@@ -20,6 +20,12 @@ if (!BOT_TOKEN) {
     process.exit(1);
 }
 
+// 쉼표(,)로 구분된 관리자 Telegram 고유 ID 목록 파싱
+const ADMIN_IDS = (process.env.ADMIN_IDS || '')
+    .split(',')
+    .map((id) => id.trim())
+    .filter(Boolean);
+
 /* =====================================================
  * 💾 영구 파일 데이터베이스 (순수 JSON 저장소)
  * ===================================================== */
@@ -161,15 +167,28 @@ bot.hears(/^\/?(start|help|도움말)(?:@\w+)?$/i, async (ctx) => {
         '📌 **상담/복음방 봇 명령어 안내**\n\n' +
             '• **만남일 설정**: `/만남일 MM-DD` (예: `/만남일 09-24`)\n' +
             '• **현재 방 일정 확인**: `/상태`\n' +
-            '• **오늘 전체 만남 명단 조회**: `오늘 만남` 또는 `/오늘만남`\n' +
+            '• **오늘 전체 만남 명단 조회 (관리자 전용)**: `오늘 만남` 또는 `/오늘만남`\n' +
             '• **피드백 제출**: 내용 앞에 `피드백` 입력\n' +
             '• **보고서 제출**: 기존 양식대로 작성 시 `다음만남일` 자동 감지',
         { parse_mode: 'Markdown' },
     );
 });
 
-// 오늘 만남 명단 조회 (/오늘만남, 오늘 만남, 오늘만남)
+// 오늘 만남 명단 조회 (/오늘만남, 오늘 만남 - 관리자 전용)
 bot.hears(/^\/?오늘\s*만남(?:@\w+)?$/i, async (ctx) => {
+    const userId = String(ctx.from?.id);
+
+    // 관리자 ID 검증
+    if (ADMIN_IDS.length === 0 || !ADMIN_IDS.includes(userId)) {
+        await ctx.reply(
+            `⛔️ **접근 권한이 없습니다.**\n이 명령어는 등록된 관리자만 사용할 수 있습니다.\n\n` +
+                `• 내 텔레그램 ID: \`${userId}\`\n` +
+                `_(서버 .env 파일의 ADMIN_IDS에 위 번호를 추가해주세요.)_`,
+            { parse_mode: 'Markdown' },
+        );
+        return;
+    }
+
     const todayStr = dayjs().tz('Asia/Seoul').format('YYYY-MM-DD');
     const allChats = getAllChats();
     const todayChats = allChats.filter((chat) => chat.meeting_date === todayStr);
@@ -251,7 +270,7 @@ bot.on('text', async (ctx) => {
     const text = ctx.message.text;
     const chatId = ctx.chat.id;
 
-    // 명령어 및 키워드는 위 bot.hears에서 이미 처리되었으므로 통과
+    // 명령어 및 주요 키워드는 통과
     if (/^\/?(만남일|상태|start|help|도움말|오늘\s*만남)/i.test(text)) return;
 
     const record = getChatRecord(chatId);
