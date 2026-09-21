@@ -20,7 +20,7 @@ if (!BOT_TOKEN) {
     process.exit(1);
 }
 
-// 쉼표(,)로 구분된 관리자 Telegram 고유 ID 목록 파싱
+// 쉼표(,)로 구분된 관리자 Telegram 고유 ID 목록
 const ADMIN_IDS = (process.env.ADMIN_IDS || '')
     .split(',')
     .map((id) => id.trim())
@@ -106,7 +106,7 @@ function updateChat(chatId: string | number, patch: Partial<ChatRecord>) {
 }
 
 /* =====================================================
- * 🔍 텍스트 파싱 유틸리티
+ * 🔍 날짜 파싱 유틸리티
  * ===================================================== */
 function parseFlexibleDate(rawText: string): string | null {
     if (!rawText) return null;
@@ -148,78 +148,89 @@ function parseNextMeetingDate(text: string): string | null {
  * ===================================================== */
 const bot = new Telegraf(BOT_TOKEN);
 
+// 예외 로깅
+bot.catch((err: any, ctx) => {
+    console.error(`[Telegraf 처리 에러] Chat ID: ${ctx.chat?.id}`, err);
+});
+
 // 봇이 그룹에 추가되었을 때
 bot.on('my_chat_member', async (ctx) => {
     const status = ctx.myChatMember.new_chat_member.status;
     if (status === 'member' || status === 'administrator') {
         await ctx.reply(
-            '👋 **상담/복음방 일정 관리 봇이 등록되었습니다.**\n\n' +
+            '👋 <b>상담/복음방 일정 관리 봇이 등록되었습니다.</b>\n\n' +
                 '첫 만남 일정을 지정해주세요.\n' +
-                '명령어: `/만남일 MM-DD` (예: `/만남일 09-24` 또는 `만남일 09-24`)',
-            { parse_mode: 'Markdown' },
+                '명령어: <code>/만남일 MM-DD</code> (예: <code>/만남일 09-24</code> 또는 <code>만남일 09-24</code>)',
+            { parse_mode: 'HTML' },
         );
     }
 });
 
-// /start 및 /help
+// 도움말 (/start, /help, 도움말)
 bot.hears(/^\/?(start|help|도움말)(?:@\w+)?$/i, async (ctx) => {
     await ctx.reply(
-        '📌 **상담/복음방 봇 명령어 안내**\n\n' +
-            '• **만남일 설정**: `/만남일 MM-DD` (예: `/만남일 09-24`)\n' +
-            '• **현재 방 일정 확인**: `/상태`\n' +
-            '• **오늘 전체 만남 명단 조회 (관리자 전용)**: `오늘 만남` 또는 `/오늘만남`\n' +
-            '• **피드백 제출**: 내용 앞에 `피드백` 입력\n' +
-            '• **보고서 제출**: 기존 양식대로 작성 시 `다음만남일` 자동 감지',
-        { parse_mode: 'Markdown' },
+        '📌 <b>상담/복음방 봇 안내</b>\n\n' +
+            '• <b>만남일 설정</b>: <code>/만남일 MM-DD</code> (예: <code>/만남일 09-24</code>)\n' +
+            '• <b>현재 방 일정 확인</b>: <code>/상태</code>\n' +
+            '• <b>오늘 전체 만남 명단</b>: <code>오늘 만남</code> (관리자 전용)\n' +
+            '• <b>피드백 제출</b>: 내용 앞에 <code>피드백</code> 포함 작성\n' +
+            '• <b>보고서 제출</b>: 기존 양식대로 올리면 <code>다음만남일</code> 자동 반영',
+        { parse_mode: 'HTML' },
     );
 });
 
 // 오늘 만남 명단 조회 (/오늘만남, 오늘 만남 - 관리자 전용)
-bot.hears(/^\/?오늘\s*만남(?:@\w+)?$/i, async (ctx) => {
-    const userId = String(ctx.from?.id);
+bot.hears(/^\/?오늘\s*만남(?:\s*|@\w+.*)$/i, async (ctx) => {
+    try {
+        const userId = String(ctx.from?.id);
+        console.log(`[명령어 호출: 오늘 만남] 요청자 ID: ${userId}`);
 
-    // 관리자 ID 검증
-    if (ADMIN_IDS.length === 0 || !ADMIN_IDS.includes(userId)) {
-        await ctx.reply(
-            `⛔️ **접근 권한이 없습니다.**\n이 명령어는 등록된 관리자만 사용할 수 있습니다.\n\n` +
-                `• 내 텔레그램 ID: \`${userId}\`\n` +
-                `_(서버 .env 파일의 ADMIN_IDS에 위 번호를 추가해주세요.)_`,
-            { parse_mode: 'Markdown' },
-        );
-        return;
+        // 관리자 ID 검증
+        if (ADMIN_IDS.length === 0 || !ADMIN_IDS.includes(userId)) {
+            await ctx.reply(
+                `⛔ <b>접근 권한이 없습니다.</b>\n` +
+                    `이 명령어는 등록된 관리자만 사용할 수 있습니다.\n\n` +
+                    `• 내 텔레그램 ID: <code>${userId}</code>\n` +
+                    `<i>(서버 .env 파일의 ADMIN_IDS에 위 번호를 추가해주세요.)</i>`,
+                { parse_mode: 'HTML' },
+            );
+            return;
+        }
+
+        const todayStr = dayjs().tz('Asia/Seoul').format('YYYY-MM-DD');
+        const allChats = getAllChats();
+        const todayChats = allChats.filter((chat) => chat.meeting_date === todayStr);
+
+        if (todayChats.length === 0) {
+            await ctx.reply(`🗓 <b>오늘(${todayStr}) 예정된 만남 일정이 없습니다.</b>`, { parse_mode: 'HTML' });
+            return;
+        }
+
+        let message = `📋 <b>[오늘 만남 명단] (총 ${todayChats.length}건)</b>\n`;
+        message += `📅 기준일: ${todayStr}\n`;
+        message += `━━━━━━━━━━━━━━━━━━\n\n`;
+
+        todayChats.forEach((chat, index) => {
+            const feedbackBadge = chat.feedback_submitted ? '✅ 완료' : '❌ 미제출';
+            const reportBadge = chat.report_submitted ? '✅ 완료' : '⏳ 대기 중';
+
+            message += `<b>${index + 1}. ${chat.room_title || '대화방'}</b>\n`;
+            message += `   • 사전 피드백: ${feedbackBadge}\n`;
+            message += `   • 만남 보고서: ${reportBadge}\n\n`;
+        });
+
+        await ctx.reply(message, { parse_mode: 'HTML' });
+    } catch (err: any) {
+        console.error('[오늘 만남 에러]:', err);
     }
-
-    const todayStr = dayjs().tz('Asia/Seoul').format('YYYY-MM-DD');
-    const allChats = getAllChats();
-    const todayChats = allChats.filter((chat) => chat.meeting_date === todayStr);
-
-    if (todayChats.length === 0) {
-        await ctx.reply(`🗓 **오늘(${todayStr}) 예정된 만남 일정이 없습니다.**`, { parse_mode: 'Markdown' });
-        return;
-    }
-
-    let message = `📋 **[오늘 만남 명단] (총 ${todayChats.length}건)**\n`;
-    message += `📅 기준일: ${todayStr}\n`;
-    message += `━━━━━━━━━━━━━━━━━━\n\n`;
-
-    todayChats.forEach((chat, index) => {
-        const feedbackBadge = chat.feedback_submitted ? '✅ 완료' : '❌ 미제출';
-        const reportBadge = chat.report_submitted ? '✅ 완료' : '⏳ 대기 중';
-
-        message += `**${index + 1}. ${chat.room_title || '이름 없는 방'}**\n`;
-        message += `   • 사전 피드백: ${feedbackBadge}\n`;
-        message += `   • 만남 보고서: ${reportBadge}\n\n`;
-    });
-
-    await ctx.reply(message, { parse_mode: 'Markdown' });
 });
 
-// 현재 개별 방 상태 확인 (/상태, 상태)
+// 개별 방 상태 확인 (/상태, 상태)
 bot.hears(/^\/?상태(?:@\w+)?$/i, async (ctx) => {
     const record = getChatRecord(ctx.chat.id);
     if (!record || !record.meeting_date) {
-        await ctx.reply('⚠️ 현재 등록된 만남 일정이 없습니다.\n`/만남일 MM-DD`로 일정을 등록해주세요.', {
-            parse_mode: 'Markdown',
+        await ctx.reply('⚠️ 현재 등록된 만남 일정이 없습니다.\n<code>/만남일 MM-DD</code>로 일정을 등록해주세요.', {
+            parse_mode: 'HTML',
         });
         return;
     }
@@ -229,11 +240,11 @@ bot.hears(/^\/?상태(?:@\w+)?$/i, async (ctx) => {
     const reportStatus = record.report_submitted ? '✅ 제출 완료' : '⏳ 대기 중';
 
     await ctx.reply(
-        `📊 **[현재 방 일정 상태]**\n\n` +
-            `• **만남 예정일**: ${mDate.format('YYYY년 MM월 DD일')}\n` +
-            `• **피드백 작성**: ${feedbackStatus}\n` +
-            `• **만남 보고서**: ${reportStatus}`,
-        { parse_mode: 'Markdown' },
+        `📊 <b>[현재 방 일정 상태]</b>\n\n` +
+            `• <b>만남 예정일</b>: ${mDate.format('YYYY년 MM월 DD일')}\n` +
+            `• <b>피드백 작성</b>: ${feedbackStatus}\n` +
+            `• <b>만남 보고서</b>: ${reportStatus}`,
+        { parse_mode: 'HTML' },
     );
 });
 
@@ -241,9 +252,10 @@ bot.hears(/^\/?상태(?:@\w+)?$/i, async (ctx) => {
 bot.hears(/^\/?만남일(?:@\w+)?(?:\s+(.+))?$/i, async (ctx) => {
     const rawInput = ctx.match[1]?.trim();
     if (!rawInput) {
-        await ctx.reply('⚠️ 날짜를 함께 입력해주세요.\n' + '예: `/만남일 09-24` 또는 `만남일 09/24`', {
-            parse_mode: 'Markdown',
-        });
+        await ctx.reply(
+            '⚠️ 날짜를 함께 입력해주세요.\n' + '예: <code>/만남일 09-24</code> 또는 <code>만남일 09/24</code>',
+            { parse_mode: 'HTML' },
+        );
         return;
     }
 
@@ -257,20 +269,19 @@ bot.hears(/^\/?만남일(?:@\w+)?(?:\s+(.+))?$/i, async (ctx) => {
     upsertMeetingDate(ctx.chat.id, title, formatted);
 
     await ctx.reply(
-        `🗓 만남일이 **${formatted}**로 등록되었습니다.\n\n` +
-            `• **만남 전날 (10:00)**: 피드백 등록 요청 알림\n` +
-            `• **만남 당일 (22:00)**: 만남 보고서 등록 알림\n` +
-            `• **미제출 시**: 1일/2일 경과 경고 알림`,
-        { parse_mode: 'Markdown' },
+        `🗓 만남일이 <b>${formatted}</b>로 등록되었습니다.\n\n` +
+            `• <b>만남 전날 (10:00)</b>: 피드백 등록 요청 알림\n` +
+            `• <b>만남 당일 (22:00)</b>: 만남 보고서 등록 알림\n` +
+            `• <b>미제출 시</b>: 1일/2일 경과 경고 알림`,
+        { parse_mode: 'HTML' },
     );
 });
 
-// 일반 텍스트 감지 (보고서 및 피드백 처리)
+// 일반 텍스트 수신 (보고서 및 피드백 처리)
 bot.on('text', async (ctx) => {
     const text = ctx.message.text;
     const chatId = ctx.chat.id;
 
-    // 명령어 및 주요 키워드는 통과
     if (/^\/?(만남일|상태|start|help|도움말|오늘\s*만남)/i.test(text)) return;
 
     const record = getChatRecord(chatId);
@@ -279,7 +290,10 @@ bot.on('text', async (ctx) => {
     if (text.includes('상담,복음방 보고서') || text.includes('다음만남일')) {
         const nextDate = parseNextMeetingDate(text);
         if (!nextDate) {
-            await ctx.reply('⚠️ 보고서에서 `다음만남일`을 파악하지 못했습니다. `/만남일 MM-DD`로 직접 설정해주세요.');
+            await ctx.reply(
+                '⚠️ 보고서에서 <code>다음만남일</code>을 파악하지 못했습니다. <code>/만남일 MM-DD</code>로 직접 설정해주세요.',
+                { parse_mode: 'HTML' },
+            );
             return;
         }
 
@@ -287,8 +301,9 @@ bot.on('text', async (ctx) => {
         upsertMeetingDate(chatId, title, nextDate);
 
         await ctx.reply(
-            `✅ **만남 보고서가 정상 반영되었습니다.**\n` + `다음 만남일이 **${nextDate}**로 자동 갱신되었습니다.`,
-            { parse_mode: 'Markdown' },
+            `✅ <b>만남 보고서가 정상 반영되었습니다.</b>\n` +
+                `다음 만남일이 <b>${nextDate}</b>로 자동 갱신되었습니다.`,
+            { parse_mode: 'HTML' },
         );
         return;
     }
@@ -296,7 +311,7 @@ bot.on('text', async (ctx) => {
     // 2. 피드백 감지
     if (text.startsWith('피드백') || text.includes('[피드백]') || text.includes('▶️ 피드백')) {
         updateChat(chatId, { feedback_submitted: 1 });
-        await ctx.reply('📝 **피드백 내용이 확인되었습니다.** 감사합니다.');
+        await ctx.reply('📝 <b>피드백 내용이 확인되었습니다.</b> 감사합니다.', { parse_mode: 'HTML' });
     }
 });
 
@@ -316,9 +331,10 @@ async function triggerMorningReminder() {
             try {
                 await bot.telegram.sendMessage(
                     chat.chat_id,
-                    `🔔 **[D-1 만남 안내]**\n` +
+                    `🔔 <b>[D-1 만남 안내]</b>\n` +
                         `내일(${mDate.format('MM/DD')})은 만남 예정일입니다.\n` +
-                        `만남 전 **피드백 내용**을 양식에 맞춰 작성해 주세요!`,
+                        `만남 전 <b>피드백 내용</b>을 양식에 맞춰 작성해 주세요!`,
+                    { parse_mode: 'HTML' },
                 );
                 updateChat(chat.chat_id, { d_minus_1_notified: 1 });
             } catch (err: any) {
@@ -330,9 +346,10 @@ async function triggerMorningReminder() {
             try {
                 await bot.telegram.sendMessage(
                     chat.chat_id,
-                    `⚠️ **[보고서 미제출 안내]**\n` +
+                    `⚠️ <b>[보고서 미제출 안내]</b>\n` +
                         `어제(${mDate.format('MM/DD')}) 만남 보고서가 아직 제출되지 않았습니다 (1일 경과).\n` +
                         `확인 후 작성해 주세요.`,
+                    { parse_mode: 'HTML' },
                 );
                 updateChat(chat.chat_id, { overdue_1_notified: 1 });
             } catch (err: any) {
@@ -344,9 +361,10 @@ async function triggerMorningReminder() {
             try {
                 await bot.telegram.sendMessage(
                     chat.chat_id,
-                    `🚨 **[보고서 제출 지연 경고]**\n` +
+                    `🚨 <b>[보고서 제출 지연 경고]</b>\n` +
                         `만남일(${mDate.format('MM/DD')})로부터 2일이 경과했습니다.\n` +
-                        `만남 보고서는 **2일 이내 필수 제출**이며 지연 시 누적 기록됩니다!`,
+                        `만남 보고서는 <b>2일 이내 필수 제출</b>이며 지연 시 누적 기록됩니다!`,
+                    { parse_mode: 'HTML' },
                 );
                 updateChat(chat.chat_id, { overdue_2_notified: 1 });
             } catch (err: any) {
@@ -368,9 +386,10 @@ async function triggerNightReminder() {
             try {
                 await bot.telegram.sendMessage(
                     chat.chat_id,
-                    `📋 **[만남 보고서 제출 안내]**\n` +
+                    `📋 <b>[만남 보고서 제출 안내]</b>\n` +
                         `오늘 만남 잘 마치셨나요?\n` +
-                        `금일 만남에 대한 **상담,복음방 보고서**를 등록해 주세요!`,
+                        `금일 만남에 대한 <b>상담,복음방 보고서</b>를 등록해 주세요!`,
+                    { parse_mode: 'HTML' },
                 );
                 updateChat(chat.chat_id, { d_day_22_notified: 1 });
             } catch (err: any) {
