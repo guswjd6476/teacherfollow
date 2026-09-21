@@ -5,7 +5,6 @@ import http from 'http';
 import fs from 'fs';
 import path from 'path';
 import { Telegraf } from 'telegraf';
-import Database from 'better-sqlite3';
 import dayjs from 'dayjs';
 import customParseFormat from 'dayjs/plugin/customParseFormat';
 import utc from 'dayjs/plugin/utc';
@@ -21,57 +20,89 @@ if (!BOT_TOKEN) {
     process.exit(1);
 }
 
-// SQLite DB 경로 설정
+/* =====================================================
+ * 💾 영구 파일 데이터베이스 (C++ 바인딩 없는 순수 JSON 저장소)
+ * ===================================================== */
+interface ChatRecord {
+    chat_id: string;
+    room_title: string;
+    meeting_date: string;
+    feedback_submitted: number;
+    report_submitted: number;
+    d_minus_1_notified: number;
+    d_day_22_notified: number;
+    overdue_1_notified: number;
+    overdue_2_notified: number;
+    updated_at: string;
+}
+
 const dataDir = path.resolve(process.cwd(), 'data');
 if (!fs.existsSync(dataDir)) {
     fs.mkdirSync(dataDir, { recursive: true });
 }
-const dbPath = path.join(dataDir, 'counseling_bot.db');
-const db = new Database(dbPath);
+const dbFilePath = path.join(dataDir, 'counseling_chats.json');
 
-db.exec(`
-CREATE TABLE IF NOT EXISTS counseling_chats (
-    chat_id TEXT PRIMARY KEY,
-    room_title TEXT,
-    meeting_date TEXT,
-    feedback_submitted INTEGER DEFAULT 0,
-    report_submitted INTEGER DEFAULT 0,
-    d_minus_1_notified INTEGER DEFAULT 0,
-    d_day_22_notified INTEGER DEFAULT 0,
-    overdue_1_notified INTEGER DEFAULT 0,
-    overdue_2_notified INTEGER DEFAULT 0,
-    updated_at TEXT
-);
-`);
+function loadChats(): Record<string, ChatRecord> {
+    try {
+        if (!fs.existsSync(dbFilePath)) return {};
+        const raw = fs.readFileSync(dbFilePath, 'utf-8');
+        return JSON.parse(raw);
+    } catch {
+        return {};
+    }
+}
 
-const bot = new Telegraf(BOT_TOKEN);
+function saveChats(chats: Record<string, ChatRecord>) {
+    fs.writeFileSync(dbFilePath, JSON.stringify(chats, null, 2), 'utf-8');
+}
 
-function getChatRecord(chatId: string | number) {
-    return db.prepare('SELECT * FROM counseling_chats WHERE chat_id = ?').get(String(chatId)) as any;
+function getChatRecord(chatId: string | number): ChatRecord | undefined {
+    const chats = loadChats();
+    return chats[String(chatId)];
+}
+
+function getAllChats(): ChatRecord[] {
+    const chats = loadChats();
+    return Object.values(chats);
 }
 
 function upsertMeetingDate(chatId: string | number, title: string, meetingDate: string) {
+    const chats = loadChats();
+    const id = String(chatId);
     const now = dayjs().tz('Asia/Seoul').toISOString();
-    const query = `
-        INSERT INTO counseling_chats (chat_id, room_title, meeting_date, feedback_submitted, report_submitted, d_minus_1_notified, d_day_22_notified, overdue_1_notified, overdue_2_notified, updated_at)
-        VALUES (@chat_id, @room_title, @meeting_date, 0, 0, 0, 0, 0, 0, @updated_at)
-        ON CONFLICT(chat_id) DO UPDATE SET
-            meeting_date = @meeting_date,
-            feedback_submitted = 0,
-            report_submitted = 0,
-            d_minus_1_notified = 0,
-            d_day_22_notified = 0,
-            overdue_1_notified = 0,
-            overdue_2_notified = 0,
-            updated_at = @updated_at;
-    `;
-    db.prepare(query).run({
-        chat_id: String(chatId),
+
+    chats[id] = {
+        chat_id: id,
         room_title: title,
         meeting_date: meetingDate,
+        feedback_submitted: 0,
+        report_submitted: 0,
+        d_minus_1_notified: 0,
+        d_day_22_notified: 0,
+        overdue_1_notified: 0,
+        overdue_2_notified: 0,
         updated_at: now,
-    });
+    };
+    saveChats(chats);
 }
+
+function updateChat(chatId: string | number, patch: Partial<ChatRecord>) {
+    const chats = loadChats();
+    const id = String(chatId);
+    if (chats[id]) {
+        chats[id] = {
+            ...chats[id],
+            ...patch,
+            updated_at: dayjs().tz('Asia/Seoul').toISOString(),
+        };
+        saveChats(chats);
+    }
+}
+
+/* =====================================================
+ * 🔍 보고서 파싱 및 봇 로직
+ * ===================================================== */
+const bot = new Telegraf(BOT_TOKEN);
 
 function parseNextMeetingDate(text: string): string | null {
     const targetSection = text.split(/다음만남일/i)[1];
@@ -91,7 +122,6 @@ function parseNextMeetingDate(text: string): string | null {
     return parsed.isValid() ? parsed.format('YYYY-MM-DD') : null;
 }
 
-// 봇 이벤트 등록
 bot.on('my_chat_member', async (ctx) => {
     const status = ctx.myChatMember.new_chat_member.status;
     if (status === 'member' || status === 'administrator') {
@@ -157,16 +187,18 @@ bot.on('text', async (ctx) => {
 
     if (record && !record.feedback_submitted) {
         if (text.startsWith('피드백') || text.includes('[피드백]') || text.includes('▶️ 피드백')) {
-            db.prepare('UPDATE counseling_chats SET feedback_submitted = 1 WHERE chat_id = ?').run(String(chatId));
+            updateChat(chatId, { feedback_submitted: 1 });
             await ctx.reply('📝 **피드백 내용이 확인되었습니다.**');
         }
     }
 });
 
-// 오전 10시 알림 실행 함수
+/* =====================================================
+ * ⏰ 스케줄러 트리거 함수들
+ * ===================================================== */
 async function triggerMorningReminder() {
     const today = dayjs().tz('Asia/Seoul').startOf('day');
-    const chats = db.prepare('SELECT * FROM counseling_chats').all() as any[];
+    const chats = getAllChats();
 
     for (const chat of chats) {
         if (!chat.meeting_date) continue;
@@ -180,7 +212,7 @@ async function triggerMorningReminder() {
                     `내일(${mDate.format('MM/DD')})은 만남 예정일입니다.\n` +
                     `만남 전 **피드백 내용**을 양식에 맞춰 작성해 주세요!`,
             );
-            db.prepare('UPDATE counseling_chats SET d_minus_1_notified = 1 WHERE chat_id = ?').run(chat.chat_id);
+            updateChat(chat.chat_id, { d_minus_1_notified: 1 });
         }
 
         if (diffDays === 1 && !chat.report_submitted && !chat.overdue_1_notified) {
@@ -190,7 +222,7 @@ async function triggerMorningReminder() {
                     `어제(${mDate.format('MM/DD')}) 만남 보고서가 아직 제출되지 않았습니다 (1일 경과).\n` +
                     `확인 후 작성해 주세요.`,
             );
-            db.prepare('UPDATE counseling_chats SET overdue_1_notified = 1 WHERE chat_id = ?').run(chat.chat_id);
+            updateChat(chat.chat_id, { overdue_1_notified: 1 });
         }
 
         if (diffDays >= 2 && !chat.report_submitted && !chat.overdue_2_notified) {
@@ -200,15 +232,14 @@ async function triggerMorningReminder() {
                     `만남일(${mDate.format('MM/DD')})로부터 2일이 경과했습니다.\n` +
                     `만남 보고서는 **2일 이내 필수 제출**이며 지연 시 누적 기록됩니다!`,
             );
-            db.prepare('UPDATE counseling_chats SET overdue_2_notified = 1 WHERE chat_id = ?').run(chat.chat_id);
+            updateChat(chat.chat_id, { overdue_2_notified: 1 });
         }
     }
 }
 
-// 밤 22시 알림 실행 함수
 async function triggerNightReminder() {
     const today = dayjs().tz('Asia/Seoul').startOf('day');
-    const chats = db.prepare('SELECT * FROM counseling_chats').all() as any[];
+    const chats = getAllChats();
 
     for (const chat of chats) {
         if (!chat.meeting_date || chat.report_submitted) continue;
@@ -220,21 +251,21 @@ async function triggerNightReminder() {
                     `오늘 만남 잘 마치셨나요?\n` +
                     `금일 만남에 대한 **상담,복음방 보고서**를 등록해 주세요!`,
             );
-            db.prepare('UPDATE counseling_chats SET d_day_22_notified = 1 WHERE chat_id = ?').run(chat.chat_id);
+            updateChat(chat.chat_id, { d_day_22_notified: 1 });
         }
     }
 }
 
-// HTTP 웹훅 서버 생성
+/* =====================================================
+ * 🌐 HTTP 웹훅 서버 구동
+ * ===================================================== */
 const server = http.createServer(async (req, res) => {
     const url = new URL(req.url || '/', `http://${req.headers.host}`);
 
-    // 1. 텔레그램 웹훅 수신
     if (req.method === 'POST' && url.pathname === '/webhook') {
         return bot.webhookCallback('/webhook')(req, res);
     }
 
-    // 2. 예약 작업(크론) 트리거 URL
     if (url.pathname === '/cron-10am') {
         await triggerMorningReminder();
         res.writeHead(200, { 'Content-Type': 'text/plain; charset=utf-8' });
@@ -252,11 +283,9 @@ const server = http.createServer(async (req, res) => {
 });
 
 const PORT = Number(process.env.PORT) || 8300;
-const HOST = process.env.IP || '::';
 
-server.listen(PORT, HOST, async () => {
-    console.log(`Server listening on ${HOST}:${PORT}`);
-    // 텔레그램 웹훅 자동 등록
+server.listen(PORT, async () => {
+    console.log(`Server listening on port ${PORT}`);
     const webhookUrl = 'https://teacherfollow.alwaysdata.net/webhook';
     try {
         await bot.telegram.setWebhook(webhookUrl);
