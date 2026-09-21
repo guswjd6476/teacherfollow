@@ -120,7 +120,6 @@ function parseFlexibleDate(rawText: string): string | null {
         const day = parseInt(match[2], 10);
         let year = now.year();
 
-        // 12월에 다음 해 1월 일정 등록 시 연도 롤오버
         if (now.month() === 11 && month === 1) {
             year += 1;
         }
@@ -161,14 +160,42 @@ bot.hears(/^\/?(start|help|도움말)(?:@\w+)?$/i, async (ctx) => {
     await ctx.reply(
         '📌 **상담/복음방 봇 명령어 안내**\n\n' +
             '• **만남일 설정**: `/만남일 MM-DD` (예: `/만남일 09-24`)\n' +
-            '• **현재 일정 확인**: `/상태`\n' +
+            '• **현재 방 일정 확인**: `/상태`\n' +
+            '• **오늘 전체 만남 명단 조회**: `오늘 만남` 또는 `/오늘만남`\n' +
             '• **피드백 제출**: 내용 앞에 `피드백` 입력\n' +
             '• **보고서 제출**: 기존 양식대로 작성 시 `다음만남일` 자동 감지',
         { parse_mode: 'Markdown' },
     );
 });
 
-// 현재 상태 확인 (/상태, 상태)
+// 오늘 만남 명단 조회 (/오늘만남, 오늘 만남, 오늘만남)
+bot.hears(/^\/?오늘\s*만남(?:@\w+)?$/i, async (ctx) => {
+    const todayStr = dayjs().tz('Asia/Seoul').format('YYYY-MM-DD');
+    const allChats = getAllChats();
+    const todayChats = allChats.filter((chat) => chat.meeting_date === todayStr);
+
+    if (todayChats.length === 0) {
+        await ctx.reply(`🗓 **오늘(${todayStr}) 예정된 만남 일정이 없습니다.**`, { parse_mode: 'Markdown' });
+        return;
+    }
+
+    let message = `📋 **[오늘 만남 명단] (총 ${todayChats.length}건)**\n`;
+    message += `📅 기준일: ${todayStr}\n`;
+    message += `━━━━━━━━━━━━━━━━━━\n\n`;
+
+    todayChats.forEach((chat, index) => {
+        const feedbackBadge = chat.feedback_submitted ? '✅ 완료' : '❌ 미제출';
+        const reportBadge = chat.report_submitted ? '✅ 완료' : '⏳ 대기 중';
+
+        message += `**${index + 1}. ${chat.room_title || '이름 없는 방'}**\n`;
+        message += `   • 사전 피드백: ${feedbackBadge}\n`;
+        message += `   • 만남 보고서: ${reportBadge}\n\n`;
+    });
+
+    await ctx.reply(message, { parse_mode: 'Markdown' });
+});
+
+// 현재 개별 방 상태 확인 (/상태, 상태)
 bot.hears(/^\/?상태(?:@\w+)?$/i, async (ctx) => {
     const record = getChatRecord(ctx.chat.id);
     if (!record || !record.meeting_date) {
@@ -224,8 +251,8 @@ bot.on('text', async (ctx) => {
     const text = ctx.message.text;
     const chatId = ctx.chat.id;
 
-    // 만남일/상태 명령어는 위 bot.hears에서 이미 처리되었으므로 통과
-    if (/^\/?(만남일|상태|start|help)/.test(text)) return;
+    // 명령어 및 키워드는 위 bot.hears에서 이미 처리되었으므로 통과
+    if (/^\/?(만남일|상태|start|help|도움말|오늘\s*만남)/i.test(text)) return;
 
     const record = getChatRecord(chatId);
 
@@ -264,9 +291,8 @@ async function triggerMorningReminder() {
     for (const chat of chats) {
         if (!chat.meeting_date) continue;
         const mDate = dayjs(chat.meeting_date).startOf('day');
-        const diffDays = today.diff(mDate, 'day'); // today - meeting_date
+        const diffDays = today.diff(mDate, 'day');
 
-        // D-1 (내일 만남)
         if (diffDays === -1 && !chat.d_minus_1_notified) {
             try {
                 await bot.telegram.sendMessage(
@@ -281,7 +307,6 @@ async function triggerMorningReminder() {
             }
         }
 
-        // D+1 지연 (어제 만남 보고서 미제출)
         if (diffDays === 1 && !chat.report_submitted && !chat.overdue_1_notified) {
             try {
                 await bot.telegram.sendMessage(
@@ -296,7 +321,6 @@ async function triggerMorningReminder() {
             }
         }
 
-        // D+2 지연 (2일 이상 미제출 경고)
         if (diffDays >= 2 && !chat.report_submitted && !chat.overdue_2_notified) {
             try {
                 await bot.telegram.sendMessage(
@@ -321,7 +345,6 @@ async function triggerNightReminder() {
         if (!chat.meeting_date || chat.report_submitted) continue;
         const mDate = dayjs(chat.meeting_date).startOf('day');
 
-        // 당일 22시 알림
         if (today.isSame(mDate, 'day') && !chat.d_day_22_notified) {
             try {
                 await bot.telegram.sendMessage(
