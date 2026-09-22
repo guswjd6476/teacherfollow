@@ -37,14 +37,14 @@ function isAdmin(userId?: number | string): boolean {
 interface ChatRecord {
     chat_id: string;
     room_title: string;
-    meeting_date: string;
+    meeting_date: string; // 'YYYY-MM-DD' 또는 '미정' 또는 ''
     feedback_submitted: number;
     report_submitted: number;
     d_minus_1_notified: number;
     d_day_22_notified: number;
     overdue_1_notified: number;
     overdue_2_notified: number;
-    created_at: string; // 봇 초대/방 등록 일시
+    created_at: string;
     updated_at: string;
 }
 
@@ -183,10 +183,9 @@ function parseFlexibleDate(rawText: string): string | null {
     return null;
 }
 
-function parseNextMeetingDate(text: string): string | null {
-    const match = text.match(/다음\s*(?:만남일|만남\s*일|만남|일정)\s*[:：\-]?\s*(.+)/i);
-    if (!match || !match[1]) return null;
-    return parseFlexibleDate(match[1]);
+function extractNextMeetingRaw(text: string): string | null {
+    const match = text.match(/다음\s*(?:만남일|만남\s*일|만남|일정)\s*[:：\-]?\s*([^\n\r]+)/i);
+    return match && match[1] ? match[1].trim() : null;
 }
 
 /* =====================================================
@@ -210,11 +209,10 @@ bot.on('my_chat_member', async (ctx) => {
         await ctx.reply(
             '👋 <b>상담/복음방 일정 관리 봇이 등록되었습니다.</b>\n\n' +
                 '첫 만남 일정을 지정해주세요.\n' +
-                '명령어: <code>/만남일 MM-DD</code> (예: <code>/만남일 09-24</code> 또는 <code>만남일 09-24</code>)',
+                '명령어: <code>/만남일 MM-DD</code> (예: <code>/만남일 09-24</code> 또는 일정이 정해지지 않은 경우 <code>/만남일 미정</code>)',
             { parse_mode: 'HTML' }
         );
     } else if (status === 'left' || status === 'kicked') {
-        // 그룹에서 퇴장된 경우 DB 목록에서 정리
         const chats = loadChats();
         if (chats[String(chatId)]) {
             delete chats[String(chatId)];
@@ -227,23 +225,23 @@ bot.on('my_chat_member', async (ctx) => {
 bot.hears(/^\/?(start|help|도움말)(?:@\w+)?$/i, async (ctx) => {
     await ctx.reply(
         '📌 <b>상담/복음방 봇 안내</b>\n\n' +
-            '• <b>만남일 설정</b>: <code>/만남일 MM-DD</code> (예: <code>/만남일 09-24</code>)\n' +
+            '• <b>만남일 설정</b>: <code>/만남일 MM-DD</code> 또는 <code>/만남일 미정</code>\n' +
             '• <b>현재 방 일정 확인</b>: <code>/상태</code>\n\n' +
             '👑 <b>관리자 전용 명령어:</b>\n' +
             '• <b>만남 명단</b>: <code>관리자 오늘만남</code>, <code>관리자 내일만남</code>, <code>관리자 일자만남 MM-DD</code>\n' +
             '• <b>보고서 미제출</b>: <code>관리자 미제출</code>\n' +
-            '• <b>초대 후 미등록 방</b>: <code>관리자 미등록</code>\n' +
+            '• <b>미등록 및 미정 방 조회</b>: <code>관리자 미등록</code> (또는 <code>관리자 미정</code>)\n' +
             '• <b>만남일 경과 미갱신 방</b>: <code>관리자 미갱신</code>\n' +
             '• <b>전체 종합 현황</b>: <code>관리자 점검</code>\n\n' +
-            '• <b>피드백 제출</b>: 내용 앞에 <code>피드백</code> 포함 작성\n' +
-            '• <b>보고서 제출</b>: 양식 내 <code>다음만남일: MM-DD</code> 포함 작성',
+            '• <b>피드백 제출</b>: 메시지 내 <code>#피드백</code> 또는 <code>#피드백내용</code> 포함 작성\n' +
+            '• <b>보고서 제출</b>: 양식 내 <code>다음만남일: MM-DD</code> (또는 <code>다음만남일: 미정</code>) 포함 작성',
         { parse_mode: 'HTML' }
     );
 });
 
 // 1. 날짜별 만남 조회 (관리자 전용)
 bot.hears(
-    /^(?:\/?관리자(?:\s+(?!(?:미제출|미등록|미갱신|최초미등록|점검|현황))(.+))?|\/(?:만남명단|만남일정)(?:@\w+)?(?:\s+(.+))?)$/i,
+    /^(?:\/?관리자(?:\s+(?!(?:미제출|미등록|미정|미갱신|최초미등록|점검|현황))(.+))?|\/(?:만남명단|만남일정)(?:@\w+)?(?:\s+(.+))?)$/i,
     async (ctx) => {
         try {
             const userId = String(ctx.from?.id);
@@ -310,7 +308,7 @@ bot.hears(
     }
 );
 
-// 2. 만남 보고서 미제출 명단 조회 (관리자 전용: 관리자 미제출, /미제출)
+// 2. 만남 보고서 미제출 명단 조회 (관리자 전용)
 bot.hears(/^(?:\/?관리자\s*)?(미제출\s*명단|미제출|보고서\s*미제출)(?:@\w+)?$/i, async (ctx) => {
     try {
         const userId = String(ctx.from?.id);
@@ -327,7 +325,7 @@ bot.hears(/^(?:\/?관리자\s*)?(미제출\s*명단|미제출|보고서\s*미제
 
         const overdueChats = allChats
             .filter((chat) => {
-                if (!chat.meeting_date || chat.report_submitted) return false;
+                if (!chat.meeting_date || chat.meeting_date === '미정' || chat.report_submitted) return false;
                 const mDate = dayjs(chat.meeting_date).startOf('day');
                 return mDate.isBefore(today) || mDate.isSame(today, 'day');
             })
@@ -366,57 +364,89 @@ bot.hears(/^(?:\/?관리자\s*)?(미제출\s*명단|미제출|보고서\s*미제
     }
 });
 
-// 3. 봇 초대 후 첫 만남일 미등록 방 명단 (관리자 전용: 관리자 미등록, 관리자 최초미등록)
-bot.hears(/^(?:\/?관리자\s*)?(최초\s*미등록|미등록\s*명단|미등록|신규\s*미등록)(?:@\w+)?$/i, async (ctx) => {
-    try {
-        const userId = String(ctx.from?.id);
-        if (!isAdmin(userId)) {
-            await ctx.reply(
-                `⛔ <b>접근 권한이 없습니다.</b>\n관리자만 사용할 수 있습니다.\n\n• 내 ID: <code>${userId}</code>`,
-                { parse_mode: 'HTML' }
-            );
-            return;
-        }
-
-        const today = dayjs().tz('Asia/Seoul').startOf('day');
-        const allChats = getAllChats();
-
-        // 봇이 추가되었으나 첫 만남일자가 아직 한 번도 등록되지 않은 방
-        const unassignedChats = allChats
-            .filter((chat) => !chat.meeting_date || chat.meeting_date.trim() === '')
-            .sort((a, b) => dayjs(a.created_at).valueOf() - dayjs(b.created_at).valueOf());
-
-        if (unassignedChats.length === 0) {
-            await ctx.reply('🎉 <b>모든 대화방에 만남일이 정상 등록되어 있습니다!</b>', { parse_mode: 'HTML' });
-            return;
-        }
-
-        let message = `❓ <b>[초대 후 만남일 미등록 대화방] (총 ${unassignedChats.length}건)</b>\n`;
-        message += `<i>(봇 입장 후 아직 첫 만남일이 지정되지 않은 방)</i>\n`;
-        message += `━━━━━━━━━━━━━━━━━━\n\n`;
-
-        unassignedChats.forEach((chat, index) => {
-            const created = chat.created_at ? dayjs(chat.created_at).tz('Asia/Seoul') : null;
-            let durationStr = '확인 불가';
-
-            if (created) {
-                const diffDays = today.diff(created.startOf('day'), 'day');
-                durationStr = diffDays === 0 ? '오늘 초대됨' : `${diffDays}일째 미등록`;
+// 3. 봇 초대 후 미등록 방 및 만남일 미정 방 명단 조회 (관리자 전용: 관리자 미등록, 관리자 미정)
+bot.hears(
+    /^(?:\/?관리자\s*)?(최초\s*미등록|미등록\s*명단|미등록|신규\s*미등록|미정|미정\s*만남|미정\s*명단)(?:@\w+)?$/i,
+    async (ctx) => {
+        try {
+            const userId = String(ctx.from?.id);
+            if (!isAdmin(userId)) {
+                await ctx.reply(
+                    `⛔ <b>접근 권한이 없습니다.</b>\n관리자만 사용할 수 있습니다.\n\n• 내 ID: <code>${userId}</code>`,
+                    { parse_mode: 'HTML' }
+                );
+                return;
             }
 
-            message += `<b>${index + 1}. ${chat.room_title || '대화방'}</b>\n`;
-            message += `   • 봇 초대일: ${created ? created.format('YYYY-MM-DD') : '기록 없음'} (${durationStr})\n`;
-            message += `   • Chat ID: <code>${chat.chat_id}</code>\n\n`;
-        });
+            const today = dayjs().tz('Asia/Seoul').startOf('day');
+            const allChats = getAllChats();
 
-        message += `💡 해당 대화방에서 <code>/만남일 MM-DD</code>를 입력해 일정을 지정해주세요.`;
-        await ctx.reply(message, { parse_mode: 'HTML' });
-    } catch (err: any) {
-        console.error('[미등록 명단 조회 에러]:', err);
+            // 1) 봇 추가 후 만남일이 한 번도 등록되지 않은 방
+            const unassignedChats = allChats
+                .filter((chat) => !chat.meeting_date || chat.meeting_date.trim() === '')
+                .sort((a, b) => dayjs(a.created_at).valueOf() - dayjs(b.created_at).valueOf());
+
+            // 2) 만남일이 '미정'으로 설정된 방
+            const undecidedChats = allChats
+                .filter((chat) => chat.meeting_date === '미정')
+                .sort((a, b) => dayjs(b.updated_at).valueOf() - dayjs(a.updated_at).valueOf());
+
+            const totalCount = unassignedChats.length + undecidedChats.length;
+
+            if (totalCount === 0) {
+                await ctx.reply('🎉 <b>미등록 또는 일정이 미정인 대화방이 없습니다!</b>', { parse_mode: 'HTML' });
+                return;
+            }
+
+            let message = `📋 <b>[만남일 미등록 및 미정 대화방] (총 ${totalCount}건)</b>\n`;
+            message += `기준시각: ${dayjs().tz('Asia/Seoul').format('YYYY-MM-DD HH:mm')}\n`;
+            message += `━━━━━━━━━━━━━━━━━━\n\n`;
+
+            // A. 만남일정 미정 상태 방
+            if (undecidedChats.length > 0) {
+                message += `⏳ <b>[만남 예정일 미정 상태] (${undecidedChats.length}건)</b>\n`;
+                undecidedChats.forEach((chat, index) => {
+                    const updated = chat.updated_at
+                        ? dayjs(chat.updated_at).tz('Asia/Seoul').format('MM/DD HH:mm')
+                        : '-';
+                    const reportBadge = chat.report_submitted ? '✅ 보고서 완료' : '⏳ 보고서 대기';
+
+                    message += `<b>${index + 1}. ${chat.room_title || '대화방'}</b>\n`;
+                    message += `   • 상태: <b>만남일 미정 (일정 확정 필요)</b>\n`;
+                    message += `   • 최근 변경: ${updated} (${reportBadge})\n`;
+                    message += `   • Chat ID: <code>${chat.chat_id}</code>\n\n`;
+                });
+            }
+
+            // B. 봇 초대 후 한 번도 일정을 등록하지 않은 방
+            if (unassignedChats.length > 0) {
+                message += `❓ <b>[초대 후 첫 만남일 미등록] (${unassignedChats.length}건)</b>\n`;
+                unassignedChats.forEach((chat, index) => {
+                    const created = chat.created_at ? dayjs(chat.created_at).tz('Asia/Seoul') : null;
+                    let durationStr = '확인 불가';
+
+                    if (created) {
+                        const diffDays = today.diff(created.startOf('day'), 'day');
+                        durationStr = diffDays === 0 ? '오늘 초대됨' : `${diffDays}일째 미등록`;
+                    }
+
+                    message += `<b>${index + 1}. ${chat.room_title || '대화방'}</b>\n`;
+                    message += `   • 봇 초대일: ${
+                        created ? created.format('YYYY-MM-DD') : '기록 없음'
+                    } (${durationStr})\n`;
+                    message += `   • Chat ID: <code>${chat.chat_id}</code>\n\n`;
+                });
+            }
+
+            message += `💡 해당 대화방에서 <code>/만남일 MM-DD</code>를 입력하여 확정된 일정을 등록해주세요.`;
+            await ctx.reply(message, { parse_mode: 'HTML' });
+        } catch (err: any) {
+            console.error('[미등록/미정 명단 조회 에러]:', err);
+        }
     }
-});
+);
 
-// 4. 만남일 경과 후 미갱신 방 명단 (관리자 전용: 관리자 미갱신)
+// 4. 만남일 경과 후 미갱신 방 명단 (관리자 전용)
 bot.hears(/^(?:\/?관리자\s*)?(미갱신\s*명단|미갱신|일정\s*미갱신)(?:@\w+)?$/i, async (ctx) => {
     try {
         const userId = String(ctx.from?.id);
@@ -431,10 +461,10 @@ bot.hears(/^(?:\/?관리자\s*)?(미갱신\s*명단|미갱신|일정\s*미갱신
         const today = dayjs().tz('Asia/Seoul').startOf('day');
         const allChats = getAllChats();
 
-        // 만남일이 과거인데 다음 일정이 설정되지 않은 방
+        // 만남일이 과거 날짜인데 다음 일정이 설정되지 않은 방 ('미정' 제외)
         const expiredChats = allChats
             .filter((chat) => {
-                if (!chat.meeting_date || chat.meeting_date.trim() === '') return false;
+                if (!chat.meeting_date || chat.meeting_date.trim() === '' || chat.meeting_date === '미정') return false;
                 const mDate = dayjs(chat.meeting_date).startOf('day');
                 return mDate.isBefore(today);
             })
@@ -465,7 +495,7 @@ bot.hears(/^(?:\/?관리자\s*)?(미갱신\s*명단|미갱신|일정\s*미갱신
     }
 });
 
-// 5. 전체 종합 점검 (관리자 전용: 관리자 점검, 관리자 현황)
+// 5. 전체 종합 점검 (관리자 전용)
 bot.hears(/^(?:\/?관리자\s*)?(점검|현황|종합\s*점검|전체\s*점검)(?:@\w+)?$/i, async (ctx) => {
     try {
         const userId = String(ctx.from?.id);
@@ -481,15 +511,16 @@ bot.hears(/^(?:\/?관리자\s*)?(점검|현황|종합\s*점검|전체\s*점검)(
         const allChats = getAllChats();
 
         const unassigned = allChats.filter((c) => !c.meeting_date || c.meeting_date.trim() === '');
+        const undecided = allChats.filter((c) => c.meeting_date === '미정');
         const overdue = allChats.filter((c) => {
-            if (!c.meeting_date || c.report_submitted) return false;
+            if (!c.meeting_date || c.meeting_date === '미정' || c.report_submitted) return false;
             return (
                 dayjs(c.meeting_date).startOf('day').isBefore(today) ||
                 dayjs(c.meeting_date).startOf('day').isSame(today, 'day')
             );
         });
         const expired = allChats.filter((c) => {
-            if (!c.meeting_date || c.meeting_date.trim() === '') return false;
+            if (!c.meeting_date || c.meeting_date.trim() === '' || c.meeting_date === '미정') return false;
             return dayjs(c.meeting_date).startOf('day').isBefore(today);
         });
 
@@ -498,11 +529,12 @@ bot.hears(/^(?:\/?관리자\s*)?(점검|현황|종합\s*점검|전체\s*점검)(
         msg += `총 등록된 대화방: <b>${allChats.length}개</b>\n`;
         msg += `━━━━━━━━━━━━━━━━━━\n\n`;
 
-        msg += `• ❓ <b>첫 만남일 미등록</b>: ${unassigned.length}개 방 (확인: <code>관리자 미등록</code>)\n`;
+        msg += `• ❓ <b>첫 만남일 미등록</b>: ${unassigned.length}개 방\n`;
+        msg += `• ⏳ <b>만남일정 미정</b>: ${undecided.length}개 방 (확인: <code>관리자 미등록</code>)\n`;
         msg += `• 🚨 <b>보고서 미제출</b>: ${overdue.length}개 방 (확인: <code>관리자 미제출</code>)\n`;
         msg += `• ⌛ <b>만남일 경과 미갱신</b>: ${expired.length}개 방 (확인: <code>관리자 미갱신</code>)\n\n`;
 
-        if (unassigned.length === 0 && overdue.length === 0 && expired.length === 0) {
+        if (unassigned.length === 0 && undecided.length === 0 && overdue.length === 0 && expired.length === 0) {
             msg += `✨ <b>현재 모든 방의 일정이 완벽하게 관리되고 있습니다!</b>`;
         } else {
             msg += `💡 각 항목별 세부 명령어를 입력하여 상세 명단을 확인하세요.`;
@@ -518,9 +550,22 @@ bot.hears(/^(?:\/?관리자\s*)?(점검|현황|종합\s*점검|전체\s*점검)(
 bot.hears(/^\/?상태(?:@\w+)?$/i, async (ctx) => {
     const record = getChatRecord(ctx.chat.id);
     if (!record || !record.meeting_date) {
-        await ctx.reply('⚠️ 현재 등록된 만남 일정이 없습니다.\n<code>/만남일 MM-DD</code>로 일정을 등록해주세요.', {
-            parse_mode: 'HTML',
-        });
+        await ctx.reply(
+            '⚠️ 현재 등록된 만남 일정이 없습니다.\n<code>/만남일 MM-DD</code> 또는 <code>/만남일 미정</code>으로 일정을 등록해주세요.',
+            { parse_mode: 'HTML' }
+        );
+        return;
+    }
+
+    if (record.meeting_date === '미정') {
+        const reportStatus = record.report_submitted ? '✅ 제출 완료' : '⏳ 대기 중';
+        await ctx.reply(
+            `📊 <b>[현재 방 일정 상태]</b>\n\n` +
+                `• <b>만남 예정일</b>: ⚠️ <b>미정 (일정 확정 필요)</b>\n` +
+                `• <b>만남 보고서</b>: ${reportStatus}\n\n` +
+                `💡 만남 일정이 다시 잡히면 <code>/만남일 MM-DD</code>로 알려주세요!`,
+            { parse_mode: 'HTML' }
+        );
         return;
     }
 
@@ -537,12 +582,25 @@ bot.hears(/^\/?상태(?:@\w+)?$/i, async (ctx) => {
     );
 });
 
-// 만남일 설정 (/만남일 MM-DD, 만남일 MM-DD)
+// 만남일 수동 설정 (/만남일 MM-DD, 만남일 미정 등)
 bot.hears(/^\/?만남일(?:@\w+)?(?:\s+(.+))?$/i, async (ctx) => {
     const rawInput = ctx.match[1]?.trim();
     if (!rawInput) {
         await ctx.reply(
-            '⚠️ 날짜를 함께 입력해주세요.\n' + '예: <code>/만남일 09-24</code> 또는 <code>만남일 09/24</code>',
+            '⚠️ 날짜를 함께 입력해주세요.\n' + '예: <code>/만남일 09-24</code> 또는 <code>/만남일 미정</code>',
+            { parse_mode: 'HTML' }
+        );
+        return;
+    }
+
+    const title = 'title' in ctx.chat ? ctx.chat.title : ctx.chat.first_name || '대화방';
+
+    // 만남일이 '미정'으로 들어온 경우
+    if (rawInput.includes('미정')) {
+        upsertMeetingDate(ctx.chat.id, title, '미정');
+        await ctx.reply(
+            '📌 <b>만남 예정일이 [미정]으로 등록되었습니다.</b>\n\n' +
+                '만남 일정이 다시 잡히면 <code>/만남일 MM-DD</code>로 봇에게 꼭 알려주세요!',
             { parse_mode: 'HTML' }
         );
         return;
@@ -550,33 +608,34 @@ bot.hears(/^\/?만남일(?:@\w+)?(?:\s+(.+))?$/i, async (ctx) => {
 
     const formatted = parseFlexibleDate(rawInput);
     if (!formatted) {
-        await ctx.reply('⚠️ 올바른 날짜 형식이 아닙니다. (예: 09-24, 9/24, 2026-09-24)');
+        await ctx.reply('⚠️ 올바른 날짜 형식이 아닙니다. (예: 09-24, 9/24, 2026-09-24, 또는 미정)');
         return;
     }
 
-    const title = 'title' in ctx.chat ? ctx.chat.title : ctx.chat.first_name || '대화방';
     upsertMeetingDate(ctx.chat.id, title, formatted);
 
     await ctx.reply(
         `🗓 만남일이 <b>${formatted}</b>로 등록되었습니다.\n\n` +
-            `• <b>만남 전날 (10:00)</b>: 피드백 등록 요청 알림\n` +
+            `• <b>만남 전날 (10:00)</b>: 피드백(#피드백) 등록 요청 알림\n` +
             `• <b>만남 당일 (22:00)</b>: 만남 보고서 등록 알림\n` +
             `• <b>미제출 시</b>: 1일/2일 경과 경고 알림`,
         { parse_mode: 'HTML' }
     );
 });
 
-// 6. 일반 텍스트 수신 (보고서 및 피드백 처리 + 다음만남일 누락 안내)
+// 6. 일반 텍스트 수신 (보고서 및 #피드백 감지)
 bot.on('text', async (ctx) => {
     const text = ctx.message.text;
     const chatId = ctx.chat.id;
     const roomTitle = 'title' in ctx.chat ? ctx.chat.title : ctx.chat.first_name || '대화방';
 
-    // DB에 방 정보가 없으면 기본 등록 (미등록 방 추적 지원)
+    // DB에 방 정보가 없으면 기본 등록
     ensureChatRecord(chatId, roomTitle);
 
     // 명령어 및 관리자 호출 텍스트는 일반 텍스트 감지에서 제외
-    if (/^\/?(만남일|상태|start|help|도움말|관리자|만남명단|미제출|미등록|미갱신|최초미등록|점검|현황)/i.test(text))
+    if (
+        /^\/?(만남일|상태|start|help|도움말|관리자|만남명단|미제출|미등록|미정|미갱신|최초미등록|점검|현황)/i.test(text)
+    )
         return;
 
     // 만남 보고서 감지 (양식 키워드)
@@ -589,7 +648,23 @@ bot.on('text', async (ctx) => {
         text.includes('다음 만남일');
 
     if (isReport) {
-        const nextDate = parseNextMeetingDate(text);
+        const rawNextDate = extractNextMeetingRaw(text);
+
+        // 보고서 내 '다음만남일' 항목이 '미정'인 경우
+        if (rawNextDate && rawNextDate.includes('미정')) {
+            upsertMeetingDate(chatId, roomTitle, '미정');
+            updateChat(chatId, { report_submitted: 1 });
+
+            await ctx.reply(
+                '✅ <b>만남 보고서가 정상 반영되었습니다.</b>\n\n' +
+                    '📌 <b>다음 만남일이 [미정]으로 기록되었습니다.</b>\n' +
+                    '추후 만남 일정이 다시 잡히면 <code>/만남일 MM-DD</code>로 꼭 알려주세요!',
+                { parse_mode: 'HTML' }
+            );
+            return;
+        }
+
+        const nextDate = rawNextDate ? parseFlexibleDate(rawNextDate) : null;
 
         if (!nextDate) {
             updateChat(chatId, { report_submitted: 1 });
@@ -597,10 +672,10 @@ bot.on('text', async (ctx) => {
             await ctx.reply(
                 '⚠️ <b>[다음 만남일 확인 필요]</b>\n\n' +
                     '만남 보고서는 확인되었으나, <b>다음만남일</b> 날짜를 인식하지 못했습니다.\n' +
-                    '<i>(예: 미정, 형식 불일치, 누락 등)</i>\n\n' +
+                    '<i>(예: 형식 불일치, 누락 등)</i>\n\n' +
                     '📌 <b>다음 만남 일정 등록 방법:</b>\n' +
-                    '채팅방에 <code>/만남일 MM-DD</code>를 입력해 주세요.\n' +
-                    '예: <code>/만남일 09-30</code>',
+                    '• 날짜가 확정된 경우: <code>/만남일 MM-DD</code>\n' +
+                    '• 아직 미정인 경우: <code>/만남일 미정</code>',
                 { parse_mode: 'HTML' }
             );
             return;
@@ -616,8 +691,8 @@ bot.on('text', async (ctx) => {
         return;
     }
 
-    // 피드백 감지
-    if (text.startsWith('피드백') || text.includes('[피드백]') || text.includes('▶️ 피드백')) {
+    // 피드백 감지: #피드백 또는 #피드백내용 태그가 포함된 경우에만 인식
+    if (/#피드백내용|#피드백/.test(text)) {
         updateChat(chatId, { feedback_submitted: 1 });
         await ctx.reply('📝 <b>피드백 내용이 확인되었습니다.</b> 감사합니다.', { parse_mode: 'HTML' });
     }
@@ -631,17 +706,22 @@ async function triggerMorningReminder() {
     const chats = getAllChats();
 
     for (const chat of chats) {
-        if (!chat.meeting_date) continue;
+        // 날짜가 없거나 '미정'인 경우 알림 건너뜀
+        if (!chat.meeting_date || chat.meeting_date === '미정') continue;
+
         const mDate = dayjs(chat.meeting_date).startOf('day');
+        if (!mDate.isValid()) continue;
+
         const diffDays = today.diff(mDate, 'day');
 
+        // D-1 피드백 요청 알림
         if (diffDays === -1 && !chat.d_minus_1_notified) {
             try {
                 await bot.telegram.sendMessage(
                     chat.chat_id,
                     `🔔 <b>[D-1 만남 안내]</b>\n` +
                         `내일(${mDate.format('MM/DD')})은 만남 예정일입니다.\n` +
-                        `만남 전 <b>피드백 내용</b>을 양식에 맞춰 작성해 주세요!`,
+                        `만남 전 <b>피드백 내용</b>을 <code>#피드백</code> 태그를 포함하여 작성해 주세요!`,
                     { parse_mode: 'HTML' }
                 );
                 updateChat(chat.chat_id, { d_minus_1_notified: 1 });
@@ -650,6 +730,7 @@ async function triggerMorningReminder() {
             }
         }
 
+        // D+1 보고서 미제출 알림
         if (diffDays === 1 && !chat.report_submitted && !chat.overdue_1_notified) {
             try {
                 await bot.telegram.sendMessage(
@@ -665,6 +746,7 @@ async function triggerMorningReminder() {
             }
         }
 
+        // D+2 경고 알림
         if (diffDays >= 2 && !chat.report_submitted && !chat.overdue_2_notified) {
             try {
                 await bot.telegram.sendMessage(
@@ -687,8 +769,11 @@ async function triggerNightReminder() {
     const chats = getAllChats();
 
     for (const chat of chats) {
-        if (!chat.meeting_date || chat.report_submitted) continue;
+        // 날짜가 없거나, '미정'이거나, 이미 보고서가 제출된 경우 건너뜀
+        if (!chat.meeting_date || chat.meeting_date === '미정' || chat.report_submitted) continue;
+
         const mDate = dayjs(chat.meeting_date).startOf('day');
+        if (!mDate.isValid()) continue;
 
         if (today.isSame(mDate, 'day') && !chat.d_day_22_notified) {
             try {
