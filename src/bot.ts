@@ -39,6 +39,8 @@ interface ChatRecord {
     room_title: string;
     meeting_date: string; // 'YYYY-MM-DD' 또는 '미정' 또는 '중단' 또는 ''
     stop_reason?: string; // 만남 중단 사유
+    progress_stage?: '섭등예정' | '예정가능일' | '가능가능일' | ''; // 방 구분 상태
+    progress_note?: string; // 구분 관련 메모/상세일정
     feedback_submitted: number;
     report_submitted: number;
     d_minus_1_notified: number;
@@ -92,6 +94,8 @@ function ensureChatRecord(chatId: string | number, title: string) {
             room_title: title || '대화방',
             meeting_date: '',
             stop_reason: '',
+            progress_stage: '',
+            progress_note: '',
             feedback_submitted: 0,
             report_submitted: 0,
             d_minus_1_notified: 0,
@@ -129,6 +133,8 @@ function upsertMeetingDate(chatId: string | number, title: string, meetingDate: 
         room_title: title,
         meeting_date: meetingDate,
         stop_reason: '', // 새 일정 등록 시 중단 사유 초기화
+        progress_stage: existing?.progress_stage || '',
+        progress_note: existing?.progress_note || '',
         feedback_submitted: 0,
         report_submitted: 0,
         d_minus_1_notified: 0,
@@ -230,23 +236,28 @@ bot.hears(/^\/?(start|help|도움말)(?:@\w+)?$/i, async (ctx) => {
         '📌 <b>상담/복음방 봇 안내</b>\n\n' +
             '• <b>만남일 설정</b>: <code>/만남일 MM-DD</code> 또는 <code>/만남일 미정</code>\n' +
             '• <b>만남 중단 처리</b>: <code>/만남중단 [사유]</code>\n' +
-            '• <b>현재 방 일정 확인</b>: <code>/상태</code>\n\n' +
+            '• <b>진행 단계 설정</b>: <code>/섭등예정</code>, <code>/예정가능일</code>, <code>/가능가능일</code>\n' +
+            '• <b>진행 단계 해제</b>: <code>/구분해제</code> (일반 상태로 전환)\n' +
+            '• <b>현재 방 일정 확인</b>: <code>/상태확인</code>\n\n' +
             '👑 <b>관리자 전용 명령어:</b>\n' +
+            '• <b>특수 구분 현황 (3가지 종합)</b>: <code>관리자 구분</code>\n' +
+            '• <b>구분별 단독 조회</b>: <code>관리자 섭등예정</code>, <code>관리자 예정가능일</code>, <code>관리자 가능가능일</code>\n' +
+            '• <b>일반방 조회 (3가지 제외)</b>: <code>관리자 일반</code>\n' +
             '• <b>만남 명단</b>: <code>관리자 오늘만남</code>, <code>관리자 내일만남</code>, <code>관리자 일자만남 MM-DD</code>\n' +
             '• <b>보고서 미제출</b>: <code>관리자 미제출</code>\n' +
-            '• <b>미등록 및 미정 방 조회</b>: <code>관리자 미등록</code> (또는 <code>관리자 미정</code>)\n' +
+            '• <b>미등록 및 미정 방 조회</b>: <code>관리자 미등록</code>\n' +
             '• <b>만남일 경과 미갱신 방</b>: <code>관리자 미갱신</code>\n' +
             '• <b>만남 중단 방 목록</b>: <code>관리자 중단</code>\n' +
             '• <b>전체 종합 현황</b>: <code>관리자 점검</code>\n\n' +
-            '• <b>피드백 제출</b>: 메시지 내 <code>#피드백</code> 또는 <code>#피드백내용</code> 포함 작성\n' +
-            '• <b>보고서 제출</b>: 양식 내 <code>다음만남일: MM-DD</code> (또는 <code>다음만남일: 미정</code>) 포함 작성',
+            '• <b>피드백 제출</b>: 메시지 내 <code>#피드백</code> 또는 <code>#피드백내용</code> 포함\n' +
+            '• <b>보고서 제출</b>: 양식 내 <code>다음만남일: MM-DD</code> (또는 <code>미정</code>) 포함',
         { parse_mode: 'HTML' },
     );
 });
 
 // 1. 날짜별 만남 조회 (관리자 전용)
 bot.hears(
-    /^(?:\/?관리자(?:\s+(?!(?:미제출|미등록|미정|미갱신|최초미등록|점검|현황|중단))(.+))?|\/(?:만남명단|만남일정)(?:@\w+)?(?:\s+(.+))?)$/i,
+    /^(?:\/?관리자(?:\s+(?!(?:미제출|미등록|미정|미갱신|최초미등록|점검|현황|중단|구분|단계|특수|섭등예정|예정가능일|가능가능일|일반|일반방))(.+))?|\/(?:만남명단|만남일정)(?:@\w+)?(?:\s+(.+))?)$/i,
     async (ctx) => {
         try {
             const userId = String(ctx.from?.id);
@@ -300,8 +311,9 @@ bot.hears(
             targetChats.forEach((chat, index) => {
                 const feedbackBadge = chat.feedback_submitted ? '✅ 완료' : '❌ 미제출';
                 const reportBadge = chat.report_submitted ? '✅ 완료' : '⏳ 대기 중';
+                const stageBadge = chat.progress_stage ? ` [🏷 ${chat.progress_stage}]` : '';
 
-                message += `<b>${index + 1}. ${chat.room_title || '대화방'}</b>\n`;
+                message += `<b>${index + 1}. ${chat.room_title || '대화방'}${stageBadge}</b>\n`;
                 message += `   • 사전 피드백: ${feedbackBadge}\n`;
                 message += `   • 만남 보고서: ${reportBadge}\n\n`;
             });
@@ -550,7 +562,159 @@ bot.hears(/^(?:\/?관리자\s*)?(중단\s*명단|중단|만남중단)(?:@\w+)?$/
     }
 });
 
-// 6. 전체 종합 점검 (관리자 전용)
+// 6. 세 가지 상황(섭등예정, 예정가능일, 가능가능일) 종합 확인 (관리자 전용: 관리자 구분, 관리자 단계)
+bot.hears(/^(?:\/?관리자\s*)?(구분|단계|특수|진행구분)(?:@\w+)?$/i, async (ctx) => {
+    try {
+        const userId = String(ctx.from?.id);
+        if (!isAdmin(userId)) {
+            await ctx.reply(
+                `⛔ <b>접근 권한이 없습니다.</b>\n관리자만 사용할 수 있습니다.\n\n• 내 ID: <code>${userId}</code>`,
+                { parse_mode: 'HTML' },
+            );
+            return;
+        }
+
+        const allChats = getAllChats();
+        const subdeung = allChats.filter((c) => c.progress_stage === '섭등예정');
+        const yejeong = allChats.filter((c) => c.progress_stage === '예정가능일');
+        const ganeung = allChats.filter((c) => c.progress_stage === '가능가능일');
+
+        const totalSpecial = subdeung.length + yejeong.length + ganeung.length;
+
+        if (totalSpecial === 0) {
+            await ctx.reply('✨ <b>현재 [섭등예정 / 예정가능일 / 가능가능일]로 지정된 대화방이 없습니다.</b>', {
+                parse_mode: 'HTML',
+            });
+            return;
+        }
+
+        let msg = `🏷 <b>[진행 구분별 대화방 목록] (총 ${totalSpecial}건)</b>\n`;
+        msg += `기준시각: ${dayjs().tz('Asia/Seoul').format('YYYY-MM-DD HH:mm')}\n`;
+        msg += `━━━━━━━━━━━━━━━━━━\n\n`;
+
+        if (subdeung.length > 0) {
+            msg += `📌 <b>[섭등예정] (${subdeung.length}건)</b>\n`;
+            subdeung.forEach((c, i) => {
+                const note = c.progress_note ? ` (메모: ${c.progress_note})` : '';
+                const mDate = c.meeting_date ? ` [만남일: ${c.meeting_date}]` : '';
+                msg += `${i + 1}. <b>${c.room_title}</b>${mDate}${note}\n`;
+            });
+            msg += `\n`;
+        }
+
+        if (yejeong.length > 0) {
+            msg += `🗓 <b>[예정가능일] (${yejeong.length}건)</b>\n`;
+            yejeong.forEach((c, i) => {
+                const note = c.progress_note ? ` (메모: ${c.progress_note})` : '';
+                const mDate = c.meeting_date ? ` [만남일: ${c.meeting_date}]` : '';
+                msg += `${i + 1}. <b>${c.room_title}</b>${mDate}${note}\n`;
+            });
+            msg += `\n`;
+        }
+
+        if (ganeung.length > 0) {
+            msg += `✨ <b>[가능가능일] (${ganeung.length}건)</b>\n`;
+            ganeung.forEach((c, i) => {
+                const note = c.progress_note ? ` (메모: ${c.progress_note})` : '';
+                const mDate = c.meeting_date ? ` [만남일: ${c.meeting_date}]` : '';
+                msg += `${i + 1}. <b>${c.room_title}</b>${mDate}${note}\n`;
+            });
+            msg += `\n`;
+        }
+
+        await ctx.reply(msg, { parse_mode: 'HTML' });
+    } catch (err: any) {
+        console.error('[관리자 구분 조회 에러]:', err);
+    }
+});
+
+// 7. 세 가지 상황 개별 조회 (관리자 전용: 관리자 섭등예정, 관리자 예정가능일, 관리자 가능가능일)
+bot.hears(/^(?:\/?관리자\s*)(섭등예정|예정가능일|가능가능일)(?:@\w+)?$/i, async (ctx) => {
+    try {
+        const userId = String(ctx.from?.id);
+        if (!isAdmin(userId)) {
+            await ctx.reply(
+                `⛔ <b>접근 권한이 없습니다.</b>\n관리자만 사용할 수 있습니다.\n\n• 내 ID: <code>${userId}</code>`,
+                { parse_mode: 'HTML' },
+            );
+            return;
+        }
+
+        const targetStage = ctx.match[1] as '섭등예정' | '예정가능일' | '가능가능일';
+        const allChats = getAllChats();
+        const targets = allChats.filter((c) => c.progress_stage === targetStage);
+
+        if (targets.length === 0) {
+            await ctx.reply(`✨ <b>현재 [${targetStage}] 상태인 대화방이 없습니다.</b>`, {
+                parse_mode: 'HTML',
+            });
+            return;
+        }
+
+        let msg = `🏷 <b>[${targetStage} 대화방 목록] (총 ${targets.length}건)</b>\n`;
+        msg += `기준시각: ${dayjs().tz('Asia/Seoul').format('YYYY-MM-DD HH:mm')}\n`;
+        msg += `━━━━━━━━━━━━━━━━━━\n\n`;
+
+        targets.forEach((c, i) => {
+            msg += `<b>${i + 1}. ${c.room_title || '대화방'}</b>\n`;
+            msg += `   • 만남일정: <b>${c.meeting_date || '일정 미등록'}</b>\n`;
+            if (c.progress_note) msg += `   • 메모/내용: ${c.progress_note}\n`;
+            msg += `   • Chat ID: <code>${c.chat_id}</code>\n\n`;
+        });
+
+        await ctx.reply(msg, { parse_mode: 'HTML' });
+    } catch (err: any) {
+        console.error('[관리자 개별 단계 조회 에러]:', err);
+    }
+});
+
+// 8. 세 가지 상황이 아닌 대화방 확인 (관리자 전용: 관리자 일반, 관리자 일반방)
+bot.hears(/^(?:\/?관리자\s*)?(일반|일반방|미분류)(?:@\w+)?$/i, async (ctx) => {
+    try {
+        const userId = String(ctx.from?.id);
+        if (!isAdmin(userId)) {
+            await ctx.reply(
+                `⛔ <b>접근 권한이 없습니다.</b>\n관리자만 사용할 수 있습니다.\n\n• 내 ID: <code>${userId}</code>`,
+                { parse_mode: 'HTML' },
+            );
+            return;
+        }
+
+        const allChats = getAllChats();
+        // 섭등예정, 예정가능일, 가능가능일 세 가지가 설정되어 있지 않은 일반 방들
+        const normalChats = allChats.filter(
+            (c) => !c.progress_stage || !['섭등예정', '예정가능일', '가능가능일'].includes(c.progress_stage),
+        );
+
+        if (normalChats.length === 0) {
+            await ctx.reply('✨ <b>모든 대화방이 특수 단계(섭등예정/예정가능일/가능가능일)로 분류되어 있습니다.</b>', {
+                parse_mode: 'HTML',
+            });
+            return;
+        }
+
+        let msg = `📋 <b>[일반 대화방 목록 (특수 3종 제외)] (총 ${normalChats.length}건)</b>\n`;
+        msg += `기준시각: ${dayjs().tz('Asia/Seoul').format('YYYY-MM-DD HH:mm')}\n`;
+        msg += `━━━━━━━━━━━━━━━━━━\n\n`;
+
+        normalChats.forEach((chat, index) => {
+            let statusText = chat.meeting_date;
+            if (!statusText) statusText = '미등록';
+            else if (statusText === '중단') statusText = `중단 (${chat.stop_reason || '사유없음'})`;
+
+            msg += `<b>${index + 1}. ${chat.room_title || '대화방'}</b>\n`;
+            msg += `   • 현재 상태: <b>${statusText}</b>\n`;
+            msg += `   • 보고서: ${chat.report_submitted ? '✅ 제출완료' : '⏳ 대기'}\n`;
+            msg += `   • Chat ID: <code>${chat.chat_id}</code>\n\n`;
+        });
+
+        await ctx.reply(msg, { parse_mode: 'HTML' });
+    } catch (err: any) {
+        console.error('[일반방 조회 에러]:', err);
+    }
+});
+
+// 9. 전체 종합 점검 (관리자 전용)
 bot.hears(/^(?:\/?관리자\s*)?(점검|현황|종합\s*점검|전체\s*점검)(?:@\w+)?$/i, async (ctx) => {
     try {
         const userId = String(ctx.from?.id);
@@ -587,28 +751,31 @@ bot.hears(/^(?:\/?관리자\s*)?(점검|현황|종합\s*점검|전체\s*점검)(
             return dayjs(c.meeting_date).startOf('day').isBefore(today);
         });
 
+        // 특수 분류 통계
+        const subdeung = allChats.filter((c) => c.progress_stage === '섭등예정').length;
+        const yejeong = allChats.filter((c) => c.progress_stage === '예정가능일').length;
+        const ganeung = allChats.filter((c) => c.progress_stage === '가능가능일').length;
+        const normalCount = allChats.length - (subdeung + yejeong + ganeung);
+
         let msg = `📊 <b>[상담/복음방 전체 관리 현황]</b>\n`;
         msg += `기준시각: ${dayjs().tz('Asia/Seoul').format('YYYY-MM-DD HH:mm')}\n`;
         msg += `총 등록된 대화방: <b>${allChats.length}개</b>\n`;
         msg += `━━━━━━━━━━━━━━━━━━\n\n`;
 
+        msg += `🏷 <b>[진행 단계별 현황]</b>\n`;
+        msg += `• 섭등예정: <b>${subdeung}개 방</b>\n`;
+        msg += `• 예정가능일: <b>${yejeong}개 방</b>\n`;
+        msg += `• 가능가능일: <b>${ganeung}개 방</b>\n`;
+        msg += `• 일반(미지정): <b>${normalCount}개 방</b> (확인: <code>관리자 일반</code>)\n\n`;
+
+        msg += `🗓 <b>[만남 및 보고서 상태]</b>\n`;
         msg += `• ❓ <b>첫 만남일 미등록</b>: ${unassigned.length}개 방\n`;
         msg += `• ⏳ <b>만남일정 미정</b>: ${undecided.length}개 방 (확인: <code>관리자 미등록</code>)\n`;
         msg += `• 🛑 <b>만남 중단 상태</b>: ${stopped.length}개 방 (확인: <code>관리자 중단</code>)\n`;
         msg += `• 🚨 <b>보고서 미제출</b>: ${overdue.length}개 방 (확인: <code>관리자 미제출</code>)\n`;
         msg += `• ⌛ <b>만남일 경과 미갱신</b>: ${expired.length}개 방 (확인: <code>관리자 미갱신</code>)\n\n`;
 
-        if (
-            unassigned.length === 0 &&
-            undecided.length === 0 &&
-            stopped.length === 0 &&
-            overdue.length === 0 &&
-            expired.length === 0
-        ) {
-            msg += `✨ <b>현재 모든 방의 일정이 완벽하게 관리되고 있습니다!</b>`;
-        } else {
-            msg += `💡 각 항목별 세부 명령어를 입력하여 상세 명단을 확인하세요.`;
-        }
+        msg += `💡 각 항목별 세부 명령어를 입력하여 상세 명단을 확인하세요.`;
 
         await ctx.reply(msg, { parse_mode: 'HTML' });
     } catch (err: any) {
@@ -616,20 +783,59 @@ bot.hears(/^(?:\/?관리자\s*)?(점검|현황|종합\s*점검|전체\s*점검)(
     }
 });
 
-// 개별 방 상태 확인 (/상태, 상태)
-bot.hears(/^\/?상태(?:@\w+)?$/i, async (ctx) => {
+// 방 구분 설정 (/섭등예정, /예정가능일, /가능가능일 [메모])
+bot.hears(/^\/?(섭등예정|예정가능일|가능가능일)(?:@\w+)?(?:\s+(.+))?$/i, async (ctx) => {
+    const stage = ctx.match[1] as '섭등예정' | '예정가능일' | '가능가능일';
+    const note = ctx.match[2]?.trim() || '';
+    const title = 'title' in ctx.chat ? ctx.chat.title : ctx.chat.first_name || '대화방';
+
+    ensureChatRecord(ctx.chat.id, title);
+    updateChat(ctx.chat.id, {
+        progress_stage: stage,
+        progress_note: note,
+    });
+
+    let replyMsg = `📌 <b>대화방 구분이 [${stage}]으로 설정되었습니다.</b>\n`;
+    if (note) replyMsg += `• 내용: ${note}\n`;
+    replyMsg += `\n💡 일반 상태로 복귀하려면 <code>/구분해제</code>를 입력하세요.`;
+
+    await ctx.reply(replyMsg, { parse_mode: 'HTML' });
+});
+
+// 방 구분 해제 (/구분해제, /일반)
+bot.hears(/^\/?(구분해제|일반)(?:@\w+)?$/i, async (ctx) => {
+    const title = 'title' in ctx.chat ? ctx.chat.title : ctx.chat.first_name || '대화방';
+    ensureChatRecord(ctx.chat.id, title);
+
+    updateChat(ctx.chat.id, {
+        progress_stage: '',
+        progress_note: '',
+    });
+
+    await ctx.reply('✅ <b>특수 구분이 해제되어 [일반] 상태로 전환되었습니다.</b>', { parse_mode: 'HTML' });
+});
+
+// 개별 방 상태 확인 (/상태확인, 상태확인)
+bot.hears(/^\/?상태확인(?:@\w+)?$/i, async (ctx) => {
     const record = getChatRecord(ctx.chat.id);
-    if (!record || !record.meeting_date) {
+    if (!record) {
         await ctx.reply(
-            '⚠️ 현재 등록된 만남 일정이 없습니다.\n<code>/만남일 MM-DD</code> 또는 <code>/만남일 미정</code>으로 일정을 등록해주세요.',
+            '⚠️ 등록된 방 정보가 없습니다.\n<code>/만남일 MM-DD</code> 또는 <code>/만남일 미정</code>으로 일정을 등록해주세요.',
             { parse_mode: 'HTML' },
         );
         return;
     }
 
+    const stageText = record.progress_stage
+        ? `🏷 <b>진행 단계</b>: <b>${record.progress_stage}</b>${
+              record.progress_note ? ` (${record.progress_note})` : ''
+          }\n`
+        : '';
+
     if (record.meeting_date === '중단') {
         await ctx.reply(
             `📊 <b>[현재 방 일정 상태]</b>\n\n` +
+                stageText +
                 `• <b>만남 상태</b>: 🛑 <b>만남 중단</b>\n` +
                 `• <b>중단 사유</b>: ${record.stop_reason || '사유 미입력'}\n\n` +
                 `💡 만남 일정이 다시 잡히면 <code>/만남일 MM-DD</code>를 입력해주세요.`,
@@ -642,9 +848,21 @@ bot.hears(/^\/?상태(?:@\w+)?$/i, async (ctx) => {
         const reportStatus = record.report_submitted ? '✅ 제출 완료' : '⏳ 대기 중';
         await ctx.reply(
             `📊 <b>[현재 방 일정 상태]</b>\n\n` +
+                stageText +
                 `• <b>만남 예정일</b>: ⚠️ <b>미정 (일정 확정 필요)</b>\n` +
                 `• <b>만남 보고서</b>: ${reportStatus}\n\n` +
                 `💡 만남 일정이 다시 잡히면 <code>/만남일 MM-DD</code>로 알려주세요!`,
+            { parse_mode: 'HTML' },
+        );
+        return;
+    }
+
+    if (!record.meeting_date) {
+        await ctx.reply(
+            `📊 <b>[현재 방 일정 상태]</b>\n\n` +
+                stageText +
+                `• <b>만남 예정일</b>: ⚠️ <b>미등록</b>\n\n` +
+                `💡 <code>/만남일 MM-DD</code> 또는 <code>/만남일 미정</code>으로 일정을 등록해주세요.`,
             { parse_mode: 'HTML' },
         );
         return;
@@ -656,6 +874,7 @@ bot.hears(/^\/?상태(?:@\w+)?$/i, async (ctx) => {
 
     await ctx.reply(
         `📊 <b>[현재 방 일정 상태]</b>\n\n` +
+            stageText +
             `• <b>만남 예정일</b>: ${mDate.format('YYYY년 MM월 DD일')}\n` +
             `• <b>피드백 작성</b>: ${feedbackStatus}\n` +
             `• <b>만남 보고서</b>: ${reportStatus}`,
@@ -687,6 +906,8 @@ bot.hears(/^\/?만남중단(?:@\w+)?(?:\s+(.+))?$/i, async (ctx) => {
         room_title: title,
         meeting_date: '중단',
         stop_reason: reason,
+        progress_stage: existing?.progress_stage || '',
+        progress_note: existing?.progress_note || '',
         feedback_submitted: 0,
         report_submitted: 0,
         d_minus_1_notified: 0,
@@ -747,7 +968,7 @@ bot.hears(/^\/?만남일(?:@\w+)?(?:\s+(.+))?$/i, async (ctx) => {
     );
 });
 
-// 7. 일반 텍스트 수신 (보고서 및 #피드백 감지)
+// 10. 일반 텍스트 수신 (보고서 및 #피드백 감지)
 bot.on('text', async (ctx) => {
     const text = ctx.message.text;
     const chatId = ctx.chat.id;
@@ -758,7 +979,7 @@ bot.on('text', async (ctx) => {
 
     // 명령어 및 관리자 호출 텍스트는 일반 텍스트 감지에서 제외
     if (
-        /^\/?(만남일|상태|start|help|도움말|관리자|만남명단|미제출|미등록|미정|미갱신|최초미등록|점검|현황|만남중단|중단)/i.test(
+        /^\/?(만남일|상태확인|start|help|도움말|관리자|만남명단|미제출|미등록|미정|미갱신|최초미등록|점검|현황|만남중단|중단|구분|단계|특수|섭등예정|예정가능일|가능가능일|구분해제|일반|일반방)/i.test(
             text,
         )
     )
@@ -832,7 +1053,6 @@ async function triggerMorningReminder() {
     const chats = getAllChats();
 
     for (const chat of chats) {
-        // 날짜가 없거나 '미정' 또는 '중단'인 경우 알림 건너뜀
         if (!chat.meeting_date || chat.meeting_date === '미정' || chat.meeting_date === '중단') continue;
 
         const mDate = dayjs(chat.meeting_date).startOf('day');
@@ -895,7 +1115,6 @@ async function triggerNightReminder() {
     const chats = getAllChats();
 
     for (const chat of chats) {
-        // 날짜가 없거나, '미정', '중단'이거나, 이미 보고서가 제출된 경우 건너뜀
         if (!chat.meeting_date || chat.meeting_date === '미정' || chat.meeting_date === '중단' || chat.report_submitted)
             continue;
 
