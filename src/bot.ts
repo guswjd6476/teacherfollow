@@ -31,6 +31,12 @@ function isAdmin(userId?: number | string): boolean {
     return ADMIN_IDS.length > 0 && ADMIN_IDS.includes(String(userId));
 }
 
+// HTML 특수문자(<, >, &) 이스케이프 유틸리티
+function escapeHtml(text?: string): string {
+    if (!text) return '';
+    return String(text).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+}
+
 /* =====================================================
  * 💾 영구 파일 데이터베이스 (순수 JSON 저장소)
  * ===================================================== */
@@ -163,61 +169,22 @@ function updateChat(chatId: string | number, patch: Partial<ChatRecord>) {
 /* =====================================================
  * 🔍 날짜 파싱 유틸리티
  * ===================================================== */
-// function parseFlexibleDate(rawText: string): string | null {
-//     if (!rawText) return null;
-//     const now = dayjs().tz('Asia/Seoul');
-
-//     // 1) YYYY-MM-DD
-//     const fullMatch = rawText.match(/(\d{4})[\-\/\.\s]+(\d{1,2})[\-\/\.\s]+(\d{1,2})/);
-//     if (fullMatch) {
-//         const d = dayjs(`${fullMatch[1]}-${fullMatch[2].padStart(2, '0')}-${fullMatch[3].padStart(2, '0')}`);
-//         return d.isValid() ? d.format('YYYY-MM-DD') : null;
-//     }
-
-//     // 2) MM-DD, MM/DD, MM.DD, M월 D일
-//     const match = rawText.match(/(\d{1,2})[\-\/\.\월\s]+(\d{1,2})/);
-//     if (match) {
-//         const month = parseInt(match[1], 10);
-//         const day = parseInt(match[2], 10);
-//         let year = now.year();
-
-//         if (now.month() === 11 && month === 1) {
-//             year += 1;
-//         }
-
-//         const d = dayjs(`${year}-${String(month).padStart(2, '0')}-${String(day).padStart(2, '0')}`);
-//         return d.isValid() ? d.format('YYYY-MM-DD') : null;
-//     }
-
-//     return null;
-// }
-
-// function extractNextMeetingRaw(text: string): string | null {
-//     const match = text.match(/다음\s*(?:만남일|만남\s*일|만남|일정)\s*[:：\-]?\s*([^\n\r]+)/i);
-//     return match && match[1] ? match[1].trim() : null;
-// }
 function parseFlexibleDate(rawText: string): string | null {
     if (!rawText) return null;
     const now = dayjs().tz('Asia/Seoul');
 
-    // 1) 3단 구분: [4자리 연도 OR 1~2자리 년기/기수] + 월 + 일
-    // 예: 43.10.03, 43/10/03, 43-10-03, 43년 10월 3일, 2026.10.02, 2026-10-02 등
+    // 1) 3단 구분: [4자리 연도 OR 1~2자리 기수] + 월 + 일
     const threeParts = rawText.match(/(?:^|[^\d])(\d{1,4})[\-\/\.\s년]+(\d{1,2})[\-\/\.\s월]+(\d{1,2})(?:일)?/);
     if (threeParts) {
         const p1 = parseInt(threeParts[1], 10);
         const month = parseInt(threeParts[2], 10);
         const day = parseInt(threeParts[3], 10);
 
-        // 월/일 유효 범위 검증
         if (month >= 1 && month <= 12 && day >= 1 && day <= 31) {
             let year = now.year();
-
-            // 4자리 정상 연도(2026 등)인 경우 해당 연도 반영
             if (threeParts[1].length === 4) {
                 year = p1;
             } else {
-                // 43 같은 1~2자리 년기/기수 표기는 무시하고 현재 연도 기준 반영
-                // (12월 시점에 다음 만남이 1월인 경우 이듬해로 처리)
                 if (now.month() === 11 && month === 1) {
                     year += 1;
                 }
@@ -228,8 +195,7 @@ function parseFlexibleDate(rawText: string): string | null {
         }
     }
 
-    // 2) 2단 구분: 월 + 일 (연도/년기 생략)
-    // 예: 10/2(금), 10월 2일, 10.2, 10-02, 10월2일(금), 10.03 등
+    // 2) 2단 구분: 월 + 일 (연도 생략)
     const twoParts = rawText.match(/(?:^|[^\d])(\d{1,2})[\-\/\.\s월]+(\d{1,2})(?:일)?/);
     if (twoParts) {
         const month = parseInt(twoParts[1], 10);
@@ -250,10 +216,33 @@ function parseFlexibleDate(rawText: string): string | null {
 }
 
 function extractNextMeetingRaw(text: string): string | null {
-    // 다음만남일, 다음만남일시, 다음만남, 다음 일정 등 폭넓게 인식
     const match = text.match(/다음\s*(?:만남일시|만남\s*일시|만남일|만남\s*일|만남|일정)\s*[:：\-]?\s*([^\n\r]+)/i);
     return match && match[1] ? match[1].trim() : null;
 }
+
+// 텔레그램 메시지 길이 제한(4,096자) 방지 분할 전송 함수
+async function sendChunkedList<T>(
+    ctx: any,
+    header: string,
+    items: T[],
+    renderItem: (item: T, globalIndex: number) => string,
+    chunkSize = 15
+) {
+    for (let i = 0; i < items.length; i += chunkSize) {
+        const chunk = items.slice(i, i + chunkSize);
+        let message =
+            i === 0
+                ? header
+                : `📋 <b>[목록 계속 (${i + 1}~${Math.min(i + chunkSize, items.length)})]</b>\n━━━━━━━━━━━━━━━━━━\n\n`;
+
+        chunk.forEach((item, idx) => {
+            message += renderItem(item, i + idx + 1);
+        });
+
+        await ctx.reply(message, { parse_mode: 'HTML' });
+    }
+}
+
 /* =====================================================
  * 🤖 텔레그램 봇 핸들러
  * ===================================================== */
@@ -314,7 +303,7 @@ bot.hears(/^\/?(start|help|도움말)(?:@\w+)?$/i, async (ctx) => {
 
 // 1. 날짜별 만남 조회 (관리자 전용)
 bot.hears(
-    /^(?:\/?관리자(?:\s+(?!(?:미제출|미등록|미정|미갱신|최초미등록|점검|현황|중단|구분|단계|특수|섭등예정|예정가능일|가능가능일|일반|일반방))(.+))?|\/(?:만남명단|만남일정)(?:@\w+)?(?:\s+(.+))?)$/i,
+    /^(?:\/?관리자(?:\s+(?!(?:미제출|미등록|미정|미갱신|최초미등록|점검|현황|중단|구분|단계|특수|섭등예정|예정가능일|가능가능일|일반|일반방|미분류))(.+))?|\/(?:만남명단|만남일정)(?:@\w+)?(?:\s+(.+))?)$/i,
     async (ctx) => {
         try {
             const userId = String(ctx.from?.id);
@@ -361,21 +350,22 @@ bot.hears(
                 return;
             }
 
-            let message = `📋 <b>[만남 일정 명단] (총 ${targetChats.length}건)</b>\n`;
-            message += `📅 기준일: <b>${targetDateStr}</b>\n`;
-            message += `━━━━━━━━━━━━━━━━━━\n\n`;
+            const header =
+                `📋 <b>[만남 일정 명단] (총 ${targetChats.length}건)</b>\n` +
+                `📅 기준일: <b>${targetDateStr}</b>\n` +
+                `━━━━━━━━━━━━━━━━━━\n\n`;
 
-            targetChats.forEach((chat, index) => {
+            await sendChunkedList(ctx, header, targetChats, (chat, idx) => {
                 const feedbackBadge = chat.feedback_submitted ? '✅ 완료' : '❌ 미제출';
                 const reportBadge = chat.report_submitted ? '✅ 완료' : '⏳ 대기 중';
                 const stageBadge = chat.progress_stage ? ` [🏷 ${chat.progress_stage}]` : '';
 
-                message += `<b>${index + 1}. ${chat.room_title || '대화방'}${stageBadge}</b>\n`;
-                message += `   • 사전 피드백: ${feedbackBadge}\n`;
-                message += `   • 만남 보고서: ${reportBadge}\n\n`;
+                return (
+                    `<b>${idx}. ${escapeHtml(chat.room_title || '대화방')}${stageBadge}</b>\n` +
+                    `   • 사전 피드백: ${feedbackBadge}\n` +
+                    `   • 만남 보고서: ${reportBadge}\n\n`
+                );
             });
-
-            await ctx.reply(message, { parse_mode: 'HTML' });
         } catch (err: any) {
             console.error('[만남 명단 조회 에러]:', err);
         }
@@ -383,7 +373,7 @@ bot.hears(
 );
 
 // 2. 만남 보고서 미제출 명단 조회 (관리자 전용)
-bot.hears(/^(?:\/?관리자\s*)?(미제출\s*명단|미제출|보고서\s*미제출)(?:@\w+)?$/i, async (ctx) => {
+bot.hears(/^(?:\/?관리자\s+)((?:만남\s*)?보고서\s*미제출|미제출\s*명단|미제출)$/i, async (ctx) => {
     try {
         const userId = String(ctx.from?.id);
         if (!isAdmin(userId)) {
@@ -416,11 +406,12 @@ bot.hears(/^(?:\/?관리자\s*)?(미제출\s*명단|미제출|보고서\s*미제
             return;
         }
 
-        let message = `🚨 <b>[보고서 미제출 명단] (총 ${overdueChats.length}건)</b>\n`;
-        message += `기준시각: ${dayjs().tz('Asia/Seoul').format('YYYY-MM-DD HH:mm')}\n`;
-        message += `━━━━━━━━━━━━━━━━━━\n\n`;
+        const header =
+            `🚨 <b>[보고서 미제출 명단] (총 ${overdueChats.length}건)</b>\n` +
+            `기준시각: ${dayjs().tz('Asia/Seoul').format('YYYY-MM-DD HH:mm')}\n` +
+            `━━━━━━━━━━━━━━━━━━\n\n`;
 
-        overdueChats.forEach((chat, index) => {
+        await sendChunkedList(ctx, header, overdueChats, (chat, idx) => {
             const mDate = dayjs(chat.meeting_date).startOf('day');
             const diffDays = today.diff(mDate, 'day');
 
@@ -433,12 +424,12 @@ bot.hears(/^(?:\/?관리자\s*)?(미제출\s*명단|미제출|보고서\s*미제
                 delayBadge = `🚨 <b>${diffDays}일 경과 (경고 누적 대상)</b>`;
             }
 
-            message += `<b>${index + 1}. ${chat.room_title || '대화방'}</b>\n`;
-            message += `   • 만남일: ${mDate.format('YYYY-MM-DD')}\n`;
-            message += `   • 상태: ${delayBadge}\n\n`;
+            return (
+                `<b>${idx}. ${escapeHtml(chat.room_title || '대화방')}</b>\n` +
+                `   • 만남일: ${mDate.format('YYYY-MM-DD')}\n` +
+                `   • 상태: ${delayBadge}\n\n`
+            );
         });
-
-        await ctx.reply(message, { parse_mode: 'HTML' });
     } catch (err: any) {
         console.error('[미제출 명단 조회 에러]:', err);
     }
@@ -446,7 +437,7 @@ bot.hears(/^(?:\/?관리자\s*)?(미제출\s*명단|미제출|보고서\s*미제
 
 // 3. 봇 초대 후 미등록 방 및 만남일 미정 방 명단 조회 (관리자 전용)
 bot.hears(
-    /^(?:\/?관리자\s*)?(최초\s*미등록|미등록\s*명단|미등록|신규\s*미등록|미정|미정\s*만남|미정\s*명단)(?:@\w+)?$/i,
+    /^(?:\/?관리자\s+)(최초\s*미등록|미등록\s*명단|미등록|신규\s*미등록|미정|미정\s*만남|미정\s*명단)$/i,
     async (ctx) => {
         try {
             const userId = String(ctx.from?.id);
@@ -488,7 +479,7 @@ bot.hears(
                         : '-';
                     const reportBadge = chat.report_submitted ? '✅ 보고서 완료' : '⏳ 보고서 대기';
 
-                    message += `<b>${index + 1}. ${chat.room_title || '대화방'}</b>\n`;
+                    message += `<b>${index + 1}. ${escapeHtml(chat.room_title || '대화방')}</b>\n`;
                     message += `   • 상태: <b>만남일 미정 (일정 확정 필요)</b>\n`;
                     message += `   • 최근 변경: ${updated} (${reportBadge})\n`;
                     message += `   • Chat ID: <code>${chat.chat_id}</code>\n\n`;
@@ -506,7 +497,7 @@ bot.hears(
                         durationStr = diffDays === 0 ? '오늘 초대됨' : `${diffDays}일째 미등록`;
                     }
 
-                    message += `<b>${index + 1}. ${chat.room_title || '대화방'}</b>\n`;
+                    message += `<b>${index + 1}. ${escapeHtml(chat.room_title || '대화방')}</b>\n`;
                     message += `   • 봇 초대일: ${
                         created ? created.format('YYYY-MM-DD') : '기록 없음'
                     } (${durationStr})\n`;
@@ -523,7 +514,7 @@ bot.hears(
 );
 
 // 4. 만남일 경과 후 미갱신 방 명단 (관리자 전용)
-bot.hears(/^(?:\/?관리자\s*)?(미갱신\s*명단|미갱신|일정\s*미갱신)(?:@\w+)?$/i, async (ctx) => {
+bot.hears(/^(?:\/?관리자\s+)(미갱신\s*명단|미갱신|일정\s*미갱신)$/i, async (ctx) => {
     try {
         const userId = String(ctx.from?.id);
         if (!isAdmin(userId)) {
@@ -556,28 +547,29 @@ bot.hears(/^(?:\/?관리자\s*)?(미갱신\s*명단|미갱신|일정\s*미갱신
             return;
         }
 
-        let message = `⌛ <b>[만남일 경과 후 미갱신 대화방] (총 ${expiredChats.length}건)</b>\n`;
-        message += `<i>(이전 만남일이 지났으나 다음 일정이 설정되지 않음)</i>\n`;
-        message += `━━━━━━━━━━━━━━━━━━\n\n`;
+        const header =
+            `⌛ <b>[만남일 경과 후 미갱신 대화방] (총 ${expiredChats.length}건)</b>\n` +
+            `<i>(이전 만남일이 지났으나 다음 일정이 설정되지 않음)</i>\n` +
+            `━━━━━━━━━━━━━━━━━━\n\n`;
 
-        expiredChats.forEach((chat, index) => {
+        await sendChunkedList(ctx, header, expiredChats, (chat, idx) => {
             const mDate = dayjs(chat.meeting_date).startOf('day');
             const diffDays = today.diff(mDate, 'day');
             const reportBadge = chat.report_submitted ? '✅ 보고서 제출됨' : '❌ 보고서 미제출';
 
-            message += `<b>${index + 1}. ${chat.room_title || '대화방'}</b>\n`;
-            message += `   • 지난 만남일: ${mDate.format('YYYY-MM-DD')} (${diffDays}일 경과)\n`;
-            message += `   • 보고서 상태: ${reportBadge}\n\n`;
+            return (
+                `<b>${idx}. ${escapeHtml(chat.room_title || '대화방')}</b>\n` +
+                `   • 지난 만남일: ${mDate.format('YYYY-MM-DD')} (${diffDays}일 경과)\n` +
+                `   • 보고서 상태: ${reportBadge}\n\n`
+            );
         });
-
-        await ctx.reply(message, { parse_mode: 'HTML' });
     } catch (err: any) {
         console.error('[미갱신 명단 조회 에러]:', err);
     }
 });
 
 // 5. 만남 중단 대화방 명단 (관리자 전용: 관리자 중단)
-bot.hears(/^(?:\/?관리자\s*)?(중단\s*명단|중단|만남중단)(?:@\w+)?$/i, async (ctx) => {
+bot.hears(/^(?:\/?관리자\s+)(중단\s*명단|중단|만남중단)$/i, async (ctx) => {
     try {
         const userId = String(ctx.from?.id);
         if (!isAdmin(userId)) {
@@ -598,29 +590,30 @@ bot.hears(/^(?:\/?관리자\s*)?(중단\s*명단|중단|만남중단)(?:@\w+)?$/
             return;
         }
 
-        let message = `🛑 <b>[만남 중단 대화방 목록] (총 ${stoppedChats.length}건)</b>\n`;
-        message += `기준시각: ${dayjs().tz('Asia/Seoul').format('YYYY-MM-DD HH:mm')}\n`;
-        message += `━━━━━━━━━━━━━━━━━━\n\n`;
+        const header =
+            `🛑 <b>[만남 중단 대화방 목록] (총 ${stoppedChats.length}건)</b>\n` +
+            `기준시각: ${dayjs().tz('Asia/Seoul').format('YYYY-MM-DD HH:mm')}\n` +
+            `━━━━━━━━━━━━━━━━━━\n\n`;
 
-        stoppedChats.forEach((chat, index) => {
+        await sendChunkedList(ctx, header, stoppedChats, (chat, idx) => {
             const stoppedAt = chat.updated_at
                 ? dayjs(chat.updated_at).tz('Asia/Seoul').format('YYYY-MM-DD HH:mm')
                 : '-';
 
-            message += `<b>${index + 1}. ${chat.room_title || '대화방'}</b>\n`;
-            message += `   • 사유: <b>${chat.stop_reason || '사유 미입력'}</b>\n`;
-            message += `   • 중단일시: ${stoppedAt}\n`;
-            message += `   • Chat ID: <code>${chat.chat_id}</code>\n\n`;
+            return (
+                `<b>${idx}. ${escapeHtml(chat.room_title || '대화방')}</b>\n` +
+                `   • 사유: <b>${escapeHtml(chat.stop_reason || '사유 미입력')}</b>\n` +
+                `   • 중단일시: ${stoppedAt}\n` +
+                `   • Chat ID: <code>${chat.chat_id}</code>\n\n`
+            );
         });
-
-        await ctx.reply(message, { parse_mode: 'HTML' });
     } catch (err: any) {
         console.error('[중단 명단 조회 에러]:', err);
     }
 });
 
 // 6. 세 가지 상황(섭등예정, 예정가능일, 가능가능일) 종합 확인 (관리자 전용: 관리자 구분, 관리자 단계)
-bot.hears(/^(?:\/?관리자\s*)?(구분|단계|특수|진행구분)(?:@\w+)?$/i, async (ctx) => {
+bot.hears(/^(?:\/?관리자\s+)(구분|단계|특수|진행구분)$/i, async (ctx) => {
     try {
         const userId = String(ctx.from?.id);
         if (!isAdmin(userId)) {
@@ -652,9 +645,9 @@ bot.hears(/^(?:\/?관리자\s*)?(구분|단계|특수|진행구분)(?:@\w+)?$/i,
         if (subdeung.length > 0) {
             msg += `📌 <b>[섭등예정] (${subdeung.length}건)</b>\n`;
             subdeung.forEach((c, i) => {
-                const note = c.progress_note ? ` (메모: ${c.progress_note})` : '';
+                const note = c.progress_note ? ` (메모: ${escapeHtml(c.progress_note)})` : '';
                 const mDate = c.meeting_date ? ` [만남일: ${c.meeting_date}]` : '';
-                msg += `${i + 1}. <b>${c.room_title}</b>${mDate}${note}\n`;
+                msg += `${i + 1}. <b>${escapeHtml(c.room_title)}</b>${mDate}${note}\n`;
             });
             msg += `\n`;
         }
@@ -662,9 +655,9 @@ bot.hears(/^(?:\/?관리자\s*)?(구분|단계|특수|진행구분)(?:@\w+)?$/i,
         if (yejeong.length > 0) {
             msg += `🗓 <b>[예정가능일] (${yejeong.length}건)</b>\n`;
             yejeong.forEach((c, i) => {
-                const note = c.progress_note ? ` (메모: ${c.progress_note})` : '';
+                const note = c.progress_note ? ` (메모: ${escapeHtml(c.progress_note)})` : '';
                 const mDate = c.meeting_date ? ` [만남일: ${c.meeting_date}]` : '';
-                msg += `${i + 1}. <b>${c.room_title}</b>${mDate}${note}\n`;
+                msg += `${i + 1}. <b>${escapeHtml(c.room_title)}</b>${mDate}${note}\n`;
             });
             msg += `\n`;
         }
@@ -672,9 +665,9 @@ bot.hears(/^(?:\/?관리자\s*)?(구분|단계|특수|진행구분)(?:@\w+)?$/i,
         if (ganeung.length > 0) {
             msg += `✨ <b>[가능가능일] (${ganeung.length}건)</b>\n`;
             ganeung.forEach((c, i) => {
-                const note = c.progress_note ? ` (메모: ${c.progress_note})` : '';
+                const note = c.progress_note ? ` (메모: ${escapeHtml(c.progress_note)})` : '';
                 const mDate = c.meeting_date ? ` [만남일: ${c.meeting_date}]` : '';
-                msg += `${i + 1}. <b>${c.room_title}</b>${mDate}${note}\n`;
+                msg += `${i + 1}. <b>${escapeHtml(c.room_title)}</b>${mDate}${note}\n`;
             });
             msg += `\n`;
         }
@@ -686,7 +679,7 @@ bot.hears(/^(?:\/?관리자\s*)?(구분|단계|특수|진행구분)(?:@\w+)?$/i,
 });
 
 // 7. 세 가지 상황 개별 조회 (관리자 전용: 관리자 섭등예정, 관리자 예정가능일, 관리자 가능가능일)
-bot.hears(/^(?:\/?관리자\s*)(섭등예정|예정가능일|가능가능일)(?:@\w+)?$/i, async (ctx) => {
+bot.hears(/^(?:\/?관리자\s+)(섭등예정|예정가능일|가능가능일)$/i, async (ctx) => {
     try {
         const userId = String(ctx.from?.id);
         if (!isAdmin(userId)) {
@@ -708,25 +701,25 @@ bot.hears(/^(?:\/?관리자\s*)(섭등예정|예정가능일|가능가능일)(?:
             return;
         }
 
-        let msg = `🏷 <b>[${targetStage} 대화방 목록] (총 ${targets.length}건)</b>\n`;
-        msg += `기준시각: ${dayjs().tz('Asia/Seoul').format('YYYY-MM-DD HH:mm')}\n`;
-        msg += `━━━━━━━━━━━━━━━━━━\n\n`;
+        const header =
+            `🏷 <b>[${targetStage} 대화방 목록] (총 ${targets.length}건)</b>\n` +
+            `기준시각: ${dayjs().tz('Asia/Seoul').format('YYYY-MM-DD HH:mm')}\n` +
+            `━━━━━━━━━━━━━━━━━━\n\n`;
 
-        targets.forEach((c, i) => {
-            msg += `<b>${i + 1}. ${c.room_title || '대화방'}</b>\n`;
-            msg += `   • 만남일정: <b>${c.meeting_date || '일정 미등록'}</b>\n`;
-            if (c.progress_note) msg += `   • 메모/내용: ${c.progress_note}\n`;
-            msg += `   • Chat ID: <code>${c.chat_id}</code>\n\n`;
+        await sendChunkedList(ctx, header, targets, (c, i) => {
+            let itemStr = `<b>${i}. ${escapeHtml(c.room_title || '대화방')}</b>\n`;
+            itemStr += `   • 만남일정: <b>${c.meeting_date || '일정 미등록'}</b>\n`;
+            if (c.progress_note) itemStr += `   • 메모/내용: ${escapeHtml(c.progress_note)}\n`;
+            itemStr += `   • Chat ID: <code>${c.chat_id}</code>\n\n`;
+            return itemStr;
         });
-
-        await ctx.reply(msg, { parse_mode: 'HTML' });
     } catch (err: any) {
         console.error('[관리자 개별 단계 조회 에러]:', err);
     }
 });
 
-// 8. 세 가지 상황이 아닌 대화방 확인 (관리자 전용: 관리자 일반, 관리자 일반방)
-bot.hears(/^(?:\/?관리자\s*)?(일반|일반방|미분류)(?:@\w+)?$/i, async (ctx) => {
+// 8. 세 가지 상황이 아닌 대화방 확인 (관리자 전용: 관리자 일반, 관리자 일반방, 관리자 미분류)
+bot.hears(/^(?:\/?관리자\s+)(일반|일반방|미분류)$/i, async (ctx) => {
     try {
         const userId = String(ctx.from?.id);
         if (!isAdmin(userId)) {
@@ -750,29 +743,35 @@ bot.hears(/^(?:\/?관리자\s*)?(일반|일반방|미분류)(?:@\w+)?$/i, async 
             return;
         }
 
-        let msg = `📋 <b>[일반 대화방 목록 (특수 3종 제외)] (총 ${normalChats.length}건)</b>\n`;
-        msg += `기준시각: ${dayjs().tz('Asia/Seoul').format('YYYY-MM-DD HH:mm')}\n`;
-        msg += `━━━━━━━━━━━━━━━━━━\n\n`;
+        const header =
+            `📋 <b>[일반 대화방 목록 (특수 3종 제외)] (총 ${normalChats.length}건)</b>\n` +
+            `기준시각: ${dayjs().tz('Asia/Seoul').format('YYYY-MM-DD HH:mm')}\n` +
+            `━━━━━━━━━━━━━━━━━━\n\n`;
 
-        normalChats.forEach((chat, index) => {
+        // 대화방이 수십 개 이상이어도 텔레그램 4,096자 제한에 걸리지 않도록 15개 단위로 자동 분할 전송
+        await sendChunkedList(ctx, header, normalChats, (chat, index) => {
             let statusText = chat.meeting_date;
             if (!statusText) statusText = '미등록';
-            else if (statusText === '중단') statusText = `중단 (${chat.stop_reason || '사유없음'})`;
+            else if (statusText === '중단') statusText = `중단 (${escapeHtml(chat.stop_reason || '사유없음')})`;
 
-            msg += `<b>${index + 1}. ${chat.room_title || '대화방'}</b>\n`;
-            msg += `   • 현재 상태: <b>${statusText}</b>\n`;
-            msg += `   • 보고서: ${chat.report_submitted ? '✅ 제출완료' : '⏳ 대기'}\n`;
-            msg += `   • Chat ID: <code>${chat.chat_id}</code>\n\n`;
+            const safeTitle = escapeHtml(chat.room_title || '대화방');
+            const reportBadge = chat.report_submitted ? '✅ 제출완료' : '⏳ 대기';
+
+            return (
+                `<b>${index}. ${safeTitle}</b>\n` +
+                `   • 현재 상태: <b>${statusText}</b>\n` +
+                `   • 보고서: ${reportBadge}\n` +
+                `   • Chat ID: <code>${chat.chat_id}</code>\n\n`
+            );
         });
-
-        await ctx.reply(msg, { parse_mode: 'HTML' });
     } catch (err: any) {
         console.error('[일반방 조회 에러]:', err);
+        await ctx.reply('⚠️ 일반방 목록을 불러오는 중 오류가 발생했습니다.');
     }
 });
 
 // 9. 전체 종합 점검 (관리자 전용)
-bot.hears(/^(?:\/?관리자\s*)?(점검|현황|종합\s*점검|전체\s*점검)(?:@\w+)?$/i, async (ctx) => {
+bot.hears(/^(?:\/?관리자\s+)(점검|현황|종합\s*점검|전체\s*점검)$/i, async (ctx) => {
     try {
         const userId = String(ctx.from?.id);
         if (!isAdmin(userId)) {
@@ -853,7 +852,7 @@ bot.hears(/^\/?(섭등예정|예정가능일|가능가능일)(?:@\w+)?(?:\s+(.+)
     });
 
     let replyMsg = `📌 <b>대화방 구분이 [${stage}]으로 설정되었습니다.</b>\n`;
-    if (note) replyMsg += `• 내용: ${note}\n`;
+    if (note) replyMsg += `• 내용: ${escapeHtml(note)}\n`;
     replyMsg += `\n💡 일반 상태로 복귀하려면 <code>/구분해제</code>를 입력하세요.`;
 
     await ctx.reply(replyMsg, { parse_mode: 'HTML' });
@@ -885,7 +884,7 @@ bot.hears(/^\/?상태확인(?:@\w+)?$/i, async (ctx) => {
 
     const stageText = record.progress_stage
         ? `🏷 <b>진행 단계</b>: <b>${record.progress_stage}</b>${
-              record.progress_note ? ` (${record.progress_note})` : ''
+              record.progress_note ? ` (${escapeHtml(record.progress_note)})` : ''
           }\n`
         : '';
 
@@ -894,7 +893,7 @@ bot.hears(/^\/?상태확인(?:@\w+)?$/i, async (ctx) => {
             `📊 <b>[현재 방 일정 상태]</b>\n\n` +
                 stageText +
                 `• <b>만남 상태</b>: 🛑 <b>만남 중단</b>\n` +
-                `• <b>중단 사유</b>: ${record.stop_reason || '사유 미입력'}\n\n` +
+                `• <b>중단 사유</b>: ${escapeHtml(record.stop_reason || '사유 미입력')}\n\n` +
                 `💡 만남 일정이 다시 잡히면 <code>/만남일 MM-DD</code>를 입력해주세요.`,
             { parse_mode: 'HTML' }
         );
@@ -978,7 +977,7 @@ bot.hears(/^\/?만남중단(?:@\w+)?(?:\s+(.+))?$/i, async (ctx) => {
 
     await ctx.reply(
         `🛑 <b>만남 일정이 [중단] 처리되었습니다.</b>\n\n` +
-            `• <b>중단 사유</b>: ${reason}\n\n` +
+            `• <b>중단 사유</b>: ${escapeHtml(reason)}\n\n` +
             `💡 만남이 재개되면 <code>/만남일 MM-DD</code>를 입력하여 새 일정을 등록해주세요.`,
         { parse_mode: 'HTML' }
     );
@@ -997,7 +996,6 @@ bot.hears(/^\/?만남일(?:@\w+)?(?:\s+(.+))?$/i, async (ctx) => {
 
     const title = 'title' in ctx.chat ? ctx.chat.title : ctx.chat.first_name || '대화방';
 
-    // 만남일이 '미정'으로 들어온 경우
     if (rawInput.includes('미정')) {
         upsertMeetingDate(ctx.chat.id, title, '미정');
         await ctx.reply(
@@ -1031,7 +1029,6 @@ bot.on('text', async (ctx) => {
     const chatId = ctx.chat.id;
     const roomTitle = 'title' in ctx.chat ? ctx.chat.title : ctx.chat.first_name || '대화방';
 
-    // DB에 방 정보가 없으면 기본 등록
     ensureChatRecord(chatId, roomTitle);
 
     // 명령어 및 관리자 호출 텍스트는 일반 텍스트 감지에서 제외
@@ -1054,7 +1051,6 @@ bot.on('text', async (ctx) => {
     if (isReport) {
         const rawNextDate = extractNextMeetingRaw(text);
 
-        // 보고서 내 '다음만남일' 항목이 '미정'인 경우
         if (rawNextDate && rawNextDate.includes('미정')) {
             upsertMeetingDate(chatId, roomTitle, '미정');
             updateChat(chatId, { report_submitted: 1 });
@@ -1095,7 +1091,7 @@ bot.on('text', async (ctx) => {
         return;
     }
 
-    // 피드백 감지: #피드백 또는 #피드백내용 태그가 포함된 경우에만 인식
+    // 피드백 감지: #피드백 또는 #피드백내용 태그가 포함된 경우
     if (/#피드백내용|#피드백/.test(text)) {
         updateChat(chatId, { feedback_submitted: 1 });
         await ctx.reply('📝 <b>피드백 내용이 확인되었습니다.</b> 감사합니다.', { parse_mode: 'HTML' });
