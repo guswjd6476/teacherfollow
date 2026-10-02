@@ -288,7 +288,7 @@ bot.hears(/^\/?(start|help|도움말)(?:@\w+)?$/i, async (ctx) => {
             '👑 <b>관리자 전용 명령어:</b>\n' +
             '• <b>특수 구분 현황 (3가지 종합)</b>: <code>관리자 구분</code>\n' +
             '• <b>구분별 단독 조회</b>: <code>관리자 섭등예정</code>, <code>관리자 예정가능일</code>, <code>관리자 가능가능일</code>\n' +
-            '• <b>일반방 조회 (3가지 제외)</b>: <code>관리자 일반</code>\n' +
+            '• <b>일반방 조회 (특수 3종 및 중단 제외)</b>: <code>관리자 일반</code>\n' +
             '• <b>만남 명단</b>: <code>관리자 오늘만남</code>, <code>관리자 내일만남</code>, <code>관리자 일자만남 MM-DD</code>\n' +
             '• <b>보고서 미제출</b>: <code>관리자 미제출</code>\n' +
             '• <b>미등록 및 미정 방 조회</b>: <code>관리자 미등록</code>\n' +
@@ -718,7 +718,7 @@ bot.hears(/^(?:\/?관리자\s+)(섭등예정|예정가능일|가능가능일)$/i
     }
 });
 
-// 8. 세 가지 상황이 아닌 대화방 확인 (관리자 전용: 관리자 일반, 관리자 일반방, 관리자 미분류)
+// 8. 특수 3종 및 중단 상태가 아닌 대화방 확인 (관리자 전용: 관리자 일반, 관리자 일반방, 관리자 미분류)
 bot.hears(/^(?:\/?관리자\s+)(일반|일반방|미분류)$/i, async (ctx) => {
     try {
         const userId = String(ctx.from?.id);
@@ -731,28 +731,28 @@ bot.hears(/^(?:\/?관리자\s+)(일반|일반방|미분류)$/i, async (ctx) => {
         }
 
         const allChats = getAllChats();
-        // 섭등예정, 예정가능일, 가능가능일 세 가지가 설정되어 있지 않은 일반 방들
+        // 섭등예정, 예정가능일, 가능가능일 제외 AND 만남 중단 상태(meeting_date === '중단') 제외
         const normalChats = allChats.filter(
-            (c) => !c.progress_stage || !['섭등예정', '예정가능일', '가능가능일'].includes(c.progress_stage)
+            (c) =>
+                (!c.progress_stage || !['섭등예정', '예정가능일', '가능가능일'].includes(c.progress_stage)) &&
+                c.meeting_date !== '중단'
         );
 
         if (normalChats.length === 0) {
-            await ctx.reply('✨ <b>모든 대화방이 특수 단계(섭등예정/예정가능일/가능가능일)로 분류되어 있습니다.</b>', {
+            await ctx.reply('✨ <b>특수 단계 및 중단 상태를 제외한 일반 대화방이 없습니다.</b>', {
                 parse_mode: 'HTML',
             });
             return;
         }
 
         const header =
-            `📋 <b>[일반 대화방 목록 (특수 3종 제외)] (총 ${normalChats.length}건)</b>\n` +
+            `📋 <b>[일반 대화방 목록 (특수 3종 및 중단 제외)] (총 ${normalChats.length}건)</b>\n` +
             `기준시각: ${dayjs().tz('Asia/Seoul').format('YYYY-MM-DD HH:mm')}\n` +
             `━━━━━━━━━━━━━━━━━━\n\n`;
 
-        // 대화방이 수십 개 이상이어도 텔레그램 4,096자 제한에 걸리지 않도록 15개 단위로 자동 분할 전송
         await sendChunkedList(ctx, header, normalChats, (chat, index) => {
             let statusText = chat.meeting_date;
             if (!statusText) statusText = '미등록';
-            else if (statusText === '중단') statusText = `중단 (${escapeHtml(chat.stop_reason || '사유없음')})`;
 
             const safeTitle = escapeHtml(chat.room_title || '대화방');
             const reportBadge = chat.report_submitted ? '✅ 제출완료' : '⏳ 대기';
@@ -807,11 +807,15 @@ bot.hears(/^(?:\/?관리자\s+)(점검|현황|종합\s*점검|전체\s*점검)$/
             return dayjs(c.meeting_date).startOf('day').isBefore(today);
         });
 
-        // 특수 분류 통계
+        // 특수 분류 및 일반(중단 제외) 통계
         const subdeung = allChats.filter((c) => c.progress_stage === '섭등예정').length;
         const yejeong = allChats.filter((c) => c.progress_stage === '예정가능일').length;
         const ganeung = allChats.filter((c) => c.progress_stage === '가능가능일').length;
-        const normalCount = allChats.length - (subdeung + yejeong + ganeung);
+        const normalCount = allChats.filter(
+            (c) =>
+                (!c.progress_stage || !['섭등예정', '예정가능일', '가능가능일'].includes(c.progress_stage)) &&
+                c.meeting_date !== '중단'
+        ).length;
 
         let msg = `📊 <b>[상담/복음방 전체 관리 현황]</b>\n`;
         msg += `기준시각: ${dayjs().tz('Asia/Seoul').format('YYYY-MM-DD HH:mm')}\n`;
@@ -822,7 +826,7 @@ bot.hears(/^(?:\/?관리자\s+)(점검|현황|종합\s*점검|전체\s*점검)$/
         msg += `• 섭등예정: <b>${subdeung}개 방</b>\n`;
         msg += `• 예정가능일: <b>${yejeong}개 방</b>\n`;
         msg += `• 가능가능일: <b>${ganeung}개 방</b>\n`;
-        msg += `• 일반(미지정): <b>${normalCount}개 방</b> (확인: <code>관리자 일반</code>)\n\n`;
+        msg += `• 일반(중단 제외): <b>${normalCount}개 방</b> (확인: <code>관리자 일반</code>)\n\n`;
 
         msg += `🗓 <b>[만남 및 보고서 상태]</b>\n`;
         msg += `• ❓ <b>첫 만남일 미등록</b>: ${unassigned.length}개 방\n`;
