@@ -77,6 +77,19 @@ function escapeHtml(text?: string | number | null): string {
     return String(text).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 }
 
+// 날짜를 'M/D' (예: 10/2) 형태로 포맷팅
+function formatDateDisplay(raw: any): string {
+    if (!raw) return '-';
+    const str = String(raw).trim();
+    if (str === '' || str === 'EMPTY_STRING' || str === 'NULL') return '-';
+
+    const d = dayjs(raw);
+    if (d.isValid()) {
+        return d.format('M/D');
+    }
+    return str;
+}
+
 /* =====================================================
  * 💾 Neon PostgreSQL 데이터베이스 인터페이스 및 함수
  * ===================================================== */
@@ -113,12 +126,11 @@ interface ChatRecord {
     updated_at: string;
 }
 
-// 텍스트에서 지역/팀/이름 추출 헬퍼 (예: "강북 1팀 귀요미" 또는 "강북/1/귀요미")
+// 텍스트에서 지역/팀/이름 추출 헬퍼 (슬래시 및 띄어쓰기 모두 지원)
 function parseMemberString(raw: string): { region: string; team: string; name: string } | null {
     if (!raw) return null;
     const cleaned = raw.trim();
 
-    // 1) 슬래시 구분
     if (cleaned.includes('/')) {
         const parts = cleaned.split('/').map((s) => s.trim());
         if (parts.length >= 3) {
@@ -126,13 +138,11 @@ function parseMemberString(raw: string): { region: string; team: string; name: s
         }
     }
 
-    // 2) 띄어쓰기 구분 ("강북 1팀 귀요미" 또는 "강북 1 귀요미")
     const spaceParts = cleaned.split(/\s+/).filter(Boolean);
     if (spaceParts.length >= 3) {
         return { region: spaceParts[0], team: spaceParts[1].replace(/팀/g, ''), name: spaceParts[2] };
     }
 
-    // 3) 붙여쓰기 형태 ("강북1팀 귀요미")
     if (spaceParts.length === 2) {
         const m = spaceParts[0].match(/^([가-힣]+?)(\d+)팀?$/);
         if (m) {
@@ -366,7 +376,7 @@ bot.on('new_chat_title', async (ctx) => {
     }
 });
 
-// 봇이 그룹에 추가되거나 퇴장당했을 때[cite: 7]
+// 봇이 방에 추가되거나 퇴장당했을 때
 bot.on('my_chat_member', async (ctx) => {
     const status = ctx.myChatMember.new_chat_member.status;
     const chatId = ctx.chat.id;
@@ -391,32 +401,53 @@ bot.on('my_chat_member', async (ctx) => {
     }
 });
 
-// 도움말 (/start, /help, /도움말)[cite: 7]
+// 종합 도움말 (/start, /help, /도움말)
 bot.hears(/^[\/!](start|help|도움말)(?:@\w+)?$/i, async (ctx) => {
     await ctx.reply(
-        '📌 <b>상담/복음방 봇 명령어 안내</b>\n\n' +
+        '📌 <b>[상담/복음방 일정 관리 봇 안내]</b>\n\n' +
+            '<b>1. 기본 설정 및 등록</b>\n' +
             '• <b>대상자 최초 등록</b>: <code>/최초등록 섭외자/지역/팀/인도자</code>\n' +
-            '• <b>인터뷰 만남 관련</b>:\n' +
-            '   - <code>/인터뷰사전양식</code> (사전 보고서 복사용 양식 출력)\n' +
-            '   - <code>/인터뷰양식</code> (결과 보고서 복사용 양식 출력)\n' +
-            '   - <i>사전 보고서를 채팅방에 올리면 인터뷰어/타이퍼/예정일이 자동 등록됩니다.</i>\n' +
-            '• <b>일반 만남일 설정</b>: <code>/만남일 MM-DD</code> 또는 <code>/만남일 미정</code>\n' +
+            '• <b>현재 방 상태 확인</b>: <code>/상태확인</code>\n' +
+            '• <b>행정 등록 확인</b>: <code>/행정확인</code>\n\n' +
+            '<b>2. 인터뷰 만남 단계</b>\n' +
+            '• <b>사전 보고서 등록</b>: 채팅방에 <code>[인터뷰 사전 보고서]</code> 양식 전송\n' +
+            '• <b>사전 보고서 양식</b>: <code>/인터뷰사전양식</code>\n' +
+            '• <b>인터뷰 항목 개별 수정</b>:\n' +
+            '   - 인터뷰어: <code>/인터뷰어 강북 1팀 귀요미</code>\n' +
+            '   - 타이퍼: <code>/타이퍼 강북 1팀 김공주</code> (해제: <code>/타이퍼 없음</code>)\n' +
+            '   - 예정일: <code>/인터뷰일 MM-DD</code>\n' +
+            '• <b>결과 보고서 양식</b>: <code>/인터뷰양식</code>\n' +
+            '   <i>(결과 보고서에서 [신청] 시 교사 만남으로 자동 전환)</i>\n\n' +
+            '<b>3. 교사 만남 및 일정 관리</b>\n' +
+            '• <b>만남일 설정</b>: <code>/만남일 MM-DD</code> 또는 <code>/만남일 미정</code>\n' +
             '• <b>만남 중단 처리</b>: <code>/만남중단 [사유]</code>\n' +
-            '• <b>행정 등록 확인</b>: <code>/행정확인</code>\n' +
-            '• <b>현재 방 일정/상태 확인</b>: <code>/상태확인</code>\n\n' +
-            '👑 <b>관리자 전용 명령어:</b>\n' +
-            '• <code>관리자 구분</code>, <code>관리자 오늘만남</code>, <code>관리자 내일만남</code>\n' +
-            '• <code>관리자 미제출</code>, <code>관리자 미등록</code>, <code>관리자 미갱신</code>, <code>관리자 중단</code>, <code>관리자 점검</code>',
+            '• <b>피드백 제출</b>: 메시지 내 <code>#피드백</code> 태그 포함\n' +
+            '• <b>만남 보고서 제출</b>: 양식 내 <code>다음만남일: MM-DD</code> 포함\n\n' +
+            '<b>4. 방 진행 단계 (특수 구분)</b>\n' +
+            '• <b>단계 설정</b>: <code>/섭등예정</code>, <code>/예정가능일</code>, <code>/가능가능일 [메모]</code>\n' +
+            '• <b>단계 해제</b>: <code>/구분해제</code> (일반 상태로 복귀)\n\n' +
+            '👑 <b>관리자 전용 명령어</b>\n' +
+            '• <b>인터뷰 예정건 모아보기</b>: <code>관리자 인터뷰</code>\n' +
+            '• <b>교사 만남 진행건 모아보기</b>: <code>관리자 교사</code>\n' +
+            '• <b>만남 명단 조회</b>: <code>관리자 오늘만남</code>, <code>관리자 내일만남</code>, <code>관리자 일자만남 MM-DD</code>\n' +
+            '• <b>보고서 미제출 명단</b>: <code>관리자 미제출</code>\n' +
+            '• <b>미등록 및 미정 방 조회</b>: <code>관리자 미등록</code>\n' +
+            '• <b>만남일 경과 미갱신 방</b>: <code>관리자 미갱신</code>\n' +
+            '• <b>만남 중단 방 목록</b>: <code>관리자 중단</code>\n' +
+            '• <b>특수 구분 현황 (3가지 종합)</b>: <code>관리자 구분</code>\n' +
+            '• <b>구분별 단독 조회</b>: <code>관리자 섭등예정</code>, <code>관리자 예정가능일</code>, <code>관리자 가능가능일</code>\n' +
+            '• <b>일반방 조회 (특수 3종 및 중단 제외)</b>: <code>관리자 일반</code>\n' +
+            '• <b>전체 종합 관리 현황</b>: <code>관리자 점검</code>',
         { parse_mode: 'HTML' }
     );
 });
 
-// 섭외자 최초 등록 (/최초등록 섭외자/지역/팀/인도자)[cite: 7]
+// 섭외자 최초 등록 (/최초등록 섭외자/지역/팀/인도자)
 bot.hears(/^[\/!]최초등록(?:@\w+)?(?:\s+(.+))?$/i, async (ctx) => {
     const rawInput = ctx.match[1]?.trim();
     if (!rawInput) {
         await ctx.reply(
-            '⚠️ <b>입력 양식이 올바르지 않습니다.</b>\n\n' +
+            '⚠️️ <b>입력 양식이 올바르지 않습니다.</b>\n\n' +
                 '• <b>입력 양식</b>: <code>/최초등록 섭외자/지역/팀/인도자</code>\n' +
                 '• <b>입력 예시</b>: <code>/최초등록 홍길동/강북/1/강현정</code>',
             { parse_mode: 'HTML' }
@@ -499,7 +530,7 @@ bot.hears(/^[\/!]최초등록(?:@\w+)?(?:\s+(.+))?$/i, async (ctx) => {
     }
 });
 
-// 버튼 콜백: 만남 유형 선택[cite: 7]
+// 버튼 콜백: 만남 유형 선택
 bot.action('type_interview', async (ctx) => {
     try {
         await ctx.answerCbQuery();
@@ -512,7 +543,7 @@ bot.action('type_interview', async (ctx) => {
             { parse_mode: 'HTML' }
         );
     } catch (err: any) {
-        console.error('[type_interview 에러]:', err.message);
+        console.error('[type_interview 에러]:', err);
     }
 });
 
@@ -528,18 +559,14 @@ bot.action('type_teacher', async (ctx) => {
             { parse_mode: 'HTML' }
         );
     } catch (err: any) {
-        console.error('[type_teacher 에러]:', err.message);
+        console.error('[type_teacher 에러]:', err);
     }
 });
 
 // 인터뷰 사전 보고서 양식 출력 (/인터뷰사전양식)
 bot.hears(/^[\/!](인터뷰사전양식|사전양식|사전보고서양식)(?:@\w+)?$/i, async (ctx) => {
-    const record = await getChatRecord(ctx.chat.id);
-    const targetName = record?.matched_student_name || '홍길동';
-
     const sample =
         `[인터뷰 사전 보고서]\n` +
-        `• 대상자: ${targetName}\n` +
         `• 인터뷰어: 강북 1팀 귀요미\n` +
         `• 타이퍼: 강북 1팀 김공주\n` +
         `• 인터뷰일시: 10-12\n` +
@@ -555,18 +582,10 @@ bot.hears(/^[\/!](인터뷰사전양식|사전양식|사전보고서양식)(?:@\
     );
 });
 
-// 인터뷰 결과 보고서 양식 출력 (/인터뷰양식)[cite: 7]
+// 인터뷰 결과 보고서 양식 출력 (/인터뷰양식)
 bot.hears(/^[\/!](인터뷰양식|인터뷰보고서양식)(?:@\w+)?$/i, async (ctx) => {
-    const record = await getChatRecord(ctx.chat.id);
-    const targetName = record?.matched_student_name || '홍길동';
-    const interviewer = record?.interviewer_name || '귀요미';
-    const typer = record?.typer_name || '김공주';
-
     const sample =
         `[인터뷰 결과 보고서]\n` +
-        `• 대상자: ${targetName}\n` +
-        `• 인터뷰어: ${interviewer}\n` +
-        `• 타이퍼: ${typer}\n` +
         `• 후속신청: 신청\n` +
         `• 미신청사유: (미신청 시 상세 사유 작성)\n` +
         `• 다음만남일: MM-DD\n` +
@@ -582,7 +601,150 @@ bot.hears(/^[\/!](인터뷰양식|인터뷰보고서양식)(?:@\w+)?$/i, async (
     );
 });
 
-// 매칭 해제 (/매칭해제)[cite: 7]
+// 인터뷰어 개별 수정 (/인터뷰어 [지역 팀 이름])
+bot.hears(/^[\/!](인터뷰어|인터뷰어수정|인터뷰어변경)(?:@\w+)?(?:\s+(.+))?$/i, async (ctx) => {
+    const rawInput = ctx.match[2]?.trim();
+    if (!rawInput) {
+        await ctx.reply(
+            '⚠️ 변경할 인터뷰어 정보를 입력해주세요.\n' +
+                '예: <code>/인터뷰어 강북 1팀 귀요미</code> 또는 <code>/인터뷰어 강북/1/귀요미</code>',
+            { parse_mode: 'HTML' }
+        );
+        return;
+    }
+
+    const info = parseMemberString(rawInput);
+    if (!info) {
+        await ctx.reply(
+            '⚠️ 형식 오류입니다. <code>지역 팀 이름</code> 형태로 입력해주세요.\n(예: <code>/인터뷰어 강북 1팀 귀요미</code>)',
+            {
+                parse_mode: 'HTML',
+            }
+        );
+        return;
+    }
+
+    try {
+        const member = await findMemberFromDB(info.name, info.region, info.team);
+        if (!member) {
+            await ctx.reply(`❌ DB에서 인터뷰어를 찾을 수 없습니다: ${escapeHtml(rawInput)}`, { parse_mode: 'HTML' });
+            return;
+        }
+
+        const infoStr = `${member['지역']} ${member['구역']} ${member['이름']}`;
+        await updateChat(ctx.chat.id, {
+            meeting_type: '인터뷰',
+            interviewer_name: member['이름'],
+            interviewer_code: member['고유번호'],
+            interviewer_info: infoStr,
+        });
+
+        await ctx.reply(
+            `🎙️ <b>인터뷰어가 성공적으로 수정되었습니다!</b>\n\n` +
+                `• <b>담당 인터뷰어</b>: <b>${escapeHtml(member['이름'])}</b> (${escapeHtml(
+                    member['지역']
+                )} / ${escapeHtml(member['구역'])})`,
+            { parse_mode: 'HTML' }
+        );
+    } catch (err: any) {
+        console.error('[/인터뷰어 개별 수정 에러]:', err);
+        await ctx.reply(`⚠ 인터뷰어 수정 중 오류 발생: ${err.message}`);
+    }
+});
+
+// 타이퍼 개별 수정 (/타이퍼 [지역 팀 이름] 또는 /타이퍼 없음)
+bot.hears(/^[\/!](타이퍼|타이퍼수정|타이퍼변경)(?:@\w+)?(?:\s+(.+))?$/i, async (ctx) => {
+    const rawInput = ctx.match[2]?.trim();
+    if (!rawInput) {
+        await ctx.reply(
+            '⚠️ 변경할 타이퍼 정보를 입력해주세요.\n' +
+                '• 지정: <code>/타이퍼 강북 1팀 김공주</code>\n' +
+                '• 해제: <code>/타이퍼 없음</code> 또는 <code>/타이퍼 미지정</code>',
+            { parse_mode: 'HTML' }
+        );
+        return;
+    }
+
+    if (/^(없음|미지정|해제|\-|X)$/i.test(rawInput)) {
+        await updateChat(ctx.chat.id, {
+            typer_name: null,
+            typer_code: null,
+            typer_info: null,
+        });
+        await ctx.reply('⌨️ <b>타이퍼가 [미지정]으로 해제되었습니다.</b>', { parse_mode: 'HTML' });
+        return;
+    }
+
+    const info = parseMemberString(rawInput);
+    if (!info) {
+        await ctx.reply(
+            '⚠️ 형식 오류입니다. <code>지역 팀 이름</code> 형태로 입력해주세요.\n(예: <code>/타이퍼 강북 1팀 김공주</code>)',
+            {
+                parse_mode: 'HTML',
+            }
+        );
+        return;
+    }
+
+    try {
+        const member = await findMemberFromDB(info.name, info.region, info.team);
+        if (!member) {
+            await ctx.reply(`❌ DB에서 타이퍼를 찾을 수 없습니다: ${escapeHtml(rawInput)}`, { parse_mode: 'HTML' });
+            return;
+        }
+
+        const infoStr = `${member['지역']} ${member['구역']} ${member['이름']}`;
+        await updateChat(ctx.chat.id, {
+            typer_name: member['이름'],
+            typer_code: member['고유번호'],
+            typer_info: infoStr,
+        });
+
+        await ctx.reply(
+            `⌨️ <b>타이퍼가 성공적으로 수정되었습니다!</b>\n\n` +
+                `• <b>담당 타이퍼</b>: <b>${escapeHtml(member['이름'])}</b> (${escapeHtml(
+                    member['지역']
+                )} / ${escapeHtml(member['구역'])})`,
+            { parse_mode: 'HTML' }
+        );
+    } catch (err: any) {
+        console.error('[/타이퍼 개별 수정 에러]:', err);
+        await ctx.reply(`⚠️ 타이퍼 수정 중 오류 발생: ${err.message}`);
+    }
+});
+
+// 인터뷰 예정일 개별 수정 (/인터뷰일 [MM-DD])
+bot.hears(/^[\/!](인터뷰일|인터뷰일자|인터뷰일정)(?:@\w+)?(?:\s+(.+))?$/i, async (ctx) => {
+    const rawInput = ctx.match[2]?.trim();
+    if (!rawInput) {
+        await ctx.reply('⚠️ 날짜를 입력해주세요.\n예: <code>/인터뷰일 10-12</code> 또는 <code>/인터뷰일 미정</code>', {
+            parse_mode: 'HTML',
+        });
+        return;
+    }
+
+    const title = 'title' in ctx.chat ? ctx.chat.title : ctx.chat.first_name || '대화방';
+
+    if (rawInput.includes('미정')) {
+        await upsertMeetingDate(ctx.chat.id, title, '미정');
+        await updateChat(ctx.chat.id, { meeting_type: '인터뷰', interview_date: '미정' });
+        await ctx.reply('📌 <b>인터뷰 일정이 [미정]으로 변경되었습니다.</b>', { parse_mode: 'HTML' });
+        return;
+    }
+
+    const formatted = parseFlexibleDate(rawInput);
+    if (!formatted) {
+        await ctx.reply('⚠️ 올바른 날짜 형식이 아닙니다. (예: 10-12, 10/12, 2026-10-12)');
+        return;
+    }
+
+    await upsertMeetingDate(ctx.chat.id, title, formatted);
+    await updateChat(ctx.chat.id, { meeting_type: '인터뷰', interview_date: formatted });
+
+    await ctx.reply(`🎙️ <b>인터뷰 예정일이 [${formatted}]로 변경되었습니다!</b>`, { parse_mode: 'HTML' });
+});
+
+// 매칭 해제 (/매칭해제)
 bot.hears(/^[\/!]매칭해제(?:@\w+)?$/i, async (ctx) => {
     await updateChat(ctx.chat.id, {
         matched_member_id: null,
@@ -601,7 +763,7 @@ bot.hears(/^[\/!]매칭해제(?:@\w+)?$/i, async (ctx) => {
     await ctx.reply('✅ 대상자 매칭 및 인터뷰 설정이 모두 초기화되었습니다.');
 });
 
-// 행정 등록 내역 확인 (/행정확인)[cite: 7]
+// 행정 등록 내역 확인 (/행정확인)
 bot.hears(/^[\/!]행정확인(?:@\w+)?$/i, async (ctx) => {
     try {
         const chat = await getChatRecord(ctx.chat.id);
@@ -642,9 +804,9 @@ bot.hears(/^[\/!]행정확인(?:@\w+)?$/i, async (ctx) => {
         const getFieldVal = (candidates: string[]): string | null => {
             for (const key of candidates) {
                 if (s[key] !== undefined && s[key] !== null) {
-                    const val = String(s[key]).trim();
-                    if (val !== '' && val !== 'EMPTY_STRING' && val !== 'NULL') {
-                        return val;
+                    const formatted = formatDateDisplay(s[key]);
+                    if (formatted !== '-') {
+                        return formatted;
                     }
                 }
             }
@@ -707,7 +869,7 @@ bot.hears(/^[\/!]행정확인(?:@\w+)?$/i, async (ctx) => {
     }
 });
 
-// 개별 방 상태 확인 (/상태확인)[cite: 7]
+// 개별 방 상태 확인 (/상태확인)
 bot.hears(/^[\/!]상태확인(?:@\w+)?$/i, async (ctx) => {
     const record = await getChatRecord(ctx.chat.id);
     if (!record) {
@@ -811,7 +973,7 @@ bot.hears(/^[\/!]상태확인(?:@\w+)?$/i, async (ctx) => {
     );
 });
 
-// 만남 중단 설정 (/만남중단 [사유])[cite: 7]
+// 만남 중단 설정 (/만남중단 [사유])
 bot.hears(/^[\/!]만남중단(?:@\w+)?(?:\s+(.+))?$/i, async (ctx) => {
     const reason = ctx.match[1]?.trim();
     if (!reason) {
@@ -845,13 +1007,16 @@ bot.hears(/^[\/!]만남중단(?:@\w+)?(?:\s+(.+))?$/i, async (ctx) => {
     );
 });
 
-// 만남일 수동 설정 (/만남일 MM-DD, 만남일 미정 등)[cite: 7]
+// 만남일 수동 설정 (/만남일 MM-DD, 만남일 미정 등)
 bot.hears(/^[\/!]만남일(?:@\w+)?(?:\s+(.+))?$/i, async (ctx) => {
     const rawInput = ctx.match[1]?.trim();
     if (!rawInput) {
-        await ctx.reply('⚠️ 날짜를 함께 입력해주세요.\n예: <code>/만남일 09-24</code> 또는 <code>/만남일 미정</code>', {
-            parse_mode: 'HTML',
-        });
+        await ctx.reply(
+            '⚠️️ 날짜를 함께 입력해주세요.\n예: <code>/만남일 09-24</code> 또는 <code>/만남일 미정</code>',
+            {
+                parse_mode: 'HTML',
+            }
+        );
         return;
     }
 
@@ -884,7 +1049,7 @@ bot.hears(/^[\/!]만남일(?:@\w+)?(?:\s+(.+))?$/i, async (ctx) => {
     );
 });
 
-// 방 구분 설정 (/섭등예정, /예정가능일, /가능가능일 [메모])[cite: 7]
+// 방 구분 설정 (/섭등예정, /예정가능일, /가능가능일 [메모])
 bot.hears(/^[\/!](섭등예정|예정가능일|가능가능일)(?:@\w+)?(?:\s+(.+))?$/i, async (ctx) => {
     const stage = ctx.match[1] as '섭등예정' | '예정가능일' | '가능가능일';
     const note = ctx.match[2]?.trim() || '';
@@ -903,7 +1068,7 @@ bot.hears(/^[\/!](섭등예정|예정가능일|가능가능일)(?:@\w+)?(?:\s+(.
     await ctx.reply(replyMsg, { parse_mode: 'HTML' });
 });
 
-// 방 구분 해제 (/구분해제, /일반)[cite: 7]
+// 방 구분 해제 (/구분해제, /일반)
 bot.hears(/^[\/!](구분해제|일반)(?:@\w+)?$/i, async (ctx) => {
     const title = 'title' in ctx.chat ? ctx.chat.title : ctx.chat.first_name || '대화방';
     await ensureChatRecord(ctx.chat.id, title);
@@ -916,9 +1081,137 @@ bot.hears(/^[\/!](구분해제|일반)(?:@\w+)?$/i, async (ctx) => {
     await ctx.reply('✅ <b>특수 구분이 해제되어 [일반] 상태로 전환되었습니다.</b>', { parse_mode: 'HTML' });
 });
 
-// 관리자 명령어 1. 날짜별 만남 조회[cite: 7]
+/* =====================================================
+ * 👑 관리자 전용 명령어 핸들러 (인터뷰 / 교사 분리 체계)
+ * ===================================================== */
+
+// [신규] 관리자 인터뷰 예정건 전체 모아보기
+bot.hears(/^(?:[\/!]?관리자\s+)(인터뷰|인터뷰예정|인터뷰목록|인터뷰건)$/i, async (ctx) => {
+    try {
+        const userId = String(ctx.from?.id);
+        if (!isAdmin(userId)) {
+            await ctx.reply('⛔ <b>접근 권한이 없습니다.</b> 관리자만 사용할 수 있습니다.', { parse_mode: 'HTML' });
+            return;
+        }
+
+        const today = dayjs().tz('Asia/Seoul').startOf('day');
+        const allChats = await getAllChats();
+
+        const interviewChats = allChats
+            .filter((c) => c.meeting_type === '인터뷰' && c.meeting_date !== '중단')
+            .sort((a, b) => {
+                if (!a.meeting_date || a.meeting_date === '미정') return 1;
+                if (!b.meeting_date || b.meeting_date === '미정') return -1;
+                return dayjs(a.meeting_date).valueOf() - dayjs(b.meeting_date).valueOf();
+            });
+
+        if (interviewChats.length === 0) {
+            await ctx.reply('✨ <b>현재 진행 중인 인터뷰 만남 일정이 없습니다.</b>', { parse_mode: 'HTML' });
+            return;
+        }
+
+        const header =
+            `🎙️ <b>[인터뷰 예정건 목록] (총 ${interviewChats.length}건)</b>\n` +
+            `기준시각: ${dayjs().tz('Asia/Seoul').format('YYYY-MM-DD HH:mm')}\n` +
+            `━━━━━━━━━━━━━━━━━━\n\n`;
+
+        await sendChunkedList(ctx, header, interviewChats, (chat, idx) => {
+            const studentName = chat.matched_student_name
+                ? `👤 <b>${escapeHtml(chat.matched_student_name)}</b>`
+                : '미매칭';
+            const interviewer = chat.interviewer_info ? escapeHtml(chat.interviewer_info) : '⚠️ 미등록';
+            const typer = chat.typer_info ? escapeHtml(chat.typer_info) : '미지정';
+
+            let dateDisplay = '미등록';
+            if (chat.meeting_date === '미정') {
+                dateDisplay = '⚠️️ 일정 미정';
+            } else if (chat.meeting_date) {
+                const mDate = dayjs(chat.meeting_date).startOf('day');
+                const diff = mDate.diff(today, 'day');
+                const dDayStr = diff === 0 ? '오늘' : diff > 0 ? `D-${diff}` : `${Math.abs(diff)}일 경과`;
+                dateDisplay = `${mDate.format('YYYY-MM-DD')} (${dDayStr})`;
+            }
+
+            return (
+                `<b>${idx}. ${studentName}</b> [${escapeHtml(chat.room_title || '대화방')}]\n` +
+                `   • 인터뷰일: <b>${dateDisplay}</b>\n` +
+                `   • 인터뷰어: ${interviewer}\n` +
+                `   • 타이퍼: ${typer}\n` +
+                `   • 담당인도자: ${escapeHtml(chat.guide_name || '-')} (${escapeHtml(
+                    chat.guide_region || ''
+                )} ${escapeHtml(chat.guide_district || '')})\n\n`
+            );
+        });
+    } catch (err: any) {
+        console.error('[관리자 인터뷰 조회 에러]:', err);
+    }
+});
+
+// [신규] 관리자 교사 만남 진행건 전체 모아보기
+bot.hears(/^(?:[\/!]?관리자\s+)(교사|교사만남|교사목록|교사건)$/i, async (ctx) => {
+    try {
+        const userId = String(ctx.from?.id);
+        if (!isAdmin(userId)) {
+            await ctx.reply('⛔ <b>접근 권한이 없습니다.</b> 관리자만 사용할 수 있습니다.', { parse_mode: 'HTML' });
+            return;
+        }
+
+        const today = dayjs().tz('Asia/Seoul').startOf('day');
+        const allChats = await getAllChats();
+
+        const teacherChats = allChats
+            .filter((c) => c.meeting_type === '교사' && c.meeting_date !== '중단')
+            .sort((a, b) => {
+                if (!a.meeting_date || a.meeting_date === '미정') return 1;
+                if (!b.meeting_date || b.meeting_date === '미정') return -1;
+                return dayjs(a.meeting_date).valueOf() - dayjs(b.meeting_date).valueOf();
+            });
+
+        if (teacherChats.length === 0) {
+            await ctx.reply('✨ <b>현재 진행 중인 교사 만남 일정이 없습니다.</b>', { parse_mode: 'HTML' });
+            return;
+        }
+
+        const header =
+            `👨‍🏫 <b>[교사 만남 진행건 목록] (총 ${teacherChats.length}건)</b>\n` +
+            `기준시각: ${dayjs().tz('Asia/Seoul').format('YYYY-MM-DD HH:mm')}\n` +
+            `━━━━━━━━━━━━━━━━━━\n\n`;
+
+        await sendChunkedList(ctx, header, teacherChats, (chat, idx) => {
+            const studentName = chat.matched_student_name
+                ? `👤 <b>${escapeHtml(chat.matched_student_name)}</b>`
+                : '미매칭';
+            const feedbackBadge = chat.feedback_submitted ? '✅ 완료' : '❌ 미제출';
+            const reportBadge = chat.report_submitted ? '✅ 완료' : '⏳ 대기';
+            const stageBadge = chat.progress_stage ? ` [🏷 ${chat.progress_stage}]` : '';
+
+            let dateDisplay = '미등록';
+            if (chat.meeting_date === '미정') {
+                dateDisplay = '⚠️ 일정 미정';
+            } else if (chat.meeting_date) {
+                const mDate = dayjs(chat.meeting_date).startOf('day');
+                const diff = mDate.diff(today, 'day');
+                const dDayStr = diff === 0 ? '오늘' : diff > 0 ? `D-${diff}` : `${Math.abs(diff)}일 경과`;
+                dateDisplay = `${mDate.format('YYYY-MM-DD')} (${dDayStr})`;
+            }
+
+            return (
+                `<b>${idx}. ${studentName}</b>${stageBadge} [${escapeHtml(chat.room_title || '대화방')}]\n` +
+                `   • 다음만남일: <b>${dateDisplay}</b>\n` +
+                `   • 사전피드백: ${feedbackBadge} / 만남보고서: ${reportBadge}\n` +
+                `   • 담당인도자: ${escapeHtml(chat.guide_name || '-')} (${escapeHtml(
+                    chat.guide_region || ''
+                )} ${escapeHtml(chat.guide_district || '')})\n\n`
+            );
+        });
+    } catch (err: any) {
+        console.error('[관리자 교사 조회 에러]:', err);
+    }
+});
+
+// 날짜별 만남 조회 (관리자 오늘만남, 관리자 내일만남, 관리자 일자만남 MM-DD)
 bot.hears(
-    /^(?:[\/!]?관리자(?:\s+(?!(?:미제출|미등록|미정|미갱신|최초미등록|점검|현황|중단|구분|단계|특수|섭등예정|예정가능일|가능가능일|일반|일반방|미분류))(.+))?|[\/!](?:만남명단|만남일정)(?:@\w+)?(?:\s+(.+))?)$/i,
+    /^(?:[\/!]?관리자(?:\s+(?!(?:미제출|미등록|미정|미갱신|최초미등록|점검|현황|중단|구분|단계|특수|섭등예정|예정가능일|가능가능일|일반|일반방|미분류|인터뷰|인터뷰예정|인터뷰목록|인터뷰건|교사|교사만남|교사목록|교사건))(.+))?|[\/!](?:만남명단|만남일정)(?:@\w+)?(?:\s+(.+))?)$/i,
     async (ctx) => {
         try {
             const userId = String(ctx.from?.id);
@@ -965,20 +1258,34 @@ bot.hears(
                 `━━━━━━━━━━━━━━━━━━\n\n`;
 
             await sendChunkedList(ctx, header, targetChats, (chat, idx) => {
-                const feedbackBadge = chat.feedback_submitted ? '✅ 완료' : '❌ 미제출';
-                const reportBadge = chat.report_submitted ? '✅ 완료' : '⏳ 대기 중';
+                const isInterview = chat.meeting_type === '인터뷰';
+                const typeBadge = isInterview
+                    ? ' [🎙️ 인터뷰]'
+                    : chat.meeting_type === '교사'
+                    ? ' [👨‍🏫 교사]'
+                    : ' [미선택]';
                 const stageBadge = chat.progress_stage ? ` [🏷 ${chat.progress_stage}]` : '';
-                const typeBadge = chat.meeting_type ? ` [${chat.meeting_type}]` : '';
                 const memberBadge = chat.matched_student_name
                     ? ` (👤 ${escapeHtml(chat.matched_student_name)} / 인도자: ${escapeHtml(chat.guide_name || '-')})`
                     : '';
+
+                let detailLine = '';
+                if (isInterview) {
+                    detailLine = `   • 인터뷰어: ${escapeHtml(
+                        chat.interviewer_info || '미등록'
+                    )} / 타이퍼: ${escapeHtml(chat.typer_info || '미지정')}\n`;
+                } else {
+                    const feedbackBadge = chat.feedback_submitted ? '✅ 완료' : '❌ 미제출';
+                    const reportBadge = chat.report_submitted ? '✅ 완료' : '⏳ 대기 중';
+                    detailLine = `   • 사전 피드백: ${feedbackBadge} / 만남 보고서: ${reportBadge}\n`;
+                }
 
                 return (
                     `<b>${idx}. ${escapeHtml(
                         chat.room_title || '대화방'
                     )}${memberBadge}${typeBadge}${stageBadge}</b>\n` +
-                    `   • 사전 피드백: ${feedbackBadge}\n` +
-                    `   • 만남 보고서: ${reportBadge}\n\n`
+                    detailLine +
+                    `\n`
                 );
             });
         } catch (err: any) {
@@ -987,7 +1294,7 @@ bot.hears(
     }
 );
 
-// 관리자 명령어 2. 보고서 미제출 명단[cite: 7]
+// 보고서 미제출 명단 (관리자 미제출)
 bot.hears(/^(?:[\/!]?관리자\s+)((?:만남\s*)?보고서\s*미제출|미제출\s*명단|미제출)$/i, async (ctx) => {
     try {
         const userId = String(ctx.from?.id);
@@ -1041,7 +1348,329 @@ bot.hears(/^(?:[\/!]?관리자\s+)((?:만남\s*)?보고서\s*미제출|미제출
     }
 });
 
-// 관리자 명령어 3. 종합 점검[cite: 7]
+// 미등록 및 미정 방 조회 (관리자 미등록)
+bot.hears(
+    /^(?:[\/!]?관리자\s+)(최초\s*미등록|미등록\s*명단|미등록|신규\s*미등록|미정|미정\s*만남|미정\s*명단)$/i,
+    async (ctx) => {
+        try {
+            const userId = String(ctx.from?.id);
+            if (!isAdmin(userId)) {
+                await ctx.reply('⛔ 접근 권한이 없습니다.', { parse_mode: 'HTML' });
+                return;
+            }
+
+            const today = dayjs().tz('Asia/Seoul').startOf('day');
+            const allChats = await getAllChats();
+
+            const unassignedChats = allChats
+                .filter((chat) => !chat.meeting_date || chat.meeting_date.trim() === '')
+                .sort((a, b) => dayjs(a.created_at).valueOf() - dayjs(b.created_at).valueOf());
+
+            const undecidedChats = allChats
+                .filter((chat) => chat.meeting_date === '미정')
+                .sort((a, b) => dayjs(b.updated_at).valueOf() - dayjs(a.updated_at).valueOf());
+
+            const totalCount = unassignedChats.length + undecidedChats.length;
+
+            if (totalCount === 0) {
+                await ctx.reply('🎉 <b>미등록 또는 일정이 미정인 대화방이 없습니다!</b>', { parse_mode: 'HTML' });
+                return;
+            }
+
+            let message = `📋 <b>[만남일 미등록 및 미정 대화방] (총 ${totalCount}건)</b>\n`;
+            message += `기준시각: ${dayjs().tz('Asia/Seoul').format('YYYY-MM-DD HH:mm')}\n`;
+            message += `━━━━━━━━━━━━━━━━━━\n\n`;
+
+            if (undecidedChats.length > 0) {
+                message += `⏳ <b>[만남 예정일 미정 상태] (${undecidedChats.length}건)</b>\n`;
+                undecidedChats.forEach((chat, index) => {
+                    const updated = chat.updated_at
+                        ? dayjs(chat.updated_at).tz('Asia/Seoul').format('MM/DD HH:mm')
+                        : '-';
+                    const memberBadge = chat.matched_student_name
+                        ? ` (👤 ${escapeHtml(chat.matched_student_name)})`
+                        : '';
+                    const typeBadge = chat.meeting_type ? ` [${chat.meeting_type}]` : '';
+
+                    message += `<b>${index + 1}. ${escapeHtml(
+                        chat.room_title || '대화방'
+                    )}</b>${memberBadge}${typeBadge}\n`;
+                    message += `   • 상태: <b>만남일 미정 (일정 확정 필요)</b>\n`;
+                    message += `   • 최근 변경: ${updated}\n`;
+                    message += `   • Chat ID: <code>${chat.chat_id}</code>\n\n`;
+                });
+            }
+
+            if (unassignedChats.length > 0) {
+                message += `❓ <b>[초대 후 첫 만남일 미등록] (${unassignedChats.length}건)</b>\n`;
+                unassignedChats.forEach((chat, index) => {
+                    const created = chat.created_at ? dayjs(chat.created_at).tz('Asia/Seoul') : null;
+                    let durationStr = '확인 불가';
+
+                    if (created) {
+                        const diffDays = today.diff(created.startOf('day'), 'day');
+                        durationStr = diffDays === 0 ? '오늘 초대됨' : `${diffDays}일째 미등록`;
+                    }
+                    const memberBadge = chat.matched_student_name
+                        ? ` (👤 ${escapeHtml(chat.matched_student_name)})`
+                        : '';
+
+                    message += `<b>${index + 1}. ${escapeHtml(chat.room_title || '대화방')}</b>${memberBadge}\n`;
+                    message += `   • 봇 초대일: ${
+                        created ? created.format('YYYY-MM-DD') : '기록 없음'
+                    } (${durationStr})\n`;
+                    message += `   • Chat ID: <code>${chat.chat_id}</code>\n\n`;
+                });
+            }
+
+            await ctx.reply(message, { parse_mode: 'HTML' });
+        } catch (err: any) {
+            console.error('[미등록/미정 조회 에러]:', err);
+        }
+    }
+);
+
+// 만남일 경과 후 미갱신 방 명단 (관리자 미갱신)
+bot.hears(/^(?:[\/!]?관리자\s+)(미갱신\s*명단|미갱신|일정\s*미갱신)$/i, async (ctx) => {
+    try {
+        const userId = String(ctx.from?.id);
+        if (!isAdmin(userId)) {
+            await ctx.reply('⛔ 접근 권한이 없습니다.', { parse_mode: 'HTML' });
+            return;
+        }
+
+        const today = dayjs().tz('Asia/Seoul').startOf('day');
+        const allChats = await getAllChats();
+
+        const expiredChats = allChats
+            .filter((chat) => {
+                if (
+                    !chat.meeting_date ||
+                    chat.meeting_date.trim() === '' ||
+                    chat.meeting_date === '미정' ||
+                    chat.meeting_date === '중단'
+                )
+                    return false;
+                const mDate = dayjs(chat.meeting_date).startOf('day');
+                return mDate.isBefore(today);
+            })
+            .sort((a, b) => dayjs(a.meeting_date).valueOf() - dayjs(b.meeting_date).valueOf());
+
+        if (expiredChats.length === 0) {
+            await ctx.reply('🎉 <b>일정이 만료되어 갱신되지 않은 대화방이 없습니다!</b>', { parse_mode: 'HTML' });
+            return;
+        }
+
+        const header =
+            `⌛ <b>[만남일 경과 후 미갱신 대화방] (총 ${expiredChats.length}건)</b>\n` +
+            `<i>(이전 만남일이 지났으나 다음 일정이 설정되지 않음)</i>\n` +
+            `━━━━━━━━━━━━━━━━━━\n\n`;
+
+        await sendChunkedList(ctx, header, expiredChats, (chat, idx) => {
+            const mDate = dayjs(chat.meeting_date).startOf('day');
+            const diffDays = today.diff(mDate, 'day');
+            const memberBadge = chat.matched_student_name ? ` (👤 ${escapeHtml(chat.matched_student_name)})` : '';
+            const typeBadge = chat.meeting_type ? ` [${chat.meeting_type}]` : '';
+
+            return (
+                `<b>${idx}. ${escapeHtml(chat.room_title || '대화방')}</b>${memberBadge}${typeBadge}\n` +
+                `   • 지난 만남일: ${mDate.format('YYYY-MM-DD')} (${diffDays}일 경과)\n\n`
+            );
+        });
+    } catch (err: any) {
+        console.error('[미갱신 명단 조회 에러]:', err);
+    }
+});
+
+// 만남 중단 방 목록 (관리자 중단)
+bot.hears(/^(?:[\/!]?관리자\s+)(중단\s*명단|중단|만남중단)$/i, async (ctx) => {
+    try {
+        const userId = String(ctx.from?.id);
+        if (!isAdmin(userId)) {
+            await ctx.reply('⛔ 접근 권한이 없습니다.', { parse_mode: 'HTML' });
+            return;
+        }
+
+        const allChats = await getAllChats();
+        const stoppedChats = allChats
+            .filter((chat) => chat.meeting_date === '중단')
+            .sort((a, b) => dayjs(b.updated_at).valueOf() - dayjs(a.updated_at).valueOf());
+
+        if (stoppedChats.length === 0) {
+            await ctx.reply('✨ <b>현재 만남이 중단된 대화방이 없습니다.</b>', { parse_mode: 'HTML' });
+            return;
+        }
+
+        const header =
+            `🛑 <b>[만남 중단 대화방 목록] (총 ${stoppedChats.length}건)</b>\n` +
+            `기준시각: ${dayjs().tz('Asia/Seoul').format('YYYY-MM-DD HH:mm')}\n` +
+            `━━━━━━━━━━━━━━━━━━\n\n`;
+
+        await sendChunkedList(ctx, header, stoppedChats, (chat, idx) => {
+            const memberBadge = chat.matched_student_name ? ` (👤 ${escapeHtml(chat.matched_student_name)})` : '';
+            return (
+                `<b>${idx}. ${escapeHtml(chat.room_title || '대화방')}</b>${memberBadge}\n` +
+                `   • 중단 사유: <b>${escapeHtml(chat.stop_reason || '사유 미입력')}</b>\n` +
+                `   • Chat ID: <code>${chat.chat_id}</code>\n\n`
+            );
+        });
+    } catch (err: any) {
+        console.error('[중단 명단 조회 에러]:', err);
+    }
+});
+
+// 특수 구분 종합 현황 (관리자 구분, 관리자 단계)
+bot.hears(/^(?:[\/!]?관리자\s+)(구분|단계|특수|진행구분)$/i, async (ctx) => {
+    try {
+        const userId = String(ctx.from?.id);
+        if (!isAdmin(userId)) {
+            await ctx.reply('⛔ 접근 권한이 없습니다.', { parse_mode: 'HTML' });
+            return;
+        }
+
+        const allChats = await getAllChats();
+        const subdeung = allChats.filter((c) => c.progress_stage === '섭등예정');
+        const yejeong = allChats.filter((c) => c.progress_stage === '예정가능일');
+        const ganeung = allChats.filter((c) => c.progress_stage === '가능가능일');
+
+        const totalSpecial = subdeung.length + yejeong.length + ganeung.length;
+
+        if (totalSpecial === 0) {
+            await ctx.reply('✨ <b>현재 [섭등예정 / 예정가능일 / 가능가능일]로 지정된 대화방이 없습니다.</b>', {
+                parse_mode: 'HTML',
+            });
+            return;
+        }
+
+        let msg = `🏷 <b>[진행 구분별 대화방 목록] (총 ${totalSpecial}건)</b>\n`;
+        msg += `기준시각: ${dayjs().tz('Asia/Seoul').format('YYYY-MM-DD HH:mm')}\n`;
+        msg += `━━━━━━━━━━━━━━━━━━\n\n`;
+
+        if (subdeung.length > 0) {
+            msg += `📌 <b>[섭등예정] (${subdeung.length}건)</b>\n`;
+            subdeung.forEach((c, i) => {
+                const note = c.progress_note ? ` (메모: ${escapeHtml(c.progress_note)})` : '';
+                const mDate = c.meeting_date ? ` [만남일: ${c.meeting_date}]` : '';
+                const member = c.matched_student_name ? ` (👤 ${escapeHtml(c.matched_student_name)})` : '';
+                msg += `${i + 1}. <b>${escapeHtml(c.room_title)}</b>${member}${mDate}${note}\n`;
+            });
+            msg += `\n`;
+        }
+
+        if (yejeong.length > 0) {
+            msg += `🗓 <b>[예정가능일] (${yejeong.length}건)</b>\n`;
+            yejeong.forEach((c, i) => {
+                const note = c.progress_note ? ` (메모: ${escapeHtml(c.progress_note)})` : '';
+                const mDate = c.meeting_date ? ` [만남일: ${c.meeting_date}]` : '';
+                const member = c.matched_student_name ? ` (👤 ${escapeHtml(c.matched_student_name)})` : '';
+                msg += `${i + 1}. <b>${escapeHtml(c.room_title)}</b>${member}${mDate}${note}\n`;
+            });
+            msg += `\n`;
+        }
+
+        if (ganeung.length > 0) {
+            msg += `✨ <b>[가능가능일] (${ganeung.length}건)</b>\n`;
+            ganeung.forEach((c, i) => {
+                const note = c.progress_note ? ` (메모: ${escapeHtml(c.progress_note)})` : '';
+                const mDate = c.meeting_date ? ` [만남일: ${c.meeting_date}]` : '';
+                const member = c.matched_student_name ? ` (👤 ${escapeHtml(c.matched_student_name)})` : '';
+                msg += `${i + 1}. <b>${escapeHtml(c.room_title)}</b>${member}${mDate}${note}\n`;
+            });
+            msg += `\n`;
+        }
+
+        await ctx.reply(msg, { parse_mode: 'HTML' });
+    } catch (err: any) {
+        console.error('[관리자 구분 조회 에러]:', err);
+    }
+});
+
+// 구분별 단독 조회 (관리자 섭등예정, 관리자 예정가능일, 관리자 가능가능일)
+bot.hears(/^(?:[\/!]?관리자\s+)(섭등예정|예정가능일|가능가능일)$/i, async (ctx) => {
+    try {
+        const userId = String(ctx.from?.id);
+        if (!isAdmin(userId)) {
+            await ctx.reply('⛔ 접근 권한이 없습니다.', { parse_mode: 'HTML' });
+            return;
+        }
+
+        const targetStage = ctx.match[1] as '섭등예정' | '예정가능일' | '가능가능일';
+        const allChats = await getAllChats();
+        const targets = allChats.filter((c) => c.progress_stage === targetStage);
+
+        if (targets.length === 0) {
+            await ctx.reply(`✨ <b>현재 [${targetStage}] 상태인 대화방이 없습니다.</b>`, {
+                parse_mode: 'HTML',
+            });
+            return;
+        }
+
+        const header =
+            `🏷 <b>[${targetStage} 대화방 목록] (총 ${targets.length}건)</b>\n` +
+            `기준시각: ${dayjs().tz('Asia/Seoul').format('YYYY-MM-DD HH:mm')}\n` +
+            `━━━━━━━━━━━━━━━━━━\n\n`;
+
+        await sendChunkedList(ctx, header, targets, (c, i) => {
+            const memberBadge = c.matched_student_name ? ` (👤 ${escapeHtml(c.matched_student_name)})` : '';
+            let itemStr = `<b>${i}. ${escapeHtml(c.room_title || '대화방')}</b>${memberBadge}\n`;
+            itemStr += `   • 만남일정: <b>${c.meeting_date || '일정 미등록'}</b>\n`;
+            if (c.progress_note) itemStr += `   • 메모/내용: ${escapeHtml(c.progress_note)}\n`;
+            itemStr += `   • Chat ID: <code>${c.chat_id}</code>\n\n`;
+            return itemStr;
+        });
+    } catch (err: any) {
+        console.error('[단계별 조회 에러]:', err);
+    }
+});
+
+// 일반방 조회 (관리자 일반 - 특수 3종 및 중단 제외)
+bot.hears(/^(?:[\/!]?관리자\s+)(일반|일반방|미분류)$/i, async (ctx) => {
+    try {
+        const userId = String(ctx.from?.id);
+        if (!isAdmin(userId)) {
+            await ctx.reply('⛔ 접근 권한이 없습니다.', { parse_mode: 'HTML' });
+            return;
+        }
+
+        const allChats = await getAllChats();
+        const normalChats = allChats.filter(
+            (c) =>
+                (!c.progress_stage || !['섭등예정', '예정가능일', '가능가능일'].includes(c.progress_stage)) &&
+                c.meeting_date !== '중단'
+        );
+
+        if (normalChats.length === 0) {
+            await ctx.reply('✨ <b>특수 단계 및 중단 상태를 제외한 일반 대화방이 없습니다.</b>', {
+                parse_mode: 'HTML',
+            });
+            return;
+        }
+
+        const header =
+            `📋 <b>[일반 대화방 목록 (특수 3종 및 중단 제외)] (총 ${normalChats.length}건)</b>\n` +
+            `기준시각: ${dayjs().tz('Asia/Seoul').format('YYYY-MM-DD HH:mm')}\n` +
+            `━━━━━━━━━━━━━━━━━━\n\n`;
+
+        await sendChunkedList(ctx, header, normalChats, (chat, index) => {
+            let statusText = chat.meeting_date;
+            if (!statusText) statusText = '미등록';
+
+            const memberBadge = chat.matched_student_name ? ` (👤 ${escapeHtml(chat.matched_student_name)})` : '';
+            const safeTitle = escapeHtml(chat.room_title || '대화방');
+            const reportBadge = chat.report_submitted ? '✅ 완료' : '⏳ 대기';
+
+            return (
+                `<b>${index}. ${safeTitle}</b>${memberBadge}\n` +
+                `   • 현재 상태: <b>${statusText}</b> (보고서: ${reportBadge})\n` +
+                `   • Chat ID: <code>${chat.chat_id}</code>\n\n`
+            );
+        });
+    } catch (err: any) {
+        console.error('[일반방 조회 에러]:', err);
+    }
+});
+
+// 전체 종합 점검 (관리자 점검)
 bot.hears(/^(?:[\/!]?관리자\s+)(점검|현황|종합\s*점검|전체\s*점검)$/i, async (ctx) => {
     try {
         const userId = String(ctx.from?.id);
@@ -1056,20 +1685,58 @@ bot.hears(/^(?:[\/!]?관리자\s+)(점검|현황|종합\s*점검|전체\s*점검
         const unassigned = allChats.filter((c) => !c.meeting_date || c.meeting_date.trim() === '');
         const undecided = allChats.filter((c) => c.meeting_date === '미정');
         const stopped = allChats.filter((c) => c.meeting_date === '중단');
-        const interviewCount = allChats.filter((c) => c.meeting_type === '인터뷰').length;
-        const teacherCount = allChats.filter((c) => c.meeting_type === '교사').length;
+        const overdue = allChats.filter((c) => {
+            if (!c.meeting_date || c.meeting_date === '미정' || c.meeting_date === '중단' || c.report_submitted)
+                return false;
+            return (
+                dayjs(c.meeting_date).startOf('day').isBefore(today) ||
+                dayjs(c.meeting_date).startOf('day').isSame(today, 'day')
+            );
+        });
+        const expired = allChats.filter((c) => {
+            if (
+                !c.meeting_date ||
+                c.meeting_date.trim() === '' ||
+                c.meeting_date === '미정' ||
+                c.meeting_date === '중단'
+            )
+                return false;
+            return dayjs(c.meeting_date).startOf('day').isBefore(today);
+        });
+
+        const subdeung = allChats.filter((c) => c.progress_stage === '섭등예정').length;
+        const yejeong = allChats.filter((c) => c.progress_stage === '예정가능일').length;
+        const ganeung = allChats.filter((c) => c.progress_stage === '가능가능일').length;
+        const normalCount = allChats.filter(
+            (c) =>
+                (!c.progress_stage || !['섭등예정', '예정가능일', '가능가능일'].includes(c.progress_stage)) &&
+                c.meeting_date !== '중단'
+        ).length;
+
+        const interviewCount = allChats.filter((c) => c.meeting_type === '인터뷰' && c.meeting_date !== '중단').length;
+        const teacherCount = allChats.filter((c) => c.meeting_type === '교사' && c.meeting_date !== '중단').length;
 
         let msg = `📊 <b>[상담/복음방 전체 관리 현황]</b>\n`;
         msg += `기준시각: ${dayjs().tz('Asia/Seoul').format('YYYY-MM-DD HH:mm')}\n`;
-        msg += `총 등록 방: <b>${allChats.length}개</b>\n`;
+        msg += `총 등록된 대화방: <b>${allChats.length}개</b>\n`;
         msg += `━━━━━━━━━━━━━━━━━━\n\n`;
 
-        msg += `🎙️ <b>인터뷰 만남 진행</b>: ${interviewCount}개 방\n`;
-        msg += `👨‍🏫 <b>교사 만남 진행</b>: ${teacherCount}개 방\n\n`;
+        msg += `🎙️ <b>[진행 분류별 현황]</b>\n`;
+        msg += `• 인터뷰 만남 진행: <b>${interviewCount}개 방</b> (조회: <code>관리자 인터뷰</code>)\n`;
+        msg += `• 교사 만남 진행: <b>${teacherCount}개 방</b> (조회: <code>관리자 교사</code>)\n\n`;
 
-        msg += `• ❓ <b>만남일 미등록</b>: ${unassigned.length}개 방\n`;
-        msg += `• ⏳ <b>만남일정 미정</b>: ${undecided.length}개 방\n`;
-        msg += `• 🛑 <b>만남 중단 상태</b>: ${stopped.length}개 방\n`;
+        msg += `🏷 <b>[진행 단계별 현황]</b>\n`;
+        msg += `• 섭등예정: <b>${subdeung}개</b>\n`;
+        msg += `• 예정가능일: <b>${yejeong}개</b>\n`;
+        msg += `• 가능가능일: <b>${ganeung}개</b>\n`;
+        msg += `• 일반(중단 제외): <b>${normalCount}개</b> (조회: <code>관리자 일반</code>)\n\n`;
+
+        msg += `🗓 <b>[일정 및 보고서 상태]</b>\n`;
+        msg += `• ❓ <b>첫 만남일 미등록</b>: ${unassigned.length}개 방\n`;
+        msg += `• ⏳ <b>만남일정 미정</b>: ${undecided.length}개 방 (조회: <code>관리자 미등록</code>)\n`;
+        msg += `• 🛑 <b>만남 중단 상태</b>: ${stopped.length}개 방 (조회: <code>관리자 중단</code>)\n`;
+        msg += `• 🚨 <b>보고서 미제출</b>: ${overdue.length}개 방 (조회: <code>관리자 미제출</code>)\n`;
+        msg += `• ⌛ <b>만남일 경과 미갱신</b>: ${expired.length}개 방 (조회: <code>관리자 미갱신</code>)\n`;
 
         await ctx.reply(msg, { parse_mode: 'HTML' });
     } catch (err: any) {
@@ -1085,7 +1752,7 @@ bot.on('text', async (ctx) => {
 
     await ensureChatRecord(chatId, roomTitle);
 
-    // 슬래시(/)나 느낌표(!)로 시작하는 정식 명령어 텍스트는 무시[cite: 7]
+    // 슬래시(/)나 느낌표(!)로 시작하는 정식 명령어 텍스트는 무시
     if (/^[!/]/i.test(text) || /^관리자\s+/i.test(text)) {
         return;
     }
@@ -1098,15 +1765,12 @@ bot.on('text', async (ctx) => {
         text.includes('인터뷰 계획서');
 
     if (isInterviewPreReport) {
-        // 인터뷰어 추출
         const interviewerMatch = text.match(/인터뷰어\s*[:：\-]?\s*([^\n\r]+)/i);
         const interviewerRaw = interviewerMatch ? interviewerMatch[1].trim() : '';
 
-        // 타이퍼 추출
         const typerMatch = text.match(/타이퍼\s*[:：\-]?\s*([^\n\r]+)/i);
         const typerRaw = typerMatch ? typerMatch[1].trim() : '';
 
-        // 날짜 추출
         const dateMatch = text.match(
             /(?:인터뷰\s*(?:예정일|일시|일)|만남\s*(?:예정일|일시|일)|일시|일정)\s*[:：\-]?\s*([^\n\r]+)/i
         );
@@ -1142,12 +1806,10 @@ bot.on('text', async (ctx) => {
                 return;
             }
 
-            // 타이퍼 조회 (타이퍼가 작성된 경우)
             let typer: any = null;
             const hasTyper = typerRaw && !/^(없음|미지정|\-|없|X)$/i.test(typerRaw);
             if (hasTyper) {
                 let tInfo = parseMemberString(typerRaw);
-                // 소속 생략 시 인터뷰어 소속 상속
                 if (!tInfo && /^[가-힣]{2,4}$/.test(typerRaw)) {
                     tInfo = { region: iInfo.region, team: iInfo.team, name: typerRaw };
                 }
@@ -1165,7 +1827,6 @@ bot.on('text', async (ctx) => {
                 }
             }
 
-            // 날짜 파싱
             let formattedDate = '미정';
             if (dateRaw && !dateRaw.includes('미정')) {
                 const parsed = parseFlexibleDate(dateRaw);
@@ -1200,18 +1861,18 @@ bot.on('text', async (ctx) => {
             resMsg += `• <b>인터뷰 예정일</b>: <b>${formattedDate}</b>\n\n`;
             resMsg += `• <b>D-1 알림 (10:00)</b>: 인터뷰 안내 알림\n`;
             resMsg += `• <b>당일 알림 (22:00)</b>: 결과 보고서 등록 알림\n\n`;
-            resMsg += `💡 인터뷰 종료 후 <code>/인터뷰양식</code>을 복사하여 결과를 등록해주세요.`;
+            resMsg += `💡 개별 수정: <code>/인터뷰어</code>, <code>/타이퍼</code>, <code>/인터뷰일</code>`;
 
             await ctx.reply(resMsg, { parse_mode: 'HTML' });
             return;
         } catch (err: any) {
-            console.error('[사전 보고서 자동 처리 에러]:', err);
+            console.error('[사전 보고서 처리 에러]:', err);
             await ctx.reply(`⚠️ 사전 보고서 처리 중 오류가 발생했습니다: ${err.message}`);
             return;
         }
     }
 
-    // B. [인터뷰 결과 보고서] 감지[cite: 7]
+    // B. [인터뷰 결과 보고서] 감지
     const isInterviewReport =
         text.includes('인터뷰 결과 보고서') ||
         text.includes('인터뷰 결과') ||
@@ -1289,7 +1950,7 @@ bot.on('text', async (ctx) => {
         return;
     }
 
-    // C. 일반 [만남 보고서] 감지[cite: 7]
+    // C. 일반 [만남 보고서] 감지
     const isReport =
         text.includes('상담,복음방 보고서') ||
         text.includes('상담 보고서') ||
@@ -1334,7 +1995,7 @@ bot.on('text', async (ctx) => {
         return;
     }
 
-    // D. 피드백 감지[cite: 7]
+    // D. 피드백 감지
     if (/#피드백내용|#피드백/.test(text)) {
         await updateChat(chatId, { feedback_submitted: 1 });
         await ctx.reply('📝 <b>피드백 내용이 확인되었습니다.</b> 감사합니다.', { parse_mode: 'HTML' });
@@ -1356,7 +2017,7 @@ async function triggerMorningReminder() {
 
         const diffDays = today.diff(mDate, 'day');
 
-        // D-1 안내[cite: 7]
+        // D-1 안내
         if (diffDays === -1 && !chat.d_minus_1_notified) {
             try {
                 if (chat.meeting_type === '인터뷰') {
@@ -1384,7 +2045,7 @@ async function triggerMorningReminder() {
             }
         }
 
-        // D+1 미제출 알림[cite: 7]
+        // D+1 미제출 알림
         if (diffDays === 1 && !chat.report_submitted && !chat.overdue_1_notified) {
             try {
                 const reportTitle = chat.meeting_type === '인터뷰' ? '인터뷰 결과 보고서' : '만남 보고서';
@@ -1403,7 +2064,7 @@ async function triggerMorningReminder() {
             }
         }
 
-        // D+2 경고 알림[cite: 7]
+        // D+2 경고 알림
         if (diffDays >= 2 && !chat.report_submitted && !chat.overdue_2_notified) {
             try {
                 await bot.telegram.sendMessage(
@@ -1461,7 +2122,7 @@ async function triggerNightReminder() {
 }
 
 /* =====================================================
- * 🌐 HTTP 웹훅 서버 구동[cite: 7]
+ * 🌐 HTTP 웹훅 서버 구동
  * ===================================================== */
 const server = http.createServer(async (req, res) => {
     const url = new URL(req.url || '/', `http://${req.headers.host}`);
@@ -1491,7 +2152,7 @@ const PORT = Number(process.env.PORT) || 8300;
 server.listen(PORT, async () => {
     console.log(`Server listening on port ${PORT}`);
 
-    // DB 테이블 컬럼 점검 및 자동 생성[cite: 7]
+    // DB 테이블 컬럼 점검 및 자동 생성
     await initDb();
 
     const webhookUrl = 'https://teacherfollow.alwaysdata.net/webhook';
