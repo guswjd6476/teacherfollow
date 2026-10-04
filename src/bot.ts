@@ -113,6 +113,36 @@ interface ChatRecord {
     updated_at: string;
 }
 
+// 텍스트에서 지역/팀/이름 추출 헬퍼 (예: "강북 1팀 귀요미" 또는 "강북/1/귀요미")
+function parseMemberString(raw: string): { region: string; team: string; name: string } | null {
+    if (!raw) return null;
+    const cleaned = raw.trim();
+
+    // 1) 슬래시 구분
+    if (cleaned.includes('/')) {
+        const parts = cleaned.split('/').map((s) => s.trim());
+        if (parts.length >= 3) {
+            return { region: parts[0], team: parts[1].replace(/팀/g, ''), name: parts[2] };
+        }
+    }
+
+    // 2) 띄어쓰기 구분 ("강북 1팀 귀요미" 또는 "강북 1 귀요미")
+    const spaceParts = cleaned.split(/\s+/).filter(Boolean);
+    if (spaceParts.length >= 3) {
+        return { region: spaceParts[0], team: spaceParts[1].replace(/팀/g, ''), name: spaceParts[2] };
+    }
+
+    // 3) 붙여쓰기 형태 ("강북1팀 귀요미")
+    if (spaceParts.length === 2) {
+        const m = spaceParts[0].match(/^([가-힣]+?)(\d+)팀?$/);
+        if (m) {
+            return { region: m[1], team: m[2], name: spaceParts[1] };
+        }
+    }
+
+    return null;
+}
+
 // members 테이블에서 지역/팀/이름으로 성도 조회
 async function findMemberFromDB(name: string, region: string, teamRaw: string) {
     const team = teamRaw.replace(/팀/g, '').trim();
@@ -336,7 +366,7 @@ bot.on('new_chat_title', async (ctx) => {
     }
 });
 
-// 봇이 그룹에 추가되거나 퇴장당했을 때
+// 봇이 그룹에 추가되거나 퇴장당했을 때[cite: 7]
 bot.on('my_chat_member', async (ctx) => {
     const status = ctx.myChatMember.new_chat_member.status;
     const chatId = ctx.chat.id;
@@ -361,16 +391,15 @@ bot.on('my_chat_member', async (ctx) => {
     }
 });
 
-// 도움말 (/start, /help, /도움말)
+// 도움말 (/start, /help, /도움말)[cite: 7]
 bot.hears(/^[\/!](start|help|도움말)(?:@\w+)?$/i, async (ctx) => {
     await ctx.reply(
         '📌 <b>상담/복음방 봇 명령어 안내</b>\n\n' +
             '• <b>대상자 최초 등록</b>: <code>/최초등록 섭외자/지역/팀/인도자</code>\n' +
             '• <b>인터뷰 만남 관련</b>:\n' +
-            '   - <code>/인터뷰어 지역/팀/이름</code>\n' +
-            '   - <code>/타이퍼 지역/팀/이름</code>\n' +
-            '   - <code>/인터뷰일 MM-DD</code> (인터뷰 예정일 등록)\n' +
-            '   - <code>/인터뷰양식</code> (결과 보고서 양식 복사)\n' +
+            '   - <code>/인터뷰사전양식</code> (사전 보고서 복사용 양식 출력)\n' +
+            '   - <code>/인터뷰양식</code> (결과 보고서 복사용 양식 출력)\n' +
+            '   - <i>사전 보고서를 채팅방에 올리면 인터뷰어/타이퍼/예정일이 자동 등록됩니다.</i>\n' +
             '• <b>일반 만남일 설정</b>: <code>/만남일 MM-DD</code> 또는 <code>/만남일 미정</code>\n' +
             '• <b>만남 중단 처리</b>: <code>/만남중단 [사유]</code>\n' +
             '• <b>행정 등록 확인</b>: <code>/행정확인</code>\n' +
@@ -382,7 +411,7 @@ bot.hears(/^[\/!](start|help|도움말)(?:@\w+)?$/i, async (ctx) => {
     );
 });
 
-// 섭외자 최초 등록 (/최초등록 섭외자/지역/팀/인도자)
+// 섭외자 최초 등록 (/최초등록 섭외자/지역/팀/인도자)[cite: 7]
 bot.hears(/^[\/!]최초등록(?:@\w+)?(?:\s+(.+))?$/i, async (ctx) => {
     const rawInput = ctx.match[1]?.trim();
     if (!rawInput) {
@@ -445,7 +474,6 @@ bot.hears(/^[\/!]최초등록(?:@\w+)?(?:\s+(.+))?$/i, async (ctx) => {
         await ensureChatRecord(ctx.chat.id, title);
         await updateChat(ctx.chat.id, { matched_member_id: match.student_id });
 
-        // 첫 만남 유형 선택 인라인 버튼 제공
         await ctx.reply(
             `🎉 <b>대상자 매칭 완료!</b>\n\n` +
                 `• <b>섭외자(대상자)</b>: <b>${escapeHtml(match.student_name)}</b> (ID: ${match.student_id})\n` +
@@ -471,7 +499,7 @@ bot.hears(/^[\/!]최초등록(?:@\w+)?(?:\s+(.+))?$/i, async (ctx) => {
     }
 });
 
-// 버튼 콜백: 만남 유형 선택
+// 버튼 콜백: 만남 유형 선택[cite: 7]
 bot.action('type_interview', async (ctx) => {
     try {
         await ctx.answerCbQuery();
@@ -479,11 +507,8 @@ bot.action('type_interview', async (ctx) => {
 
         await ctx.reply(
             `🎙️ <b>첫 만남이 [인터뷰 만남]으로 지정되었습니다.</b>\n\n` +
-                `아래 순서대로 등록을 진행해주세요:\n` +
-                `1. <b>인터뷰어 등록</b>: <code>/인터뷰어 지역/팀/이름</code>\n` +
-                `2. <b>타이퍼 등록</b>: <code>/타이퍼 지역/팀/이름</code> (선택)\n` +
-                `3. <b>인터뷰 예정일 등록</b>: <code>/인터뷰일 MM-DD</code>\n\n` +
-                `<i>(예: <code>/인터뷰어 강북/1/이희수</code>)</i>`,
+                `채팅방에 <b>[인터뷰 사전 보고서]</b>를 올려주시면 인터뷰어/타이퍼/예정일이 자동 등록됩니다.\n\n` +
+                `💡 양식이 필요하시면 <code>/인터뷰사전양식</code>을 입력하세요.`,
             { parse_mode: 'HTML' }
         );
     } catch (err: any) {
@@ -507,187 +532,35 @@ bot.action('type_teacher', async (ctx) => {
     }
 });
 
-// 만남유형 수동 전환 (/인터뷰만남, /교사만남 - 슬래시 필수)
-bot.hears(/^[\/!](인터뷰만남|교사만남)$/i, async (ctx) => {
-    const isInterview = ctx.match[1].includes('인터뷰');
-    const type = isInterview ? '인터뷰' : '교사';
+// 인터뷰 사전 보고서 양식 출력 (/인터뷰사전양식)
+bot.hears(/^[\/!](인터뷰사전양식|사전양식|사전보고서양식)(?:@\w+)?$/i, async (ctx) => {
+    const record = await getChatRecord(ctx.chat.id);
+    const targetName = record?.matched_student_name || '홍길동';
 
-    await updateChat(ctx.chat.id, { meeting_type: type });
-
-    if (isInterview) {
-        await ctx.reply(
-            `🎙️ <b>[인터뷰 만남]으로 설정되었습니다.</b>\n\n` +
-                `• 인터뷰어 등록: <code>/인터뷰어 지역/팀/이름</code>\n` +
-                `• 타이퍼 등록: <code>/타이퍼 지역/팀/이름</code>\n` +
-                `• 인터뷰일 등록: <code>/인터뷰일 MM-DD</code>`,
-            { parse_mode: 'HTML' }
-        );
-    } else {
-        await ctx.reply(
-            `👨‍🏫 <b>[교사 만남]으로 설정되었습니다.</b>\n\n` +
-                `• 만남일 등록: <code>/만남일 MM-DD</code> 또는 <code>/만남일 미정</code>`,
-            { parse_mode: 'HTML' }
-        );
-    }
-});
-
-// 인터뷰어 등록 (/인터뷰어 또는 /인터뷰어등록 - 슬래시/느낌표 필수)
-bot.hears(/^[\/!](인터뷰어|인터뷰어등록)(?:@\w+)?(?:\s+(.+))?$/i, async (ctx) => {
-    const rawInput = ctx.match[2]?.trim();
-    if (!rawInput) {
-        await ctx.reply(
-            '⚠️ 입력 양식: <code>/인터뷰어 지역/팀/이름</code>\n(예: <code>/인터뷰어 강북/1/이희수</code>)',
-            {
-                parse_mode: 'HTML',
-            }
-        );
-        return;
-    }
-
-    const parts = rawInput.split('/').map((s) => s.trim());
-    if (parts.length < 3) {
-        await ctx.reply('⚠️ 슬래시(/)로 구분하여 입력해주세요.\n(예: <code>/인터뷰어 강북/1/이희수</code>)', {
-            parse_mode: 'HTML',
-        });
-        return;
-    }
-
-    const [region, teamRaw, name] = parts;
-
-    try {
-        const member = await findMemberFromDB(name, region, teamRaw);
-        if (!member) {
-            await ctx.reply(
-                `❌ <b>일치하는 인터뷰어를 찾을 수 없습니다.</b>\n• ${escapeHtml(region)} / ${escapeHtml(
-                    teamRaw
-                )} / ${escapeHtml(name)}`,
-                { parse_mode: 'HTML' }
-            );
-            return;
-        }
-
-        const infoStr = `${member['지역']} ${member['구역']} ${member['이름']}`;
-        await updateChat(ctx.chat.id, {
-            meeting_type: '인터뷰',
-            interviewer_name: member['이름'],
-            interviewer_code: member['고유번호'],
-            interviewer_info: infoStr,
-        });
-
-        await ctx.reply(
-            `🎙️ <b>인터뷰어가 등록되었습니다!</b>\n\n` +
-                `• <b>인터뷰어</b>: <b>${escapeHtml(member['이름'])}</b> (${escapeHtml(member['지역'])} / ${escapeHtml(
-                    member['구역']
-                )})\n` +
-                `• <b>고유번호</b>: <code>${escapeHtml(member['고유번호'])}</code>\n\n` +
-                `🗓 이어서 <b>인터뷰 예정일</b>을 등록해주세요:\n` +
-                `• <code>/인터뷰일 MM-DD</code> (예: <code>/인터뷰일 10-12</code>)\n` +
-                `• 타이퍼가 있다면: <code>/타이퍼 지역/팀/이름</code>`,
-            { parse_mode: 'HTML' }
-        );
-    } catch (err: any) {
-        console.error('[/인터뷰어 등록 에러]:', err);
-        await ctx.reply(`⚠️ 인터뷰어 등록 중 오류 발생: ${err.message}`);
-    }
-});
-
-// 타이퍼 등록 (/타이퍼 또는 /타이퍼등록 - 슬래시/느낌표 필수)
-bot.hears(/^[\/!](타이퍼|타이퍼등록)(?:@\w+)?(?:\s+(.+))?$/i, async (ctx) => {
-    const rawInput = ctx.match[2]?.trim();
-    if (!rawInput) {
-        await ctx.reply('⚠️ 입력 양식: <code>/타이퍼 지역/팀/이름</code>\n(예: <code>/타이퍼 강북/1/안유정</code>)', {
-            parse_mode: 'HTML',
-        });
-        return;
-    }
-
-    const parts = rawInput.split('/').map((s) => s.trim());
-    if (parts.length < 3) {
-        await ctx.reply('⚠️ 슬래시(/)로 구분하여 입력해주세요.\n(예: <code>/타이퍼 강북/1/안유정</code>)', {
-            parse_mode: 'HTML',
-        });
-        return;
-    }
-
-    const [region, teamRaw, name] = parts;
-
-    try {
-        const member = await findMemberFromDB(name, region, teamRaw);
-        if (!member) {
-            await ctx.reply(
-                `❌ <b>일치하는 타이퍼를 찾을 수 없습니다.</b>\n• ${escapeHtml(region)} / ${escapeHtml(
-                    teamRaw
-                )} / ${escapeHtml(name)}`,
-                { parse_mode: 'HTML' }
-            );
-            return;
-        }
-
-        const infoStr = `${member['지역']} ${member['구역']} ${member['이름']}`;
-        await updateChat(ctx.chat.id, {
-            typer_name: member['이름'],
-            typer_code: member['고유번호'],
-            typer_info: infoStr,
-        });
-
-        await ctx.reply(
-            `⌨️ <b>타이퍼가 등록되었습니다!</b>\n\n` +
-                `• <b>타이퍼</b>: <b>${escapeHtml(member['이름'])}</b> (${escapeHtml(member['지역'])} / ${escapeHtml(
-                    member['구역']
-                )})\n` +
-                `• <b>고유번호</b>: <code>${escapeHtml(member['고유번호'])}</code>\n\n` +
-                `🗓 일정을 아직 등록하지 않으셨다면 <code>/인터뷰일 MM-DD</code>를 입력해주세요.`,
-            { parse_mode: 'HTML' }
-        );
-    } catch (err: any) {
-        console.error('[/타이퍼 등록 에러]:', err);
-        await ctx.reply(`⚠️ 타이퍼 등록 중 오류 발생: ${err.message}`);
-    }
-});
-
-// 인터뷰 예정일 등록 (/인터뷰일 MM-DD)
-bot.hears(/^[\/!]인터뷰일(?:자)?(?:@\w+)?(?:\s+(.+))?$/i, async (ctx) => {
-    const rawInput = ctx.match[1]?.trim();
-    if (!rawInput) {
-        await ctx.reply('⚠️ 날짜를 입력해주세요.\n예: <code>/인터뷰일 10-12</code> 또는 <code>/인터뷰일 미정</code>', {
-            parse_mode: 'HTML',
-        });
-        return;
-    }
-
-    const title = 'title' in ctx.chat ? ctx.chat.title : ctx.chat.first_name || '대화방';
-
-    if (rawInput.includes('미정')) {
-        await upsertMeetingDate(ctx.chat.id, title, '미정');
-        await updateChat(ctx.chat.id, { meeting_type: '인터뷰', interview_date: '미정' });
-        await ctx.reply('📌 <b>인터뷰 일정이 [미정]으로 등록되었습니다.</b>', { parse_mode: 'HTML' });
-        return;
-    }
-
-    const formatted = parseFlexibleDate(rawInput);
-    if (!formatted) {
-        await ctx.reply('⚠️ 올바른 날짜 형식이 아닙니다. (예: 10-12, 10/12, 2026-10-12)');
-        return;
-    }
-
-    await upsertMeetingDate(ctx.chat.id, title, formatted);
-    await updateChat(ctx.chat.id, { meeting_type: '인터뷰', interview_date: formatted });
+    const sample =
+        `[인터뷰 사전 보고서]\n` +
+        `• 대상자: ${targetName}\n` +
+        `• 인터뷰어: 강북 1팀 귀요미\n` +
+        `• 타이퍼: 강북 1팀 김공주\n` +
+        `• 인터뷰일시: 10-12\n` +
+        `• 사전메모: 마음 문 열려 있음`;
 
     await ctx.reply(
-        `🎙️ <b>인터뷰 만남 예정일이 [${formatted}]로 등록되었습니다!</b>\n\n` +
-            `• <b>인터뷰 전날 (10:00)</b>: 인터뷰 안내 알림\n` +
-            `• <b>인터뷰 당일 (22:00)</b>: 인터뷰 결과 보고서 등록 알림\n\n` +
-            `💡 인터뷰 완료 후 <code>/인터뷰양식</code>을 복사하여 작성해 주세요.`,
+        `📋 <b>[인터뷰 사전 보고서 양식]</b>\n아래 양식을 복사하여 작성 후 이 방에 전송해주세요.\n\n` +
+            `<code>${sample}</code>\n\n` +
+            `💡 <b>안내:</b>\n` +
+            `• 인터뷰어/타이퍼는 <code>지역 팀 이름</code> 형태로 적어주시면 됩니다.\n` +
+            `• 타이퍼가 없는 경우 <code>없음</code> 또는 <code>미지정</code>으로 작성하세요.`,
         { parse_mode: 'HTML' }
     );
 });
 
-// 인터뷰 결과 보고서 양식 출력 (/인터뷰양식)
+// 인터뷰 결과 보고서 양식 출력 (/인터뷰양식)[cite: 7]
 bot.hears(/^[\/!](인터뷰양식|인터뷰보고서양식)(?:@\w+)?$/i, async (ctx) => {
     const record = await getChatRecord(ctx.chat.id);
     const targetName = record?.matched_student_name || '홍길동';
-    const interviewer = record?.interviewer_name || '이희수';
-    const typer = record?.typer_name || '안유정';
+    const interviewer = record?.interviewer_name || '귀요미';
+    const typer = record?.typer_name || '김공주';
 
     const sample =
         `[인터뷰 결과 보고서]\n` +
@@ -709,7 +582,7 @@ bot.hears(/^[\/!](인터뷰양식|인터뷰보고서양식)(?:@\w+)?$/i, async (
     );
 });
 
-// 매칭 해제 (/매칭해제)
+// 매칭 해제 (/매칭해제)[cite: 7]
 bot.hears(/^[\/!]매칭해제(?:@\w+)?$/i, async (ctx) => {
     await updateChat(ctx.chat.id, {
         matched_member_id: null,
@@ -728,7 +601,7 @@ bot.hears(/^[\/!]매칭해제(?:@\w+)?$/i, async (ctx) => {
     await ctx.reply('✅ 대상자 매칭 및 인터뷰 설정이 모두 초기화되었습니다.');
 });
 
-// 행정 등록 내역 확인 (/행정확인)
+// 행정 등록 내역 확인 (/행정확인)[cite: 7]
 bot.hears(/^[\/!]행정확인(?:@\w+)?$/i, async (ctx) => {
     try {
         const chat = await getChatRecord(ctx.chat.id);
@@ -834,7 +707,7 @@ bot.hears(/^[\/!]행정확인(?:@\w+)?$/i, async (ctx) => {
     }
 });
 
-// 개별 방 상태 확인 (/상태확인)
+// 개별 방 상태 확인 (/상태확인)[cite: 7]
 bot.hears(/^[\/!]상태확인(?:@\w+)?$/i, async (ctx) => {
     const record = await getChatRecord(ctx.chat.id);
     if (!record) {
@@ -860,13 +733,9 @@ bot.hears(/^[\/!]상태확인(?:@\w+)?$/i, async (ctx) => {
     } else if (record.meeting_type === '인터뷰') {
         typeText = '• <b>만남 유형</b>: 🎙️ <b>인터뷰 만남 단계</b>\n';
         typeText += `   - <b>인터뷰어</b>: ${
-            record.interviewer_info
-                ? escapeHtml(record.interviewer_info)
-                : '⚠️ 미등록 (<code>/인터뷰어 지역/팀/이름</code>)'
+            record.interviewer_info ? escapeHtml(record.interviewer_info) : '⚠️ 미등록'
         }\n`;
-        typeText += `   - <b>타이퍼</b>: ${
-            record.typer_info ? escapeHtml(record.typer_info) : '미지정 (<code>/타이퍼 지역/팀/이름</code>)'
-        }\n`;
+        typeText += `   - <b>타이퍼</b>: ${record.typer_info ? escapeHtml(record.typer_info) : '미지정'}\n`;
         if (record.interview_date) {
             typeText += `   - <b>인터뷰 예정일</b>: <b>${escapeHtml(record.interview_date)}</b>\n`;
         }
@@ -920,7 +789,7 @@ bot.hears(/^[\/!]상태확인(?:@\w+)?$/i, async (ctx) => {
                 typeText +
                 stageText +
                 `• <b>만남 예정일</b>: ⚠️ <b>미등록</b>\n\n` +
-                `💡 <code>/만남일 MM-DD</code> 또는 <code>/인터뷰일 MM-DD</code>로 일정을 등록해주세요.`,
+                `💡 <code>/만남일 MM-DD</code> 또는 인터뷰 사전 보고서로 일정을 등록해주세요.`,
             { parse_mode: 'HTML' }
         );
         return;
@@ -942,7 +811,7 @@ bot.hears(/^[\/!]상태확인(?:@\w+)?$/i, async (ctx) => {
     );
 });
 
-// 만남 중단 설정 (/만남중단 [사유])
+// 만남 중단 설정 (/만남중단 [사유])[cite: 7]
 bot.hears(/^[\/!]만남중단(?:@\w+)?(?:\s+(.+))?$/i, async (ctx) => {
     const reason = ctx.match[1]?.trim();
     if (!reason) {
@@ -976,7 +845,7 @@ bot.hears(/^[\/!]만남중단(?:@\w+)?(?:\s+(.+))?$/i, async (ctx) => {
     );
 });
 
-// 만남일 수동 설정 (/만남일 MM-DD, 만남일 미정 등)
+// 만남일 수동 설정 (/만남일 MM-DD, 만남일 미정 등)[cite: 7]
 bot.hears(/^[\/!]만남일(?:@\w+)?(?:\s+(.+))?$/i, async (ctx) => {
     const rawInput = ctx.match[1]?.trim();
     if (!rawInput) {
@@ -1015,7 +884,7 @@ bot.hears(/^[\/!]만남일(?:@\w+)?(?:\s+(.+))?$/i, async (ctx) => {
     );
 });
 
-// 방 구분 설정 (/섭등예정, /예정가능일, /가능가능일 [메모])
+// 방 구분 설정 (/섭등예정, /예정가능일, /가능가능일 [메모])[cite: 7]
 bot.hears(/^[\/!](섭등예정|예정가능일|가능가능일)(?:@\w+)?(?:\s+(.+))?$/i, async (ctx) => {
     const stage = ctx.match[1] as '섭등예정' | '예정가능일' | '가능가능일';
     const note = ctx.match[2]?.trim() || '';
@@ -1034,7 +903,7 @@ bot.hears(/^[\/!](섭등예정|예정가능일|가능가능일)(?:@\w+)?(?:\s+(.
     await ctx.reply(replyMsg, { parse_mode: 'HTML' });
 });
 
-// 방 구분 해제 (/구분해제, /일반)
+// 방 구분 해제 (/구분해제, /일반)[cite: 7]
 bot.hears(/^[\/!](구분해제|일반)(?:@\w+)?$/i, async (ctx) => {
     const title = 'title' in ctx.chat ? ctx.chat.title : ctx.chat.first_name || '대화방';
     await ensureChatRecord(ctx.chat.id, title);
@@ -1047,7 +916,7 @@ bot.hears(/^[\/!](구분해제|일반)(?:@\w+)?$/i, async (ctx) => {
     await ctx.reply('✅ <b>특수 구분이 해제되어 [일반] 상태로 전환되었습니다.</b>', { parse_mode: 'HTML' });
 });
 
-// 관리자 명령어 1. 날짜별 만남 조회
+// 관리자 명령어 1. 날짜별 만남 조회[cite: 7]
 bot.hears(
     /^(?:[\/!]?관리자(?:\s+(?!(?:미제출|미등록|미정|미갱신|최초미등록|점검|현황|중단|구분|단계|특수|섭등예정|예정가능일|가능가능일|일반|일반방|미분류))(.+))?|[\/!](?:만남명단|만남일정)(?:@\w+)?(?:\s+(.+))?)$/i,
     async (ctx) => {
@@ -1118,7 +987,7 @@ bot.hears(
     }
 );
 
-// 관리자 명령어 2. 보고서 미제출 명단
+// 관리자 명령어 2. 보고서 미제출 명단[cite: 7]
 bot.hears(/^(?:[\/!]?관리자\s+)((?:만남\s*)?보고서\s*미제출|미제출\s*명단|미제출)$/i, async (ctx) => {
     try {
         const userId = String(ctx.from?.id);
@@ -1172,7 +1041,7 @@ bot.hears(/^(?:[\/!]?관리자\s+)((?:만남\s*)?보고서\s*미제출|미제출
     }
 });
 
-// 관리자 명령어 3. 종합 점검
+// 관리자 명령어 3. 종합 점검[cite: 7]
 bot.hears(/^(?:[\/!]?관리자\s+)(점검|현황|종합\s*점검|전체\s*점검)$/i, async (ctx) => {
     try {
         const userId = String(ctx.from?.id);
@@ -1208,7 +1077,7 @@ bot.hears(/^(?:[\/!]?관리자\s+)(점검|현황|종합\s*점검|전체\s*점검
     }
 });
 
-// 10. 일반 텍스트 수신 (인터뷰 보고서, 만남 보고서 및 #피드백 감지)
+// 10. 일반 텍스트 수신 (사전 보고서, 결과 보고서, 만남 보고서 및 #피드백 감지)
 bot.on('text', async (ctx) => {
     const text = ctx.message.text.trim();
     const chatId = ctx.chat.id;
@@ -1216,12 +1085,133 @@ bot.on('text', async (ctx) => {
 
     await ensureChatRecord(chatId, roomTitle);
 
-    // 슬래시(/)나 느낌표(!)로 시작하는 정식 명령어 텍스트는 여기서 무시
+    // 슬래시(/)나 느낌표(!)로 시작하는 정식 명령어 텍스트는 무시[cite: 7]
     if (/^[!/]/i.test(text) || /^관리자\s+/i.test(text)) {
         return;
     }
 
-    // A. [인터뷰 결과 보고서] 감지 (양식 키워드가 포함된 경우에만 반응)
+    // A. [인터뷰 사전 보고서] 자동 감지 및 파싱
+    const isInterviewPreReport =
+        text.includes('인터뷰 사전 보고서') ||
+        text.includes('인터뷰 사전보고서') ||
+        text.includes('인터뷰 신청서') ||
+        text.includes('인터뷰 계획서');
+
+    if (isInterviewPreReport) {
+        // 인터뷰어 추출
+        const interviewerMatch = text.match(/인터뷰어\s*[:：\-]?\s*([^\n\r]+)/i);
+        const interviewerRaw = interviewerMatch ? interviewerMatch[1].trim() : '';
+
+        // 타이퍼 추출
+        const typerMatch = text.match(/타이퍼\s*[:：\-]?\s*([^\n\r]+)/i);
+        const typerRaw = typerMatch ? typerMatch[1].trim() : '';
+
+        // 날짜 추출
+        const dateMatch = text.match(
+            /(?:인터뷰\s*(?:예정일|일시|일)|만남\s*(?:예정일|일시|일)|일시|일정)\s*[:：\-]?\s*([^\n\r]+)/i
+        );
+        const dateRaw = dateMatch ? dateMatch[1].trim() : '';
+
+        if (!interviewerRaw) {
+            await ctx.reply(
+                '⚠️ 인터뷰어 정보가 누락되었습니다. <code>• 인터뷰어: 지역 팀 이름</code> 형식으로 작성해주세요.',
+                { parse_mode: 'HTML' }
+            );
+            return;
+        }
+
+        const iInfo = parseMemberString(interviewerRaw);
+        if (!iInfo) {
+            await ctx.reply(
+                `⚠️ 인터뷰어(<b>${escapeHtml(interviewerRaw)}</b>)의 소속 형식을 인식하지 못했습니다.\n` +
+                    `예: <code>• 인터뷰어: 강북 1팀 귀요미</code> 또는 <code>강북/1/귀요미</code>`,
+                { parse_mode: 'HTML' }
+            );
+            return;
+        }
+
+        try {
+            const interviewer = await findMemberFromDB(iInfo.name, iInfo.region, iInfo.team);
+            if (!interviewer) {
+                await ctx.reply(
+                    `❌ <b>DB에서 인터뷰어를 찾을 수 없습니다.</b>\n• ${escapeHtml(iInfo.region)} / ${escapeHtml(
+                        iInfo.team
+                    )}팀 / ${escapeHtml(iInfo.name)}`,
+                    { parse_mode: 'HTML' }
+                );
+                return;
+            }
+
+            // 타이퍼 조회 (타이퍼가 작성된 경우)
+            let typer: any = null;
+            const hasTyper = typerRaw && !/^(없음|미지정|\-|없|X)$/i.test(typerRaw);
+            if (hasTyper) {
+                let tInfo = parseMemberString(typerRaw);
+                // 소속 생략 시 인터뷰어 소속 상속
+                if (!tInfo && /^[가-힣]{2,4}$/.test(typerRaw)) {
+                    tInfo = { region: iInfo.region, team: iInfo.team, name: typerRaw };
+                }
+
+                if (tInfo) {
+                    typer = await findMemberFromDB(tInfo.name, tInfo.region, tInfo.team);
+                    if (!typer) {
+                        await ctx.reply(
+                            `⚠️ 타이퍼(<b>${escapeHtml(
+                                typerRaw
+                            )}</b>)를 DB에서 찾지 못하여 [미지정] 처리하고 계속 진행합니다.`,
+                            { parse_mode: 'HTML' }
+                        );
+                    }
+                }
+            }
+
+            // 날짜 파싱
+            let formattedDate = '미정';
+            if (dateRaw && !dateRaw.includes('미정')) {
+                const parsed = parseFlexibleDate(dateRaw);
+                if (parsed) formattedDate = parsed;
+            }
+
+            await upsertMeetingDate(chatId, roomTitle, formattedDate);
+
+            const patch: Partial<ChatRecord> = {
+                meeting_type: '인터뷰',
+                interview_date: formattedDate,
+                interviewer_name: interviewer['이름'],
+                interviewer_code: interviewer['고유번호'],
+                interviewer_info: `${interviewer['지역']} ${interviewer['구역']} ${interviewer['이름']}`,
+                typer_name: typer ? typer['이름'] : null,
+                typer_code: typer ? typer['고유번호'] : null,
+                typer_info: typer ? `${typer['지역']} ${typer['구역']} ${typer['이름']}` : null,
+            };
+            await updateChat(chatId, patch);
+
+            let resMsg = `🎙️ <b>[인터뷰 사전 보고서]가 정상 반영되었습니다!</b>\n\n`;
+            resMsg += `• <b>인터뷰어</b>: <b>${escapeHtml(interviewer['이름'])}</b> (${escapeHtml(
+                interviewer['지역']
+            )} / ${escapeHtml(interviewer['구역'])})\n`;
+            resMsg += `• <b>타이퍼</b>: ${
+                typer
+                    ? `<b>${escapeHtml(typer['이름'])}</b> (${escapeHtml(typer['지역'])} / ${escapeHtml(
+                          typer['구역']
+                      )})`
+                    : '미지정'
+            }\n`;
+            resMsg += `• <b>인터뷰 예정일</b>: <b>${formattedDate}</b>\n\n`;
+            resMsg += `• <b>D-1 알림 (10:00)</b>: 인터뷰 안내 알림\n`;
+            resMsg += `• <b>당일 알림 (22:00)</b>: 결과 보고서 등록 알림\n\n`;
+            resMsg += `💡 인터뷰 종료 후 <code>/인터뷰양식</code>을 복사하여 결과를 등록해주세요.`;
+
+            await ctx.reply(resMsg, { parse_mode: 'HTML' });
+            return;
+        } catch (err: any) {
+            console.error('[사전 보고서 자동 처리 에러]:', err);
+            await ctx.reply(`⚠️ 사전 보고서 처리 중 오류가 발생했습니다: ${err.message}`);
+            return;
+        }
+    }
+
+    // B. [인터뷰 결과 보고서] 감지[cite: 7]
     const isInterviewReport =
         text.includes('인터뷰 결과 보고서') ||
         text.includes('인터뷰 결과') ||
@@ -1272,7 +1262,7 @@ bot.on('text', async (ctx) => {
 
             await upsertMeetingDate(chatId, roomTitle, nextMeetingStr);
             await updateChat(chatId, {
-                meeting_type: '교사', // 교사 만남으로 자동 전환
+                meeting_type: '교사',
                 follow_up_applied: '신청',
                 follow_up_reason: '',
                 interview_report_submitted: 1,
@@ -1299,7 +1289,7 @@ bot.on('text', async (ctx) => {
         return;
     }
 
-    // B. 일반 [만남 보고서] 감지
+    // C. 일반 [만남 보고서] 감지[cite: 7]
     const isReport =
         text.includes('상담,복음방 보고서') ||
         text.includes('상담 보고서') ||
@@ -1344,7 +1334,7 @@ bot.on('text', async (ctx) => {
         return;
     }
 
-    // C. 피드백 감지
+    // D. 피드백 감지[cite: 7]
     if (/#피드백내용|#피드백/.test(text)) {
         await updateChat(chatId, { feedback_submitted: 1 });
         await ctx.reply('📝 <b>피드백 내용이 확인되었습니다.</b> 감사합니다.', { parse_mode: 'HTML' });
@@ -1366,7 +1356,7 @@ async function triggerMorningReminder() {
 
         const diffDays = today.diff(mDate, 'day');
 
-        // D-1 안내
+        // D-1 안내[cite: 7]
         if (diffDays === -1 && !chat.d_minus_1_notified) {
             try {
                 if (chat.meeting_type === '인터뷰') {
@@ -1394,7 +1384,7 @@ async function triggerMorningReminder() {
             }
         }
 
-        // D+1 미제출 알림
+        // D+1 미제출 알림[cite: 7]
         if (diffDays === 1 && !chat.report_submitted && !chat.overdue_1_notified) {
             try {
                 const reportTitle = chat.meeting_type === '인터뷰' ? '인터뷰 결과 보고서' : '만남 보고서';
@@ -1413,7 +1403,7 @@ async function triggerMorningReminder() {
             }
         }
 
-        // D+2 경고 알림
+        // D+2 경고 알림[cite: 7]
         if (diffDays >= 2 && !chat.report_submitted && !chat.overdue_2_notified) {
             try {
                 await bot.telegram.sendMessage(
@@ -1471,7 +1461,7 @@ async function triggerNightReminder() {
 }
 
 /* =====================================================
- * 🌐 HTTP 웹훅 서버 구동
+ * 🌐 HTTP 웹훅 서버 구동[cite: 7]
  * ===================================================== */
 const server = http.createServer(async (req, res) => {
     const url = new URL(req.url || '/', `http://${req.headers.host}`);
@@ -1501,7 +1491,7 @@ const PORT = Number(process.env.PORT) || 8300;
 server.listen(PORT, async () => {
     console.log(`Server listening on port ${PORT}`);
 
-    // DB 테이블 컬럼 점검 및 자동 생성
+    // DB 테이블 컬럼 점검 및 자동 생성[cite: 7]
     await initDb();
 
     const webhookUrl = 'https://teacherfollow.alwaysdata.net/webhook';
