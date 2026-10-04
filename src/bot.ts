@@ -1228,7 +1228,76 @@ bot.on('text', async (ctx) => {
         await ctx.reply('📝 <b>피드백 내용이 확인되었습니다.</b> 감사합니다.', { parse_mode: 'HTML' });
     }
 });
+bot.hears(/^\/?행정확인(?:@\w+)?$/i, async (ctx) => {
+    try {
+        const chat = await getChatRecord(ctx.chat.id);
 
+        // 1. 최초등록 여부 검증
+        if (!chat || !chat.matched_member_id) {
+            await ctx.reply(
+                '⚠️️ <b>매칭된 대상자가 없습니다.</b>\n\n' +
+                    '먼저 <code>/최초등록 섭외자/지역/팀/인도자</code> 명령어로 대상자를 등록해주세요.',
+                { parse_mode: 'HTML' }
+            );
+            return;
+        }
+
+        // 2. students 테이블에서 해당 대상자의 행정 정보 조회
+        const query = `
+            SELECT 
+                s.*,
+                m."이름" AS guide_name,
+                m."지역" AS guide_region,
+                m."구역" AS guide_district
+            FROM students s
+            LEFT JOIN members m ON s."인도자_고유번호" = m."고유번호"
+            WHERE s.id = $1
+            LIMIT 1;
+        `;
+        const res = await neonPool.query(query, [chat.matched_member_id]);
+
+        if (res.rows.length === 0) {
+            await ctx.reply('❌ <b>DB에서 대상자 정보를 찾을 수 없습니다.</b>', { parse_mode: 'HTML' });
+            return;
+        }
+
+        const s = res.rows[0];
+
+        // 3. 날짜 및 행정 정보 정리
+        const studentName = escapeHtml(s['이름'] || '미등록');
+        const guideInfo = s.guide_name
+            ? `${escapeHtml(s.guide_name)} (${escapeHtml(s.guide_region || '')} ${escapeHtml(s.guide_district || '')})`
+            : '미등록';
+
+        // 행정 필드 (컬럼에 값이 없으면 '-' 처리)
+        const stage = escapeHtml(s['단계'] || '-');
+        const balRegDate = escapeHtml(s['발_등록일'] || s['발등록일'] || '-');
+        const bokRegDate = escapeHtml(s['복_등록일'] || s['복등록일'] || '-');
+        const subRegDate = escapeHtml(s['섭_등록일'] || s['섭등록일'] || '-');
+        const regDate = escapeHtml(s['등록일'] || '-');
+
+        let msg = `📑 <b>[${studentName}] 행정 등록 현황</b>\n`;
+        msg += `━━━━━━━━━━━━━━━━━━\n`;
+        msg += `• <b>담당 인도자</b>: ${guideInfo}\n`;
+        msg += `• <b>현재 단계</b>: <b>${stage}</b>\n\n`;
+
+        msg += `🗓 <b>[주요 행정 일자]</b>\n`;
+        if (balRegDate !== '-') msg += `• 발_등록일: <b>${balRegDate}</b>\n`;
+        if (bokRegDate !== '-') msg += `• 복_등록일: <b>${bokRegDate}</b>\n`;
+        if (subRegDate !== '-') msg += `• 섭_등록일: <b>${subRegDate}</b>\n`;
+        if (regDate !== '-') msg += `• 기본 등록일: <b>${regDate}</b>\n`;
+
+        // 등록된 행정 날짜가 하나도 없을 경우 안내
+        if (balRegDate === '-' && bokRegDate === '-' && subRegDate === '-' && regDate === '-') {
+            msg += `• 등록된 행정 일자 기록이 없습니다.\n`;
+        }
+
+        await ctx.reply(msg, { parse_mode: 'HTML' });
+    } catch (err: any) {
+        console.error('[/행정확인 조회 에러]:', err);
+        await ctx.reply(`⚠️ 행정 확인 조회 중 오류가 발생했습니다: ${err.message}`);
+    }
+});
 /* =====================================================
  * ⏰ 스케줄러 트리거 함수들
  * ===================================================== */
