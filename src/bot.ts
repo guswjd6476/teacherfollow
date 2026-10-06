@@ -912,7 +912,7 @@ async function getStudentTargetColumnType(): Promise<string> {
 }
 
 // 목표월 수정 (/목표월수정 n월)
-bot.hears(/^[\/!]목표월수정(?:@\w+)?(?:\s+(.+))?$/i, async (ctx) => {
+bot.hears(/^[\/!]목표월(?:\s*(?:수정|변경|설정))?(?:@\w+)?(?:\s+(.+))?$/i, async (ctx) => {
     const rawInput = ctx.match[1]?.trim() || '';
     const monthMatch = rawInput.match(/^(\d{1,2})\s*월?$/);
     const month = monthMatch ? Number(monthMatch[1]) : NaN;
