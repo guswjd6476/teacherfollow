@@ -33,8 +33,8 @@ const neonPool = new Pool({
     idleTimeoutMillis: 30000,
 });
 
-neonPool.on('error', (err: any) => {
-    console.error('🚨 [Neon Pool 유휴 연결 에러]:', err.message);
+neonPool.on('error', (err: unknown) => {
+    console.error('🚨 [Neon Pool 유휴 연결 에러]:', getErrorMessage(err));
 });
 
 // DB 스키마 컬럼 자동 추가
@@ -56,8 +56,8 @@ async function initDb() {
             ADD COLUMN IF NOT EXISTS interview_report_submitted INTEGER DEFAULT 0;
         `);
         console.log('✅ [DB 점검] counseling_chats 테이블 신규 컬럼 점검 완료');
-    } catch (err: any) {
-        console.error('⚠️ [DB 점검 경고]:', err.message);
+    } catch (err: unknown) {
+        console.error('⚠️ [DB 점검 경고]:', getErrorMessage(err));
     }
 }
 
@@ -70,6 +70,10 @@ const ADMIN_IDS = (process.env.ADMIN_IDS || '')
 function isAdmin(userId?: number | string): boolean {
     if (!userId) return false;
     return ADMIN_IDS.length > 0 && ADMIN_IDS.includes(String(userId));
+}
+
+function getErrorMessage(err: unknown): string {
+    return err instanceof Error ? err.message : String(err);
 }
 
 function escapeHtml(text?: string | number | null): string {
@@ -352,7 +356,7 @@ async function sendChunkedList<T>(
  * ===================================================== */
 const bot = new Telegraf(BOT_TOKEN);
 
-bot.catch((err: any, ctx) => {
+bot.catch((err: unknown, ctx) => {
     console.error(`[Telegraf 처리 에러] Chat ID: ${ctx.chat?.id}`, err);
 });
 
@@ -370,8 +374,8 @@ bot.on('new_chat_title', async (ctx) => {
                 [newTitle, String(chatId)]
             );
             console.log(`[방 제목 변경 반영] Chat: ${chatId} -> "${newTitle}"`);
-        } catch (err: any) {
-            console.error('[방 제목 갱신 실패]:', err.message);
+        } catch (err: unknown) {
+            console.error('[방 제목 갱신 실패]:', getErrorMessage(err));
         }
     }
 });
@@ -383,20 +387,24 @@ bot.on('my_chat_member', async (ctx) => {
 
     if (status === 'member' || status === 'administrator') {
         const title = 'title' in ctx.chat ? ctx.chat.title : ctx.chat.first_name || '대화방';
-        await ensureChatRecord(chatId, title);
+        try {
+            await ensureChatRecord(chatId, title);
 
-        await ctx.reply(
-            '👋 <b>상담/복음방 일정 관리 봇이 등록되었습니다.</b>\n\n' +
-                '먼저 대상자 매칭을 위해 아래 명령어를 입력해주세요:\n' +
-                '<code>/최초등록 섭외자/지역/팀/인도자</code>\n' +
-                '<i>(예: <code>/최초등록 홍길동/강북/1/강현정</code>)</i>',
-            { parse_mode: 'HTML' }
-        );
+            await ctx.reply(
+                '👋 <b>상담/복음방 일정 관리 봇이 등록되었습니다.</b>\n\n' +
+                    '먼저 대상자 매칭을 위해 아래 명령어를 입력해주세요:\n' +
+                    '<code>/최초등록 섭외자/지역/팀/인도자</code>\n' +
+                    '<i>(예: <code>/최초등록 홍길동/강북/1/강현정</code>)</i>',
+                { parse_mode: 'HTML' }
+            );
+        } catch (err: unknown) {
+            console.error('[방 등록 초기화 실패]:', getErrorMessage(err));
+        }
     } else if (status === 'left' || status === 'kicked') {
         try {
             await neonPool.query(`DELETE FROM counseling_chats WHERE chat_id = $1;`, [String(chatId)]);
-        } catch (err: any) {
-            console.error('[방 퇴장 데이터 삭제 실패]:', err.message);
+        } catch (err: unknown) {
+            console.error('[방 퇴장 데이터 삭제 실패]:', getErrorMessage(err));
         }
     }
 });
@@ -524,9 +532,9 @@ bot.hears(/^[\/!]최초등록(?:@\w+)?(?:\s+(.+))?$/i, async (ctx) => {
                 },
             }
         );
-    } catch (err: any) {
+    } catch (err: unknown) {
         console.error('[최초등록 JOIN 매칭 에러]:', err);
-        await ctx.reply(`⚠️ DB 매칭 조회 중 오류 발생: ${err.message}`);
+        await ctx.reply(`⚠️ DB 매칭 조회 중 오류 발생: ${getErrorMessage(err)}`);
     }
 });
 
@@ -542,7 +550,7 @@ bot.action('type_interview', async (ctx) => {
                 `💡 양식이 필요하시면 <code>/인터뷰사전양식</code>을 입력하세요.`,
             { parse_mode: 'HTML' }
         );
-    } catch (err: any) {
+    } catch (err: unknown) {
         console.error('[type_interview 에러]:', err);
     }
 });
@@ -558,7 +566,7 @@ bot.action('type_teacher', async (ctx) => {
                 `• <code>/만남일 MM-DD</code> 또는 <code>/만남일 미정</code>`,
             { parse_mode: 'HTML' }
         );
-    } catch (err: any) {
+    } catch (err: unknown) {
         console.error('[type_teacher 에러]:', err);
     }
 });
@@ -646,9 +654,9 @@ bot.hears(/^[\/!](인터뷰어|인터뷰어수정|인터뷰어변경)(?:@\w+)?(?
                 )} / ${escapeHtml(member['구역'])})`,
             { parse_mode: 'HTML' }
         );
-    } catch (err: any) {
+    } catch (err: unknown) {
         console.error('[/인터뷰어 개별 수정 에러]:', err);
-        await ctx.reply(`⚠ 인터뷰어 수정 중 오류 발생: ${err.message}`);
+        await ctx.reply(`⚠ 인터뷰어 수정 중 오류 발생: ${getErrorMessage(err)}`);
     }
 });
 
@@ -666,12 +674,17 @@ bot.hears(/^[\/!](타이퍼|타이퍼수정|타이퍼변경)(?:@\w+)?(?:\s+(.+))
     }
 
     if (/^(없음|미지정|해제|\-|X)$/i.test(rawInput)) {
-        await updateChat(ctx.chat.id, {
-            typer_name: null,
-            typer_code: null,
-            typer_info: null,
-        });
-        await ctx.reply('⌨️ <b>타이퍼가 [미지정]으로 해제되었습니다.</b>', { parse_mode: 'HTML' });
+        try {
+            await updateChat(ctx.chat.id, {
+                typer_name: null,
+                typer_code: null,
+                typer_info: null,
+            });
+            await ctx.reply('⌨️ <b>타이퍼가 [미지정]으로 해제되었습니다.</b>', { parse_mode: 'HTML' });
+        } catch (err: unknown) {
+            console.error('[/타이퍼 해제 에러]:', getErrorMessage(err));
+            await ctx.reply(`⚠️ 타이퍼 해제 중 오류 발생: ${getErrorMessage(err)}`);
+        }
         return;
     }
 
@@ -707,9 +720,9 @@ bot.hears(/^[\/!](타이퍼|타이퍼수정|타이퍼변경)(?:@\w+)?(?:\s+(.+))
                 )} / ${escapeHtml(member['구역'])})`,
             { parse_mode: 'HTML' }
         );
-    } catch (err: any) {
+    } catch (err: unknown) {
         console.error('[/타이퍼 개별 수정 에러]:', err);
-        await ctx.reply(`⚠️ 타이퍼 수정 중 오류 발생: ${err.message}`);
+        await ctx.reply(`⚠️ 타이퍼 수정 중 오류 발생: ${getErrorMessage(err)}`);
     }
 });
 
@@ -725,42 +738,52 @@ bot.hears(/^[\/!](인터뷰일|인터뷰일자|인터뷰일정)(?:@\w+)?(?:\s+(.
 
     const title = 'title' in ctx.chat ? ctx.chat.title : ctx.chat.first_name || '대화방';
 
-    if (rawInput.includes('미정')) {
-        await upsertMeetingDate(ctx.chat.id, title, '미정');
-        await updateChat(ctx.chat.id, { meeting_type: '인터뷰', interview_date: '미정' });
-        await ctx.reply('📌 <b>인터뷰 일정이 [미정]으로 변경되었습니다.</b>', { parse_mode: 'HTML' });
-        return;
+    try {
+        if (rawInput.includes('미정')) {
+            await upsertMeetingDate(ctx.chat.id, title, '미정');
+            await updateChat(ctx.chat.id, { meeting_type: '인터뷰', interview_date: '미정' });
+            await ctx.reply('📌 <b>인터뷰 일정이 [미정]으로 변경되었습니다.</b>', { parse_mode: 'HTML' });
+            return;
+        }
+
+        const formatted = parseFlexibleDate(rawInput);
+        if (!formatted) {
+            await ctx.reply('⚠️ 올바른 날짜 형식이 아닙니다. (예: 10-12, 10/12, 2026-10-12)');
+            return;
+        }
+
+        await upsertMeetingDate(ctx.chat.id, title, formatted);
+        await updateChat(ctx.chat.id, { meeting_type: '인터뷰', interview_date: formatted });
+
+        await ctx.reply(`🎙️ <b>인터뷰 예정일이 [${formatted}]로 변경되었습니다!</b>`, { parse_mode: 'HTML' });
+    } catch (err: unknown) {
+        console.error('[/인터뷰일 수정 에러]:', getErrorMessage(err));
+        await ctx.reply(`⚠️ 인터뷰 일정 수정 중 오류 발생: ${getErrorMessage(err)}`);
     }
-
-    const formatted = parseFlexibleDate(rawInput);
-    if (!formatted) {
-        await ctx.reply('⚠️ 올바른 날짜 형식이 아닙니다. (예: 10-12, 10/12, 2026-10-12)');
-        return;
-    }
-
-    await upsertMeetingDate(ctx.chat.id, title, formatted);
-    await updateChat(ctx.chat.id, { meeting_type: '인터뷰', interview_date: formatted });
-
-    await ctx.reply(`🎙️ <b>인터뷰 예정일이 [${formatted}]로 변경되었습니다!</b>`, { parse_mode: 'HTML' });
 });
 
 // 매칭 해제 (/매칭해제)
 bot.hears(/^[\/!]매칭해제(?:@\w+)?$/i, async (ctx) => {
-    await updateChat(ctx.chat.id, {
-        matched_member_id: null,
-        meeting_type: null,
-        interviewer_name: null,
-        interviewer_code: null,
-        interviewer_info: null,
-        typer_name: null,
-        typer_code: null,
-        typer_info: null,
-        interview_date: null,
-        follow_up_applied: null,
-        follow_up_reason: null,
-        interview_report_submitted: 0,
-    });
-    await ctx.reply('✅ 대상자 매칭 및 인터뷰 설정이 모두 초기화되었습니다.');
+    try {
+        await updateChat(ctx.chat.id, {
+            matched_member_id: null,
+            meeting_type: null,
+            interviewer_name: null,
+            interviewer_code: null,
+            interviewer_info: null,
+            typer_name: null,
+            typer_code: null,
+            typer_info: null,
+            interview_date: null,
+            follow_up_applied: null,
+            follow_up_reason: null,
+            interview_report_submitted: 0,
+        });
+        await ctx.reply('✅ 대상자 매칭 및 인터뷰 설정이 모두 초기화되었습니다.');
+    } catch (err: unknown) {
+        console.error('[/매칭해제 에러]:', getErrorMessage(err));
+        await ctx.reply(`⚠️ 매칭 해제 중 오류 발생: ${getErrorMessage(err)}`);
+    }
 });
 
 // 행정 등록 내역 확인 (/행정확인)
@@ -863,14 +886,15 @@ bot.hears(/^[\/!]행정확인(?:@\w+)?$/i, async (ctx) => {
         }
 
         await ctx.reply(msg, { parse_mode: 'HTML' });
-    } catch (err: any) {
+    } catch (err: unknown) {
         console.error('[/행정확인 에러]:', err);
-        await ctx.reply(`⚠️ 행정 확인 중 오류 발생: ${err.message}`);
+        await ctx.reply(`⚠️ 행정 확인 중 오류 발생: ${getErrorMessage(err)}`);
     }
 });
 
 // 개별 방 상태 확인 (/상태확인)
 bot.hears(/^[\/!]상태확인(?:@\w+)?$/i, async (ctx) => {
+    try {
     const record = await getChatRecord(ctx.chat.id);
     if (!record) {
         await ctx.reply(
@@ -971,6 +995,10 @@ bot.hears(/^[\/!]상태확인(?:@\w+)?$/i, async (ctx) => {
             `• <b>보고서 제출</b>: ${reportStatus}`,
         { parse_mode: 'HTML' }
     );
+    } catch (err: unknown) {
+        console.error('[/상태확인 에러]:', getErrorMessage(err));
+        await ctx.reply(`⚠️ 상태 확인 중 오류 발생: ${getErrorMessage(err)}`);
+    }
 });
 
 // 만남 중단 설정 (/만남중단 [사유])
@@ -987,24 +1015,29 @@ bot.hears(/^[\/!]만남중단(?:@\w+)?(?:\s+(.+))?$/i, async (ctx) => {
     }
 
     const title = 'title' in ctx.chat ? ctx.chat.title : ctx.chat.first_name || '대화방';
-    await ensureChatRecord(ctx.chat.id, title);
-    await updateChat(ctx.chat.id, {
-        meeting_date: '중단',
-        stop_reason: reason,
-        feedback_submitted: 0,
-        report_submitted: 0,
-        d_minus_1_notified: 0,
-        d_day_22_notified: 0,
-        overdue_1_notified: 0,
-        overdue_2_notified: 0,
-    });
+    try {
+        await ensureChatRecord(ctx.chat.id, title);
+        await updateChat(ctx.chat.id, {
+            meeting_date: '중단',
+            stop_reason: reason,
+            feedback_submitted: 0,
+            report_submitted: 0,
+            d_minus_1_notified: 0,
+            d_day_22_notified: 0,
+            overdue_1_notified: 0,
+            overdue_2_notified: 0,
+        });
 
-    await ctx.reply(
-        `🛑 <b>만남 일정이 [중단] 처리되었습니다.</b>\n\n` +
-            `• <b>중단 사유</b>: ${escapeHtml(reason)}\n\n` +
-            `💡 만남이 재개되면 <code>/만남일 MM-DD</code>를 입력하여 새 일정을 등록해주세요.`,
-        { parse_mode: 'HTML' }
-    );
+        await ctx.reply(
+            `🛑 <b>만남 일정이 [중단] 처리되었습니다.</b>\n\n` +
+                `• <b>중단 사유</b>: ${escapeHtml(reason)}\n\n` +
+                `💡 만남이 재개되면 <code>/만남일 MM-DD</code>를 입력하여 새 일정을 등록해주세요.`,
+            { parse_mode: 'HTML' }
+        );
+    } catch (err: unknown) {
+        console.error('[/만남중단 에러]:', getErrorMessage(err));
+        await ctx.reply(`⚠️ 만남 중단 처리 중 오류 발생: ${getErrorMessage(err)}`);
+    }
 });
 
 // 만남일 수동 설정 (/만남일 MM-DD, 만남일 미정 등)
@@ -1022,31 +1055,36 @@ bot.hears(/^[\/!]만남일(?:@\w+)?(?:\s+(.+))?$/i, async (ctx) => {
 
     const title = 'title' in ctx.chat ? ctx.chat.title : ctx.chat.first_name || '대화방';
 
-    if (rawInput.includes('미정')) {
-        await upsertMeetingDate(ctx.chat.id, title, '미정');
+    try {
+        if (rawInput.includes('미정')) {
+            await upsertMeetingDate(ctx.chat.id, title, '미정');
+            await ctx.reply(
+                '📌 <b>만남 예정일이 [미정]으로 등록되었습니다.</b>\n\n' +
+                    '만남 일정이 다시 잡히면 <code>/만남일 MM-DD</code>로 봇에게 꼭 알려주세요!',
+                { parse_mode: 'HTML' }
+            );
+            return;
+        }
+
+        const formatted = parseFlexibleDate(rawInput);
+        if (!formatted) {
+            await ctx.reply('⚠️ 올바른 날짜 형식이 아닙니다. (예: 09-24, 9/24, 2026-09-24, 또는 미정)');
+            return;
+        }
+
+        await upsertMeetingDate(ctx.chat.id, title, formatted);
+
         await ctx.reply(
-            '📌 <b>만남 예정일이 [미정]으로 등록되었습니다.</b>\n\n' +
-                '만남 일정이 다시 잡히면 <code>/만남일 MM-DD</code>로 봇에게 꼭 알려주세요!',
+            `🗓 만남일이 <b>${formatted}</b>로 등록되었습니다.\n\n` +
+                `• <b>만남 전날 (10:00)</b>: 피드백(#피드백) 등록 요청 알림\n` +
+                `• <b>만남 당일 (22:00)</b>: 만남 보고서 등록 알림\n` +
+                `• <b>미제출 시</b>: 1일/2일 경과 경고 알림`,
             { parse_mode: 'HTML' }
         );
-        return;
+    } catch (err: unknown) {
+        console.error('[/만남일 설정 에러]:', getErrorMessage(err));
+        await ctx.reply(`⚠️ 만남일 설정 중 오류 발생: ${getErrorMessage(err)}`);
     }
-
-    const formatted = parseFlexibleDate(rawInput);
-    if (!formatted) {
-        await ctx.reply('⚠️ 올바른 날짜 형식이 아닙니다. (예: 09-24, 9/24, 2026-09-24, 또는 미정)');
-        return;
-    }
-
-    await upsertMeetingDate(ctx.chat.id, title, formatted);
-
-    await ctx.reply(
-        `🗓 만남일이 <b>${formatted}</b>로 등록되었습니다.\n\n` +
-            `• <b>만남 전날 (10:00)</b>: 피드백(#피드백) 등록 요청 알림\n` +
-            `• <b>만남 당일 (22:00)</b>: 만남 보고서 등록 알림\n` +
-            `• <b>미제출 시</b>: 1일/2일 경과 경고 알림`,
-        { parse_mode: 'HTML' }
-    );
 });
 
 // 방 구분 설정 (/섭등예정, /예정가능일, /가능가능일 [메모])
@@ -1055,30 +1093,40 @@ bot.hears(/^[\/!](섭등예정|예정가능일|가능가능일)(?:@\w+)?(?:\s+(.
     const note = ctx.match[2]?.trim() || '';
     const title = 'title' in ctx.chat ? ctx.chat.title : ctx.chat.first_name || '대화방';
 
-    await ensureChatRecord(ctx.chat.id, title);
-    await updateChat(ctx.chat.id, {
-        progress_stage: stage,
-        progress_note: note,
-    });
+    try {
+        await ensureChatRecord(ctx.chat.id, title);
+        await updateChat(ctx.chat.id, {
+            progress_stage: stage,
+            progress_note: note,
+        });
 
-    let replyMsg = `📌 <b>대화방 구분이 [${stage}]으로 설정되었습니다.</b>\n`;
-    if (note) replyMsg += `• 내용: ${escapeHtml(note)}\n`;
-    replyMsg += `\n💡 일반 상태로 복귀하려면 <code>/구분해제</code>를 입력하세요.`;
+        let replyMsg = `📌 <b>대화방 구분이 [${stage}]으로 설정되었습니다.</b>\n`;
+        if (note) replyMsg += `• 내용: ${escapeHtml(note)}\n`;
+        replyMsg += `\n💡 일반 상태로 복귀하려면 <code>/구분해제</code>를 입력하세요.`;
 
-    await ctx.reply(replyMsg, { parse_mode: 'HTML' });
+        await ctx.reply(replyMsg, { parse_mode: 'HTML' });
+    } catch (err: unknown) {
+        console.error('[방 구분 설정 에러]:', getErrorMessage(err));
+        await ctx.reply(`⚠️ 구분 설정 중 오류 발생: ${getErrorMessage(err)}`);
+    }
 });
 
 // 방 구분 해제 (/구분해제, /일반)
 bot.hears(/^[\/!](구분해제|일반)(?:@\w+)?$/i, async (ctx) => {
     const title = 'title' in ctx.chat ? ctx.chat.title : ctx.chat.first_name || '대화방';
-    await ensureChatRecord(ctx.chat.id, title);
+    try {
+        await ensureChatRecord(ctx.chat.id, title);
 
-    await updateChat(ctx.chat.id, {
-        progress_stage: '',
-        progress_note: '',
-    });
+        await updateChat(ctx.chat.id, {
+            progress_stage: '',
+            progress_note: '',
+        });
 
-    await ctx.reply('✅ <b>특수 구분이 해제되어 [일반] 상태로 전환되었습니다.</b>', { parse_mode: 'HTML' });
+        await ctx.reply('✅ <b>특수 구분이 해제되어 [일반] 상태로 전환되었습니다.</b>', { parse_mode: 'HTML' });
+    } catch (err: unknown) {
+        console.error('[구분 해제 에러]:', getErrorMessage(err));
+        await ctx.reply(`⚠️ 구분 해제 중 오류 발생: ${getErrorMessage(err)}`);
+    }
 });
 
 /* =====================================================
@@ -1142,7 +1190,7 @@ bot.hears(/^(?:[\/!]?관리자\s+)(인터뷰|인터뷰예정|인터뷰목록|인
                 )} ${escapeHtml(chat.guide_district || '')})\n\n`
             );
         });
-    } catch (err: any) {
+    } catch (err: unknown) {
         console.error('[관리자 인터뷰 조회 에러]:', err);
     }
 });
@@ -1204,7 +1252,7 @@ bot.hears(/^(?:[\/!]?관리자\s+)(교사|교사만남|교사목록|교사건)$/
                 )} ${escapeHtml(chat.guide_district || '')})\n\n`
             );
         });
-    } catch (err: any) {
+    } catch (err: unknown) {
         console.error('[관리자 교사 조회 에러]:', err);
     }
 });
@@ -1288,7 +1336,7 @@ bot.hears(
                     `\n`
                 );
             });
-        } catch (err: any) {
+        } catch (err: unknown) {
             console.error('[만남 명단 조회 에러]:', err);
         }
     }
@@ -1343,7 +1391,7 @@ bot.hears(/^(?:[\/!]?관리자\s+)((?:만남\s*)?보고서\s*미제출|미제출
                 `   • 만남일: ${mDate.format('YYYY-MM-DD')} (${delayBadge})\n\n`
             );
         });
-    } catch (err: any) {
+    } catch (err: unknown) {
         console.error('[미제출 명단 조회 에러]:', err);
     }
 });
@@ -1424,7 +1472,7 @@ bot.hears(
             }
 
             await ctx.reply(message, { parse_mode: 'HTML' });
-        } catch (err: any) {
+        } catch (err: unknown) {
             console.error('[미등록/미정 조회 에러]:', err);
         }
     }
@@ -1477,7 +1525,7 @@ bot.hears(/^(?:[\/!]?관리자\s+)(미갱신\s*명단|미갱신|일정\s*미갱�
                 `   • 지난 만남일: ${mDate.format('YYYY-MM-DD')} (${diffDays}일 경과)\n\n`
             );
         });
-    } catch (err: any) {
+    } catch (err: unknown) {
         console.error('[미갱신 명단 조회 에러]:', err);
     }
 });
@@ -1514,7 +1562,7 @@ bot.hears(/^(?:[\/!]?관리자\s+)(중단\s*명단|중단|만남중단)$/i, asyn
                 `   • Chat ID: <code>${chat.chat_id}</code>\n\n`
             );
         });
-    } catch (err: any) {
+    } catch (err: unknown) {
         console.error('[중단 명단 조회 에러]:', err);
     }
 });
@@ -1580,7 +1628,7 @@ bot.hears(/^(?:[\/!]?관리자\s+)(구분|단계|특수|진행구분)$/i, async 
         }
 
         await ctx.reply(msg, { parse_mode: 'HTML' });
-    } catch (err: any) {
+    } catch (err: unknown) {
         console.error('[관리자 구분 조회 에러]:', err);
     }
 });
@@ -1618,7 +1666,7 @@ bot.hears(/^(?:[\/!]?관리자\s+)(섭등예정|예정가능일|가능가능일)
             itemStr += `   • Chat ID: <code>${c.chat_id}</code>\n\n`;
             return itemStr;
         });
-    } catch (err: any) {
+    } catch (err: unknown) {
         console.error('[단계별 조회 에러]:', err);
     }
 });
@@ -1665,7 +1713,7 @@ bot.hears(/^(?:[\/!]?관리자\s+)(일반|일반방|미분류)$/i, async (ctx) =
                 `   • Chat ID: <code>${chat.chat_id}</code>\n\n`
             );
         });
-    } catch (err: any) {
+    } catch (err: unknown) {
         console.error('[일반방 조회 에러]:', err);
     }
 });
@@ -1739,7 +1787,7 @@ bot.hears(/^(?:[\/!]?관리자\s+)(점검|현황|종합\s*점검|전체\s*점검
         msg += `• ⌛ <b>만남일 경과 미갱신</b>: ${expired.length}개 방 (조회: <code>관리자 미갱신</code>)\n`;
 
         await ctx.reply(msg, { parse_mode: 'HTML' });
-    } catch (err: any) {
+    } catch (err: unknown) {
         console.error('[종합 점검 에러]:', err);
     }
 });
@@ -1749,6 +1797,8 @@ bot.on('text', async (ctx) => {
     const text = ctx.message.text.trim();
     const chatId = ctx.chat.id;
     const roomTitle = 'title' in ctx.chat ? ctx.chat.title : ctx.chat.first_name || '대화방';
+
+    try {
 
     await ensureChatRecord(chatId, roomTitle);
 
@@ -1865,9 +1915,9 @@ bot.on('text', async (ctx) => {
 
             await ctx.reply(resMsg, { parse_mode: 'HTML' });
             return;
-        } catch (err: any) {
+        } catch (err: unknown) {
             console.error('[사전 보고서 처리 에러]:', err);
-            await ctx.reply(`⚠️ 사전 보고서 처리 중 오류가 발생했습니다: ${err.message}`);
+            await ctx.reply(`⚠️ 사전 보고서 처리 중 오류가 발생했습니다: ${getErrorMessage(err)}`);
             return;
         }
     }
@@ -2000,12 +2050,25 @@ bot.on('text', async (ctx) => {
         await updateChat(chatId, { feedback_submitted: 1 });
         await ctx.reply('📝 <b>피드백 내용이 확인되었습니다.</b> 감사합니다.', { parse_mode: 'HTML' });
     }
+    } catch (err: unknown) {
+        console.error('[텍스트 메시지 처리 에러]:', getErrorMessage(err));
+        await ctx.reply(`⚠️ 메시지 처리 중 오류가 발생했습니다: ${getErrorMessage(err)}`);
+    }
 });
 
 /* =====================================================
  * ⏰ 스케줄러 트리거 함수들
  * ===================================================== */
+let isMorningReminderRunning = false;
+
 async function triggerMorningReminder() {
+    if (isMorningReminderRunning) {
+        console.warn('[오전 알림] 이전 실행이 아직 진행 중이라 중복 호출을 건너뜁니다.');
+        return;
+    }
+    isMorningReminderRunning = true;
+
+    try {
     const today = dayjs().tz('Asia/Seoul').startOf('day');
     const chats = await getAllChats();
 
@@ -2040,8 +2103,8 @@ async function triggerMorningReminder() {
                     );
                 }
                 await updateChat(chat.chat_id, { d_minus_1_notified: 1 });
-            } catch (err: any) {
-                console.error(`[오전 알림 실패] Chat: ${chat.chat_id}`, err.message);
+            } catch (err: unknown) {
+                console.error(`[오전 알림 실패] Chat: ${chat.chat_id}`, getErrorMessage(err));
             }
         }
 
@@ -2059,8 +2122,8 @@ async function triggerMorningReminder() {
                     { parse_mode: 'HTML' }
                 );
                 await updateChat(chat.chat_id, { overdue_1_notified: 1 });
-            } catch (err: any) {
-                console.error(`[D+1 지연 알림 실패] Chat: ${chat.chat_id}`, err.message);
+            } catch (err: unknown) {
+                console.error(`[D+1 지연 알림 실패] Chat: ${chat.chat_id}`, getErrorMessage(err));
             }
         }
 
@@ -2075,14 +2138,26 @@ async function triggerMorningReminder() {
                     { parse_mode: 'HTML' }
                 );
                 await updateChat(chat.chat_id, { overdue_2_notified: 1 });
-            } catch (err: any) {
-                console.error(`[D+2 경고 알림 실패] Chat: ${chat.chat_id}`, err.message);
+            } catch (err: unknown) {
+                console.error(`[D+2 경고 알림 실패] Chat: ${chat.chat_id}`, getErrorMessage(err));
             }
         }
     }
+    } finally {
+        isMorningReminderRunning = false;
+    }
 }
 
+let isNightReminderRunning = false;
+
 async function triggerNightReminder() {
+    if (isNightReminderRunning) {
+        console.warn('[야간 알림] 이전 실행이 아직 진행 중이라 중복 호출을 건너뜁니다.');
+        return;
+    }
+    isNightReminderRunning = true;
+
+    try {
     const today = dayjs().tz('Asia/Seoul').startOf('day');
     const chats = await getAllChats();
 
@@ -2114,10 +2189,13 @@ async function triggerNightReminder() {
                     );
                 }
                 await updateChat(chat.chat_id, { d_day_22_notified: 1 });
-            } catch (err: any) {
-                console.error(`[22시 알림 실패] Chat: ${chat.chat_id}`, err.message);
+            } catch (err: unknown) {
+                console.error(`[22시 알림 실패] Chat: ${chat.chat_id}`, getErrorMessage(err));
             }
         }
+    }
+    } finally {
+        isNightReminderRunning = false;
     }
 }
 
@@ -2159,7 +2237,7 @@ server.listen(PORT, async () => {
     try {
         await bot.telegram.setWebhook(webhookUrl);
         console.log(`Telegram Webhook 등록 완료: ${webhookUrl}`);
-    } catch (e: any) {
-        console.error('Webhook 등록 에러:', e.message);
+    } catch (e: unknown) {
+        console.error('Webhook 등록 에러:', getErrorMessage(e));
     }
 });

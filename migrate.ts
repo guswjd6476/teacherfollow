@@ -23,9 +23,9 @@ interface ChatRecord {
     updated_at?: string;
 }
 
-const dbUrl = process.env.DATABASE_URL || process.env.DATABASE_URL;
+const dbUrl = process.env.NEON_DATABASE_URL || process.env.DATABASE_URL;
 if (!dbUrl) {
-    console.error('❌ 환경 변수에 DATABASE_URL이 설정되어 있지 않습니다.');
+    console.error('❌ 환경 변수에 NEON_DATABASE_URL 또는 DATABASE_URL이 설정되어 있지 않습니다.');
     process.exit(1);
 }
 
@@ -47,8 +47,8 @@ async function runMigration() {
 
     try {
         chatMap = JSON.parse(rawData);
-    } catch (e: any) {
-        console.error('❌ JSON 파싱 에러:', e.message);
+    } catch (e: unknown) {
+        console.error('❌ JSON 파싱 에러:', e instanceof Error ? e.message : String(e));
         process.exit(1);
     }
 
@@ -144,7 +144,7 @@ async function runMigration() {
 
         await client.query('COMMIT');
         console.log(`🎉 성공: 총 ${migratedCount}개의 대화방 데이터가 Neon DB로 안전하게 이관되었습니다.`);
-    } catch (err: any) {
+    } catch (err: unknown) {
         await client.query('ROLLBACK');
         console.error('❌ 마이그레이션 실패 (롤백 처리됨):', err);
     } finally {
