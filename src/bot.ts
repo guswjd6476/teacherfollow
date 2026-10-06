@@ -329,6 +329,39 @@ function extractNextMeetingRaw(text: string): string | null {
     return match && match[1] ? match[1].trim() : null;
 }
 
+// students."단계" 진행 순서 (첫 글자 기준: 발 → 찾 → 합 → 섭)
+const STUDENT_STAGE_ORDER = ['발', '찾', '합', '섭'] as const;
+
+function getStudentStageRank(stage: unknown): number {
+    const first = String(stage ?? '').trim().charAt(0);
+    return STUDENT_STAGE_ORDER.indexOf(first as (typeof STUDENT_STAGE_ORDER)[number]);
+}
+
+// 단계별 등록일 조회 (예: '찾' → 찾_등록일 / 찾등록일 / 찾*등록* / 찾*일 순으로 탐색)
+function getStageRegDate(row: Record<string, any>, prefix: string): string | null {
+    const keys = Object.keys(row).filter((k) => k.startsWith(prefix));
+    const ordered = [
+        ...[`${prefix}_등록일`, `${prefix}등록일`].filter((k) => keys.includes(k)),
+        ...keys.filter((k) => k.includes('등록')),
+        ...keys.filter((k) => k.endsWith('일')),
+    ];
+    for (const key of ordered) {
+        const formatted = formatDateDisplay(row[key]);
+        if (formatted !== '-') return formatted;
+    }
+    return null;
+}
+
+// students.target 값을 'n월'로 표시 (숫자 / 날짜 / 'n월' 문자 모두 지원)
+function formatTargetMonth(raw: unknown): string {
+    if (raw === undefined || raw === null || String(raw).trim() === '') return '미설정';
+    if (raw instanceof Date) return `${raw.getMonth() + 1}월`;
+    const str = String(raw).trim();
+    if (/^\d{1,2}\s*월?$/.test(str)) return `${parseInt(str, 10)}월`;
+    const d = dayjs(str);
+    return d.isValid() ? `${d.month() + 1}월` : escapeHtml(str);
+}
+
 async function sendChunkedList<T>(
     ctx: any,
     header: string,
@@ -416,7 +449,8 @@ bot.hears(/^[\/!](start|help|도움말)(?:@\w+)?$/i, async (ctx) => {
             '<b>1. 기본 설정 및 등록</b>\n' +
             '• <b>대상자 최초 등록</b>: <code>/최초등록 섭외자/지역/팀/인도자</code>\n' +
             '• <b>현재 방 상태 확인</b>: <code>/상태확인</code>\n' +
-            '• <b>행정 등록 확인</b>: <code>/행정확인</code>\n\n' +
+            '• <b>행정 등록 확인</b>: <code>/행정확인</code>\n' +
+            '• <b>목표월 수정</b>: <code>/목표월수정 n월</code>\n\n' +
             '<b>2. 인터뷰 만남 단계</b>\n' +
             '• <b>사전 보고서 등록</b>: 채팅방에 <code>[인터뷰 사전 보고서]</code> 양식 전송\n' +
             '• <b>사전 보고서 양식</b>: <code>/인터뷰사전양식</code>\n' +
@@ -441,6 +475,7 @@ bot.hears(/^[\/!](start|help|도움말)(?:@\w+)?$/i, async (ctx) => {
             '• <b>보고서 미제출 명단</b>: <code>관리자 미제출</code>\n' +
             '• <b>미등록 및 미정 방 조회</b>: <code>관리자 미등록</code>\n' +
             '• <b>만남일 경과 미갱신 방</b>: <code>관리자 미갱신</code>\n' +
+            '• <b>합등 이상 봇 미초대 명단</b>: <code>관리자 미초대</code>\n' +
             '• <b>만남 중단 방 목록</b>: <code>관리자 중단</code>\n' +
             '• <b>특수 구분 현황 (3가지 종합)</b>: <code>관리자 구분</code>\n' +
             '• <b>구분별 단독 조회</b>: <code>관리자 섭등예정</code>, <code>관리자 예정가능일</code>, <code>관리자 가능가능일</code>\n' +
@@ -824,71 +859,114 @@ bot.hears(/^[\/!]행정확인(?:@\w+)?$/i, async (ctx) => {
             ? `${escapeHtml(s.guide_name)} (${escapeHtml(s.guide_region || '')} ${escapeHtml(s.guide_district || '')})`
             : '미등록';
 
-        const getFieldVal = (candidates: string[]): string | null => {
-            for (const key of candidates) {
-                if (s[key] !== undefined && s[key] !== null) {
-                    const formatted = formatDateDisplay(s[key]);
-                    if (formatted !== '-') {
-                        return formatted;
-                    }
-                }
-            }
-            return null;
-        };
-
-        const balComplete = getFieldVal(['발_완료일', '발완료일', '발완료']);
-        const balReg = getFieldVal(['발_등록일', '발등록일']);
-        const bokComplete = getFieldVal(['복_완료일', '복완료일', '복완료']);
-        const bokReg = getFieldVal(['복_등록일', '복등록일']);
-        const subComplete = getFieldVal(['섭_완료일', '섭완료일', '섭완료']);
-        const subReg = getFieldVal(['섭_등록일', '섭등록일']);
-        const regDate = getFieldVal(['등록일', '생성일']);
+        // 단계별 표시 대상: 발 → 발 / 찾 → 발,찾 / 합·섭 → 발,찾,합
+        const rank = getStudentStageRank(s['단계']);
+        const targetPrefixes: string[] =
+            rank < 0 ? [] : STUDENT_STAGE_ORDER.slice(0, Math.min(rank, 2) + 1);
 
         let msg = `📑 <b>[${studentName}] 행정 등록 현황</b>\n`;
         msg += `━━━━━━━━━━━━━━━━━━\n`;
         msg += `• <b>담당 인도자</b>: ${guideInfo}\n`;
-        msg += `• <b>현재 단계</b>: <b>${stage}</b>\n\n`;
+        msg += `• <b>현재 단계</b>: <b>${stage}</b>\n`;
+        msg += `• <b>목표월</b>: ${formatTargetMonth(s.target)}\n\n`;
 
-        msg += `🗓 <b>[주요 행정 일자]</b>\n`;
-        let foundDateCount = 0;
+        msg += `🗓 <b>[단계별 등록일]</b>\n`;
 
-        if (balComplete) {
-            msg += `• <b>발_완료일</b>: <b>${escapeHtml(balComplete)}</b>\n`;
-            foundDateCount++;
-        }
-        if (balReg) {
-            msg += `• 발_등록일: <b>${escapeHtml(balReg)}</b>\n`;
-            foundDateCount++;
-        }
-        if (bokComplete) {
-            msg += `• <b>복_완료일</b>: <b>${escapeHtml(bokComplete)}</b>\n`;
-            foundDateCount++;
-        }
-        if (bokReg) {
-            msg += `• 복_등록일: <b>${escapeHtml(bokReg)}</b>\n`;
-            foundDateCount++;
-        }
-        if (subComplete) {
-            msg += `• <b>섭_완료일</b>: <b>${escapeHtml(subComplete)}</b>\n`;
-            foundDateCount++;
-        }
-        if (subReg) {
-            msg += `• 섭_등록일: <b>${escapeHtml(subReg)}</b>\n`;
-            foundDateCount++;
-        }
-        if (regDate) {
-            msg += `• 기본 등록일: <b>${escapeHtml(regDate)}</b>\n`;
-            foundDateCount++;
-        }
-
-        if (foundDateCount === 0) {
-            msg += `• 등록된 행정 완료/등록 일자 기록이 없습니다.\n`;
+        if (targetPrefixes.length > 0) {
+            for (const prefix of targetPrefixes) {
+                const regDate = getStageRegDate(s, prefix);
+                msg += `• ${prefix}_등록일: <b>${regDate ? escapeHtml(regDate) : '미등록'}</b>\n`;
+            }
+        } else {
+            // 단계를 알 수 없는 경우: 기록된 단계 등록일만 표시
+            let foundDateCount = 0;
+            for (const prefix of STUDENT_STAGE_ORDER) {
+                const regDate = getStageRegDate(s, prefix);
+                if (regDate) {
+                    msg += `• ${prefix}_등록일: <b>${escapeHtml(regDate)}</b>\n`;
+                    foundDateCount++;
+                }
+            }
+            if (foundDateCount === 0) {
+                msg += `• 등록된 행정 등록 일자 기록이 없습니다.\n`;
+            }
         }
 
         await ctx.reply(msg, { parse_mode: 'HTML' });
     } catch (err: unknown) {
         console.error('[/행정확인 에러]:', err);
         await ctx.reply(`⚠️ 행정 확인 중 오류 발생: ${getErrorMessage(err)}`);
+    }
+});
+
+// students.target 컬럼 타입 (숫자/날짜/문자에 따라 저장 형식이 다름)
+let studentTargetColumnType: string | null = null;
+async function getStudentTargetColumnType(): Promise<string> {
+    if (studentTargetColumnType) return studentTargetColumnType;
+    const res = await neonPool.query(
+        `SELECT data_type FROM information_schema.columns WHERE table_name = 'students' AND column_name = 'target' LIMIT 1;`
+    );
+    if (res.rows.length === 0) throw new Error('students 테이블에 target 컬럼이 없습니다.');
+    studentTargetColumnType = String(res.rows[0].data_type);
+    return studentTargetColumnType;
+}
+
+// 목표월 수정 (/목표월수정 n월)
+bot.hears(/^[\/!]목표월수정(?:@\w+)?(?:\s+(.+))?$/i, async (ctx) => {
+    const rawInput = ctx.match[1]?.trim() || '';
+    const monthMatch = rawInput.match(/^(\d{1,2})\s*월?$/);
+    const month = monthMatch ? Number(monthMatch[1]) : NaN;
+
+    if (!(month >= 1 && month <= 12)) {
+        await ctx.reply(
+            '⚠️ <b>입력 양식이 올바르지 않습니다.</b>\n\n' +
+                '• <b>입력 양식</b>: <code>/목표월수정 n월</code> (1~12)\n' +
+                '• <b>입력 예시</b>: <code>/목표월수정 11월</code>',
+            { parse_mode: 'HTML' }
+        );
+        return;
+    }
+
+    try {
+        const chat = await getChatRecord(ctx.chat.id);
+        if (!chat || !chat.matched_member_id) {
+            await ctx.reply(
+                '⚠️ <b>매칭된 대상자가 없습니다.</b>\n\n먼저 <code>/최초등록 섭외자/지역/팀/인도자</code>로 등록해주세요.',
+                { parse_mode: 'HTML' }
+            );
+            return;
+        }
+
+        const columnType = await getStudentTargetColumnType();
+        let value: string | number;
+        if (/int|numeric|real|double/.test(columnType)) {
+            value = month;
+        } else if (/date|timestamp/.test(columnType)) {
+            // 이번 달보다 이전 월이면 내년으로 간주
+            const now = dayjs().tz('Asia/Seoul');
+            const year = month < now.month() + 1 ? now.year() + 1 : now.year();
+            value = `${year}-${String(month).padStart(2, '0')}-01`;
+        } else {
+            value = `${month}월`;
+        }
+
+        const res = await neonPool.query(
+            `UPDATE students SET target = $1 WHERE id::text = $2::text RETURNING "이름";`,
+            [value, chat.matched_member_id]
+        );
+
+        if (res.rows.length === 0) {
+            await ctx.reply('❌ <b>DB에서 대상자 정보를 찾을 수 없습니다.</b>', { parse_mode: 'HTML' });
+            return;
+        }
+
+        await ctx.reply(
+            `✅ <b>[${escapeHtml(res.rows[0]['이름'] || '대상자')}] 목표월이 ${month}월로 수정되었습니다.</b>`,
+            { parse_mode: 'HTML' }
+        );
+    } catch (err: unknown) {
+        console.error('[/목표월수정 에러]:', err);
+        await ctx.reply(`⚠️ 목표월 수정 중 오류 발생: ${getErrorMessage(err)}`);
     }
 });
 
@@ -1259,7 +1337,7 @@ bot.hears(/^(?:[\/!]?관리자\s+)(교사|교사만남|교사목록|교사건)$/
 
 // 날짜별 만남 조회 (관리자 오늘만남, 관리자 내일만남, 관리자 일자만남 MM-DD)
 bot.hears(
-    /^(?:[\/!]?관리자(?:\s+(?!(?:미제출|미등록|미정|미갱신|최초미등록|점검|현황|중단|구분|단계|특수|섭등예정|예정가능일|가능가능일|일반|일반방|미분류|인터뷰|인터뷰예정|인터뷰목록|인터뷰건|교사|교사만남|교사목록|교사건))(.+))?|[\/!](?:만남명단|만남일정)(?:@\w+)?(?:\s+(.+))?)$/i,
+    /^(?:[\/!]?관리자(?:\s+(?!(?:미초대|봇미초대|초대누락|미제출|미등록|미정|미갱신|최초미등록|점검|현황|중단|구분|단계|특수|섭등예정|예정가능일|가능가능일|일반|일반방|미분류|인터뷰|인터뷰예정|인터뷰목록|인터뷰건|교사|교사만남|교사목록|교사건))(.+))?|[\/!](?:만남명단|만남일정)(?:@\w+)?(?:\s+(.+))?)$/i,
     async (ctx) => {
         try {
             const userId = String(ctx.from?.id);
@@ -1527,6 +1605,59 @@ bot.hears(/^(?:[\/!]?관리자\s+)(미갱신\s*명단|미갱신|일정\s*미갱�
         });
     } catch (err: unknown) {
         console.error('[미갱신 명단 조회 에러]:', err);
+    }
+});
+
+// 합등 이상인데 봇이 초대(매칭)된 방이 없는 대상자 (관리자 미초대)
+bot.hears(/^(?:[\/!]?관리자\s+)(미초대|봇미초대|초대누락)$/i, async (ctx) => {
+    try {
+        const userId = String(ctx.from?.id);
+        if (!isAdmin(userId)) {
+            await ctx.reply('⛔ 접근 권한이 없습니다.', { parse_mode: 'HTML' });
+            return;
+        }
+
+        const res = await neonPool.query(`
+            SELECT
+                s.*,
+                m."이름" AS guide_name,
+                m."지역" AS guide_region,
+                m."구역" AS guide_district
+            FROM students s
+            LEFT JOIN members m ON s."인도자_고유번호" = m."고유번호"
+            WHERE LEFT(TRIM(COALESCE(s."단계"::text, '')), 1) IN ('합', '섭')
+              AND NOT EXISTS (
+                  SELECT 1 FROM counseling_chats c
+                  WHERE c.matched_member_id::text = s.id::text
+              )
+            ORDER BY m."지역", m."구역", m."이름", s."이름";
+        `);
+
+        if (res.rows.length === 0) {
+            await ctx.reply('✨ <b>합등 이상 대상자 중 봇이 초대되지 않은 건이 없습니다.</b>', { parse_mode: 'HTML' });
+            return;
+        }
+
+        const header =
+            `📭 <b>[합등 이상 · 봇 미초대 명단] (총 ${res.rows.length}건)</b>\n` +
+            `기준시각: ${dayjs().tz('Asia/Seoul').format('YYYY-MM-DD HH:mm')}\n` +
+            `<i>(봇이 있어도 /최초등록 매칭이 안 된 방은 미초대로 집계됩니다)</i>\n` +
+            `━━━━━━━━━━━━━━━━━━\n\n`;
+
+        await sendChunkedList(ctx, header, res.rows, (s: Record<string, any>, idx) => {
+            const guideInfo = s.guide_name
+                ? `${escapeHtml(s.guide_name)} (${escapeHtml(s.guide_region || '')} ${escapeHtml(s.guide_district || '')})`
+                : '미등록';
+            const hapDate = getStageRegDate(s, '합');
+            return (
+                `<b>${idx}. ${escapeHtml(s['이름'] || '이름 없음')}</b> [${escapeHtml(s['단계'] || '-')}]\n` +
+                `   • 인도자: ${guideInfo}\n` +
+                `   • 합_등록일: ${hapDate ? escapeHtml(hapDate) : '미등록'}\n\n`
+            );
+        });
+    } catch (err: unknown) {
+        console.error('[미초대 명단 조회 에러]:', err);
+        await ctx.reply(`⚠️ 미초대 명단 조회 중 오류 발생: ${getErrorMessage(err)}`);
     }
 });
 
