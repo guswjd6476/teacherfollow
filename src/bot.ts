@@ -85,7 +85,7 @@ function escapeHtml(text?: string | number | null): string {
 // 만남 중단 / 인터뷰 후속 미신청 사유 분류 (버튼 선택 → counseling_chats.stop_category 저장)
 const STOP_CATEGORIES = [
     { code: 'contact', label: '연락두절' },
-    { code: 'family', label: '가족·주변 반대' },
+    { code: 'chim', label: '침맞음' },
     { code: 'refuse', label: '관심부족·거부' },
     { code: 'study', label: '학업·시험' },
     { code: 'busy', label: '직장·바쁨' },
