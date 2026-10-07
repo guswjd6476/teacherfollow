@@ -53,7 +53,8 @@ async function initDb() {
             ADD COLUMN IF NOT EXISTS interview_date VARCHAR(30),
             ADD COLUMN IF NOT EXISTS follow_up_applied VARCHAR(20),
             ADD COLUMN IF NOT EXISTS follow_up_reason TEXT,
-            ADD COLUMN IF NOT EXISTS interview_report_submitted INTEGER DEFAULT 0;
+            ADD COLUMN IF NOT EXISTS interview_report_submitted INTEGER DEFAULT 0,
+            ADD COLUMN IF NOT EXISTS stop_category VARCHAR(30);
         `);
         console.log('✅ [DB 점검] counseling_chats 테이블 신규 컬럼 점검 완료');
     } catch (err: unknown) {
@@ -81,6 +82,32 @@ function escapeHtml(text?: string | number | null): string {
     return String(text).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 }
 
+// 만남 중단 / 인터뷰 후속 미신청 사유 분류 (버튼 선택 → counseling_chats.stop_category 저장)
+const STOP_CATEGORIES = [
+    { code: 'contact', label: '연락두절' },
+    { code: 'family', label: '가족·주변 반대' },
+    { code: 'refuse', label: '관심부족·거부' },
+    { code: 'study', label: '학업·시험' },
+    { code: 'busy', label: '직장·바쁨' },
+    { code: 'health', label: '건강' },
+    { code: 'move', label: '이사·거리' },
+    { code: 'personal', label: '개인사정' },
+    { code: 'etc', label: '기타' },
+] as const;
+
+function getStopCategoryLabel(code: string): string | null {
+    return STOP_CATEGORIES.find((c) => c.code === code)?.label ?? null;
+}
+
+// prefix: 'stop' (만남 중단) / 'fu' (인터뷰 후속 미신청)
+function buildStopCategoryKeyboard(prefix: 'stop' | 'fu') {
+    const buttons = STOP_CATEGORIES.map((c) => ({ text: c.label, callback_data: `${prefix}:${c.code}` }));
+    const rows: { text: string; callback_data: string }[][] = [];
+    for (let i = 0; i < buttons.length; i += 3) rows.push(buttons.slice(i, i + 3));
+    if (prefix === 'stop') rows.push([{ text: '❌ 취소', callback_data: 'stop:cancel' }]);
+    return { inline_keyboard: rows };
+}
+
 // 날짜를 'M/D' (예: 10/2) 형태로 포맷팅
 function formatDateDisplay(raw: any): string {
     if (!raw) return '-';
@@ -102,6 +129,7 @@ interface ChatRecord {
     room_title: string;
     matched_member_id?: number | null;
     matched_student_name?: string | null;
+    student_target?: unknown;
     guide_name?: string | null;
     guide_region?: string | null;
     guide_district?: string | null;
@@ -118,6 +146,7 @@ interface ChatRecord {
     interview_report_submitted?: number;
     meeting_date: string;
     stop_reason?: string;
+    stop_category?: string | null;
     progress_stage?: '섭등예정' | '예정가능일' | '가능가능일' | '';
     progress_note?: string;
     feedback_submitted: number;
@@ -178,6 +207,7 @@ async function getAllChats(): Promise<ChatRecord[]> {
         SELECT 
             c.*,
             s."이름" AS matched_student_name,
+            s.target AS student_target,
             m."이름" AS guide_name,
             m."지역" AS guide_region,
             m."구역" AS guide_district
@@ -259,7 +289,7 @@ async function upsertMeetingDate(chatId: string | number, title: string, meeting
 // 방 정보 동적 업데이트
 async function updateChat(chatId: string | number, patch: Partial<ChatRecord>) {
     const id = String(chatId);
-    const ignoredKeys = ['chat_id', 'matched_student_name', 'guide_name', 'guide_region', 'guide_district'];
+    const ignoredKeys = ['chat_id', 'matched_student_name', 'student_target', 'guide_name', 'guide_region', 'guide_district'];
     const keys = Object.keys(patch).filter((k) => !ignoredKeys.includes(k));
     if (keys.length === 0) return;
 
@@ -355,11 +385,32 @@ function getStageRegDate(row: Record<string, any>, prefix: string): string | nul
 // students.target 값을 'n월'로 표시 (숫자 / 날짜 / 'n월' 문자 모두 지원)
 function formatTargetMonth(raw: unknown): string {
     if (raw === undefined || raw === null || String(raw).trim() === '') return '미설정';
-    if (raw instanceof Date) return `${raw.getMonth() + 1}월`;
+    const month = getTargetMonthNumber(raw);
+    return month ? `${month}월` : escapeHtml(String(raw).trim());
+}
+
+// students.target 값에서 월(1~12) 추출, 판별 불가 시 null
+function getTargetMonthNumber(raw: unknown): number | null {
+    if (raw === undefined || raw === null) return null;
+    if (raw instanceof Date) return raw.getMonth() + 1;
     const str = String(raw).trim();
-    if (/^\d{1,2}\s*월?$/.test(str)) return `${parseInt(str, 10)}월`;
+    if (!str) return null;
+    if (/^\d{1,2}\s*월?$/.test(str)) {
+        const n = parseInt(str, 10);
+        return n >= 1 && n <= 12 ? n : null;
+    }
     const d = dayjs(str);
-    return d.isValid() ? `${d.month() + 1}월` : escapeHtml(str);
+    return d.isValid() ? d.month() + 1 : null;
+}
+
+// '관리자 n월 ...' 입력의 월 필터 (월 미입력 시 전체)
+function filterByTargetMonth<T extends { student_target?: unknown }>(chats: T[], month: number | null): T[] {
+    return month ? chats.filter((c) => getTargetMonthNumber(c.student_target) === month) : chats;
+}
+
+function parseMonthArg(raw?: string): number | null {
+    const n = raw ? parseInt(raw, 10) : NaN;
+    return n >= 1 && n <= 12 ? n : null;
 }
 
 async function sendChunkedList<T>(
@@ -462,7 +513,7 @@ bot.hears(/^[\/!](start|help|도움말)(?:@\w+)?$/i, async (ctx) => {
             '   <i>(결과 보고서에서 [신청] 시 교사 만남으로 자동 전환)</i>\n\n' +
             '<b>3. 교사 만남 및 일정 관리</b>\n' +
             '• <b>만남일 설정</b>: <code>/만남일 MM-DD</code> 또는 <code>/만남일 미정</code>\n' +
-            '• <b>만남 중단 처리</b>: <code>/만남중단 [사유]</code>\n' +
+            '• <b>만남 중단 처리</b>: <code>/만남중단 [상세 사유]</code> → 사유 버튼 선택\n' +
             '• <b>피드백 제출</b>: 메시지 내 <code>#피드백</code> 태그 포함\n' +
             '• <b>만남 보고서 제출</b>: 양식 내 <code>다음만남일: MM-DD</code> 포함\n\n' +
             '<b>4. 방 진행 단계 (특수 구분)</b>\n' +
@@ -478,8 +529,9 @@ bot.hears(/^[\/!](start|help|도움말)(?:@\w+)?$/i, async (ctx) => {
             '• <b>합등 이상 봇 미초대 명단</b>: <code>관리자 미초대</code>\n' +
             '• <b>만남 중단 방 목록</b>: <code>관리자 중단</code>\n' +
             '• <b>특수 구분 현황 (3가지 종합)</b>: <code>관리자 구분</code>\n' +
-            '• <b>구분별 단독 조회</b>: <code>관리자 섭등예정</code>, <code>관리자 예정가능일</code>, <code>관리자 가능가능일</code>\n' +
-            '• <b>일반방 조회 (특수 3종 및 중단 제외)</b>: <code>관리자 일반</code>\n' +
+            '• <b>구분별 단독 조회</b>: <code>관리자 n월 섭등예정</code>, <code>관리자 n월 예정가능일</code>, <code>관리자 n월 가능가능일</code>\n' +
+            '• <b>일반방 조회 (특수 3종 및 중단 제외)</b>: <code>관리자 n월 일반</code>\n' +
+            '   <i>(n월 = 대상자 목표월, 생략 시 전체)</i>\n' +
             '• <b>전체 종합 관리 현황</b>: <code>관리자 점검</code>',
         { parse_mode: 'HTML' }
     );
@@ -812,6 +864,7 @@ bot.hears(/^[\/!]매칭해제(?:@\w+)?$/i, async (ctx) => {
             interview_date: null,
             follow_up_applied: null,
             follow_up_reason: null,
+            stop_category: null,
             interview_report_submitted: 0,
         });
         await ctx.reply('✅ 대상자 매칭 및 인터뷰 설정이 모두 초기화되었습니다.');
@@ -1079,25 +1132,55 @@ bot.hears(/^[\/!]상태확인(?:@\w+)?$/i, async (ctx) => {
     }
 });
 
-// 만남 중단 설정 (/만남중단 [사유])
-bot.hears(/^[\/!]만남중단(?:@\w+)?(?:\s+(.+))?$/i, async (ctx) => {
-    const reason = ctx.match[1]?.trim();
-    if (!reason) {
-        await ctx.reply(
-            '⚠️ <b>중단 사유를 함께 입력해주세요.</b>\n' +
-                '예: <code>/만남중단 개인 사정으로 잠정 보류</code>\n' +
-                '예: <code>/만남중단 대상자 시험 기간으로 인한 일시 중단</code>',
-            { parse_mode: 'HTML' }
-        );
-        return;
-    }
+// 만남 중단 설정 (/만남중단 [상세 사유]) → 사유 분류 버튼 선택 시 중단 처리
+const STOP_DETAIL_LABEL = '상세 사유: ';
 
+bot.hears(/^[\/!]만남중단(?:@\w+)?(?:\s+(.+))?$/i, async (ctx) => {
+    const detail = ctx.match[1]?.trim() || '';
     const title = 'title' in ctx.chat ? ctx.chat.title : ctx.chat.first_name || '대화방';
     try {
         await ensureChatRecord(ctx.chat.id, title);
+        await ctx.reply(
+            `🛑 <b>만남 중단 사유를 선택해주세요.</b>\n` +
+                (detail ? `• ${STOP_DETAIL_LABEL}${escapeHtml(detail)}\n` : '') +
+                `\n<i>버튼을 누르면 중단 처리됩니다. 상세 사유는 <code>/만남중단 상세내용</code>으로 함께 남길 수 있습니다.</i>`,
+            { parse_mode: 'HTML', reply_markup: buildStopCategoryKeyboard('stop') }
+        );
+    } catch (err: unknown) {
+        console.error('[/만남중단 에러]:', getErrorMessage(err));
+        await ctx.reply(`⚠️ 만남 중단 처리 중 오류 발생: ${getErrorMessage(err)}`);
+    }
+});
+
+// 버튼 콜백: 만남 중단 사유 선택
+bot.action(/^stop:(\w+)$/, async (ctx) => {
+    try {
+        const code = ctx.match[1];
+        if (code === 'cancel') {
+            await ctx.answerCbQuery('취소되었습니다.');
+            await ctx.editMessageText('↩️ 만남 중단이 취소되었습니다.');
+            return;
+        }
+
+        const label = getStopCategoryLabel(code);
+        if (!label || !ctx.chat) {
+            await ctx.answerCbQuery('알 수 없는 선택입니다.');
+            return;
+        }
+
+        // 상세 사유는 안내 메시지 본문에서 복원 (서버 재시작에도 안전)
+        const msg = ctx.callbackQuery.message;
+        const msgText = msg && 'text' in msg ? msg.text : '';
+        const detailLine = msgText.split('\n').find((l) => l.includes(STOP_DETAIL_LABEL));
+        const detail = detailLine
+            ? detailLine.slice(detailLine.indexOf(STOP_DETAIL_LABEL) + STOP_DETAIL_LABEL.length).trim()
+            : '';
+        const reason = detail ? `${label} - ${detail}` : label;
+
         await updateChat(ctx.chat.id, {
             meeting_date: '중단',
             stop_reason: reason,
+            stop_category: label,
             feedback_submitted: 0,
             report_submitted: 0,
             d_minus_1_notified: 0,
@@ -1106,15 +1189,49 @@ bot.hears(/^[\/!]만남중단(?:@\w+)?(?:\s+(.+))?$/i, async (ctx) => {
             overdue_2_notified: 0,
         });
 
-        await ctx.reply(
+        await ctx.answerCbQuery(`${label}(으)로 중단 처리되었습니다.`);
+        await ctx.editMessageText(
             `🛑 <b>만남 일정이 [중단] 처리되었습니다.</b>\n\n` +
-                `• <b>중단 사유</b>: ${escapeHtml(reason)}\n\n` +
-                `💡 만남이 재개되면 <code>/만남일 MM-DD</code>를 입력하여 새 일정을 등록해주세요.`,
+                `• <b>중단 사유</b>: <b>${escapeHtml(label)}</b>\n` +
+                (detail ? `• <b>상세 사유</b>: ${escapeHtml(detail)}\n` : '') +
+                `\n💡 만남이 재개되면 <code>/만남일 MM-DD</code>를 입력하여 새 일정을 등록해주세요.`,
             { parse_mode: 'HTML' }
         );
     } catch (err: unknown) {
-        console.error('[/만남중단 에러]:', getErrorMessage(err));
-        await ctx.reply(`⚠️ 만남 중단 처리 중 오류 발생: ${getErrorMessage(err)}`);
+        console.error('[만남 중단 사유 선택 에러]:', getErrorMessage(err));
+        await ctx.answerCbQuery('처리 중 오류가 발생했습니다.').catch(() => {});
+    }
+});
+
+// 버튼 콜백: 인터뷰 후속 미신청 사유 선택 (미신청 처리는 보고서 접수 시 이미 완료됨)
+bot.action(/^fu:(\w+)$/, async (ctx) => {
+    try {
+        const label = getStopCategoryLabel(ctx.match[1]);
+        if (!label || !ctx.chat) {
+            await ctx.answerCbQuery('알 수 없는 선택입니다.');
+            return;
+        }
+
+        const record = await getChatRecord(ctx.chat.id);
+        const detail = record?.follow_up_reason && record.follow_up_reason !== '사유 미입력' ? record.follow_up_reason : '';
+
+        await updateChat(ctx.chat.id, {
+            stop_category: label,
+            stop_reason: `인터뷰 후속 미신청: ${detail ? `${label} - ${detail}` : label}`,
+        });
+
+        await ctx.answerCbQuery(`${label}(으)로 저장되었습니다.`);
+        await ctx.editMessageText(
+            `🛑 <b>인터뷰 결과 보고서가 반영되었습니다.</b>\n\n` +
+                `• <b>후속 신청</b>: <b>미신청</b>\n` +
+                `• <b>미신청 사유</b>: <b>${escapeHtml(label)}</b>\n` +
+                (detail ? `• <b>상세 사유</b>: ${escapeHtml(detail)}\n` : '') +
+                `• <b>대화방 상태</b>: 만남 중단 처리됨`,
+            { parse_mode: 'HTML' }
+        );
+    } catch (err: unknown) {
+        console.error('[미신청 사유 선택 에러]:', getErrorMessage(err));
+        await ctx.answerCbQuery('처리 중 오류가 발생했습니다.').catch(() => {});
     }
 });
 
@@ -1337,7 +1454,7 @@ bot.hears(/^(?:[\/!]?관리자\s+)(교사|교사만남|교사목록|교사건)$/
 
 // 날짜별 만남 조회 (관리자 오늘만남, 관리자 내일만남, 관리자 일자만남 MM-DD)
 bot.hears(
-    /^(?:[\/!]?관리자(?:\s+(?!(?:미초대|봇미초대|초대누락|미제출|미등록|미정|미갱신|최초미등록|점검|현황|중단|구분|단계|특수|섭등예정|예정가능일|가능가능일|일반|일반방|미분류|인터뷰|인터뷰예정|인터뷰목록|인터뷰건|교사|교사만남|교사목록|교사건))(.+))?|[\/!](?:만남명단|만남일정)(?:@\w+)?(?:\s+(.+))?)$/i,
+    /^(?:[\/!]?관리자(?:\s+(?!\d{1,2}\s*월\s*(?:섭등예정|예정가능일|가능가능일|일반|일반방|미분류)$)(?!(?:미초대|봇미초대|초대누락|미제출|미등록|미정|미갱신|최초미등록|점검|현황|중단|구분|단계|특수|섭등예정|예정가능일|가능가능일|일반|일반방|미분류|인터뷰|인터뷰예정|인터뷰목록|인터뷰건|교사|교사만남|교사목록|교사건))(.+))?|[\/!](?:만남명단|만남일정)(?:@\w+)?(?:\s+(.+))?)$/i,
     async (ctx) => {
         try {
             const userId = String(ctx.from?.id);
@@ -1765,7 +1882,7 @@ bot.hears(/^(?:[\/!]?관리자\s+)(구분|단계|특수|진행구분)$/i, async 
 });
 
 // 구분별 단독 조회 (관리자 섭등예정, 관리자 예정가능일, 관리자 가능가능일)
-bot.hears(/^(?:[\/!]?관리자\s+)(섭등예정|예정가능일|가능가능일)$/i, async (ctx) => {
+bot.hears(/^(?:[\/!]?관리자\s+)(?:(\d{1,2})\s*월\s*)?(섭등예정|예정가능일|가능가능일)$/i, async (ctx) => {
     try {
         const userId = String(ctx.from?.id);
         if (!isAdmin(userId)) {
@@ -1773,26 +1890,33 @@ bot.hears(/^(?:[\/!]?관리자\s+)(섭등예정|예정가능일|가능가능일)
             return;
         }
 
-        const targetStage = ctx.match[1] as '섭등예정' | '예정가능일' | '가능가능일';
+        const month = parseMonthArg(ctx.match[1]);
+        const targetStage = ctx.match[2] as '섭등예정' | '예정가능일' | '가능가능일';
+        const monthLabel = month ? `${month}월 목표 ` : '';
         const allChats = await getAllChats();
-        const targets = allChats.filter((c) => c.progress_stage === targetStage);
+        const targets = filterByTargetMonth(
+            allChats.filter((c) => c.progress_stage === targetStage),
+            month
+        );
 
         if (targets.length === 0) {
-            await ctx.reply(`✨ <b>현재 [${targetStage}] 상태인 대화방이 없습니다.</b>`, {
+            await ctx.reply(`✨ <b>현재 [${monthLabel}${targetStage}] 상태인 대화방이 없습니다.</b>`, {
                 parse_mode: 'HTML',
             });
             return;
         }
 
         const header =
-            `🏷 <b>[${targetStage} 대화방 목록] (총 ${targets.length}건)</b>\n` +
+            `🏷 <b>[${monthLabel}${targetStage} 대화방 목록] (총 ${targets.length}건)</b>\n` +
             `기준시각: ${dayjs().tz('Asia/Seoul').format('YYYY-MM-DD HH:mm')}\n` +
+            (month ? '' : `💡 <code>관리자 10월 ${targetStage}</code>처럼 월을 붙이면 해당 목표월만 조회됩니다.\n`) +
             `━━━━━━━━━━━━━━━━━━\n\n`;
 
         await sendChunkedList(ctx, header, targets, (c, i) => {
             const memberBadge = c.matched_student_name ? ` (👤 ${escapeHtml(c.matched_student_name)})` : '';
             let itemStr = `<b>${i}. ${escapeHtml(c.room_title || '대화방')}</b>${memberBadge}\n`;
             itemStr += `   • 만남일정: <b>${c.meeting_date || '일정 미등록'}</b>\n`;
+            if (!month) itemStr += `   • 목표월: ${formatTargetMonth(c.student_target)}\n`;
             if (c.progress_note) itemStr += `   • 메모/내용: ${escapeHtml(c.progress_note)}\n`;
             itemStr += `   • Chat ID: <code>${c.chat_id}</code>\n\n`;
             return itemStr;
@@ -1803,7 +1927,7 @@ bot.hears(/^(?:[\/!]?관리자\s+)(섭등예정|예정가능일|가능가능일)
 });
 
 // 일반방 조회 (관리자 일반 - 특수 3종 및 중단 제외)
-bot.hears(/^(?:[\/!]?관리자\s+)(일반|일반방|미분류)$/i, async (ctx) => {
+bot.hears(/^(?:[\/!]?관리자\s+)(?:(\d{1,2})\s*월\s*)?(일반|일반방|미분류)$/i, async (ctx) => {
     try {
         const userId = String(ctx.from?.id);
         if (!isAdmin(userId)) {
@@ -1811,23 +1935,29 @@ bot.hears(/^(?:[\/!]?관리자\s+)(일반|일반방|미분류)$/i, async (ctx) =
             return;
         }
 
+        const month = parseMonthArg(ctx.match[1]);
+        const monthLabel = month ? `${month}월 목표 ` : '';
         const allChats = await getAllChats();
-        const normalChats = allChats.filter(
-            (c) =>
-                (!c.progress_stage || !['섭등예정', '예정가능일', '가능가능일'].includes(c.progress_stage)) &&
-                c.meeting_date !== '중단'
+        const normalChats = filterByTargetMonth(
+            allChats.filter(
+                (c) =>
+                    (!c.progress_stage || !['섭등예정', '예정가능일', '가능가능일'].includes(c.progress_stage)) &&
+                    c.meeting_date !== '중단'
+            ),
+            month
         );
 
         if (normalChats.length === 0) {
-            await ctx.reply('✨ <b>특수 단계 및 중단 상태를 제외한 일반 대화방이 없습니다.</b>', {
+            await ctx.reply(`✨ <b>특수 단계 및 중단 상태를 제외한 ${monthLabel}일반 대화방이 없습니다.</b>`, {
                 parse_mode: 'HTML',
             });
             return;
         }
 
         const header =
-            `📋 <b>[일반 대화방 목록 (특수 3종 및 중단 제외)] (총 ${normalChats.length}건)</b>\n` +
+            `📋 <b>[${monthLabel}일반 대화방 목록 (특수 3종 및 중단 제외)] (총 ${normalChats.length}건)</b>\n` +
             `기준시각: ${dayjs().tz('Asia/Seoul').format('YYYY-MM-DD HH:mm')}\n` +
+            (month ? '' : `💡 <code>관리자 10월 일반</code>처럼 월을 붙이면 해당 목표월만 조회됩니다.\n`) +
             `━━━━━━━━━━━━━━━━━━\n\n`;
 
         await sendChunkedList(ctx, header, normalChats, (chat, index) => {
@@ -1841,6 +1971,7 @@ bot.hears(/^(?:[\/!]?관리자\s+)(일반|일반방|미분류)$/i, async (ctx) =
             return (
                 `<b>${index}. ${safeTitle}</b>${memberBadge}\n` +
                 `   • 현재 상태: <b>${statusText}</b> (보고서: ${reportBadge})\n` +
+                (month ? '' : `   • 목표월: ${formatTargetMonth(chat.student_target)}\n`) +
                 `   • Chat ID: <code>${chat.chat_id}</code>\n\n`
             );
         });
@@ -2077,6 +2208,7 @@ bot.on('text', async (ctx) => {
                 follow_up_reason: reason,
                 meeting_date: '중단',
                 stop_reason: `인터뷰 후속 미신청: ${reason}`,
+                stop_category: null,
                 interview_report_submitted: 1,
                 report_submitted: 1,
             });
@@ -2084,10 +2216,10 @@ bot.on('text', async (ctx) => {
             await ctx.reply(
                 `🛑 <b>인터뷰 결과 보고서가 반영되었습니다.</b>\n\n` +
                     `• <b>후속 신청</b>: <b>미신청</b>\n` +
-                    `• <b>미신청 사유</b>: ${escapeHtml(reason)}\n` +
+                    `• <b>상세 사유</b>: ${escapeHtml(reason)}\n` +
                     `• <b>대화방 상태</b>: 만남 중단 처리됨\n\n` +
-                    `<i>(후속 미신청 사유가 DB에 안전하게 기록되었습니다.)</i>`,
-                { parse_mode: 'HTML' }
+                    `👇 <b>미신청 사유 분류를 선택해주세요:</b>`,
+                { parse_mode: 'HTML', reply_markup: buildStopCategoryKeyboard('fu') }
             );
             return;
         }
