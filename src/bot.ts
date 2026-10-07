@@ -92,6 +92,7 @@ const STOP_CATEGORIES = [
     { code: 'health', label: '건강' },
     { code: 'move', label: '이사·거리' },
     { code: 'personal', label: '개인사정' },
+    { code: 'romance', label: '이성목적' },
     { code: 'etc', label: '기타' },
 ] as const;
 
@@ -352,6 +353,35 @@ function parseFlexibleDate(rawText: string): string | null {
     }
 
     return null;
+}
+
+// 보고서 항목 내용 추출: 라벨 뒤(같은 줄 + 다음 항목 라벨 전까지의 줄) 텍스트, 라벨이 없으면 null
+const REPORT_FIELD_LINE = /^\s*[•\-*▪◾■□○●▶►✔✅☑️\d.)]*\s*[가-힣A-Za-z][가-힣A-Za-z0-9 ()\/·,]{0,20}\s*[:：]/;
+const REPORT_KNOWN_LABEL = /^\s*[•\-*▪◾■□○●▶►✔✅☑️\d.)]*\s*(?:진행\s*내용|섭외자\s*느낀\s*점|다음\s*만남)/;
+
+function extractReportField(text: string, label: RegExp): string | null {
+    const lines = text.split(/\r?\n/);
+    const start = lines.findIndex((l) => label.test(l));
+    if (start < 0) return null;
+
+    const m = lines[start].match(label)!;
+    const first = lines[start].slice(m.index! + m[0].length).replace(/^\s*[:：\-]?\s*/, '');
+    const body = [first];
+    for (
+        let i = start + 1;
+        i < lines.length && !REPORT_FIELD_LINE.test(lines[i]) && !REPORT_KNOWN_LABEL.test(lines[i]);
+        i++
+    ) {
+        body.push(lines[i]);
+    }
+    return body.join('\n').trim();
+}
+
+// 괄호 안내문구·기호만 있으면 빈칸으로 간주
+function isBlankReportField(value: string | null): boolean {
+    if (value === null) return true;
+    const stripped = value.replace(/\([^)]*\)|\[[^\]]*\]/g, '').replace(/[\s\-_.·~:：xX]/g, '');
+    return stripped.length === 0;
 }
 
 function extractNextMeetingRaw(text: string): string | null {
@@ -2273,6 +2303,25 @@ bot.on('text', async (ctx) => {
         text.includes('다음 만남일');
 
     if (isReport) {
+        // 진행내용 / 섭외자 느낀점이 비어 있으면 제출로 처리하지 않음 (일정 갱신도 보류)
+        const missingFields = [
+            { name: '진행내용', label: /진행\s*내용/ },
+            { name: '섭외자 느낀점', label: /섭외자\s*느낀\s*점/ },
+        ]
+            .filter((f) => isBlankReportField(extractReportField(text, f.label)))
+            .map((f) => f.name);
+
+        if (missingFields.length > 0) {
+            await ctx.reply(
+                `⚠️ <b>만남 보고서가 아직 제출 처리되지 않았습니다.</b>\n\n` +
+                    `아래 항목이 비어 있습니다:\n` +
+                    missingFields.map((n) => `• <b>${n}</b>`).join('\n') +
+                    `\n\n내용을 작성하여 보고서를 다시 올려주세요.`,
+                { parse_mode: 'HTML' }
+            );
+            return;
+        }
+
         const rawNextDate = extractNextMeetingRaw(text);
 
         if (rawNextDate && rawNextDate.includes('미정')) {
