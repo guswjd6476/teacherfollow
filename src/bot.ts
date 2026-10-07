@@ -357,7 +357,10 @@ function parseFlexibleDate(rawText: string): string | null {
 
 // 보고서 항목 내용 추출: 라벨 뒤(같은 줄 + 다음 항목 라벨 전까지의 줄) 텍스트, 라벨이 없으면 null
 const REPORT_FIELD_LINE = /^\s*[•\-*▪◾■□○●▶►✔✅☑️\d.)]*\s*[가-힣A-Za-z][가-힣A-Za-z0-9 ()\/·,]{0,20}\s*[:：]/;
-const REPORT_KNOWN_LABEL = /^\s*[•\-*▪◾■□○●▶►✔✅☑️\d.)]*\s*(?:진행\s*내용|섭외자\s*느낀\s*점|다음\s*만남)/;
+const REPORT_KNOWN_LABEL =
+    /^\s*[•\-*▪◾■□○●▶►✔✅☑️\d.)]*\s*(?:진행\s*내용|진행\s*내역|상담\s*반응|섭외자\s*느낀\s*점|입막음|다음\s*만남)/;
+// 양식의 섹션 머리 기호 (▶️ 진행내용, ▪️만남일시, 🖤 해결해야 할 것 등)
+const REPORT_SECTION_HEAD = /^\s*(?:▶|►|▪|◾|■|🖤|🏷)/u;
 
 function extractReportField(text: string, label: RegExp): string | null {
     const lines = text.split(/\r?\n/);
@@ -369,7 +372,10 @@ function extractReportField(text: string, label: RegExp): string | null {
     const body = [first];
     for (
         let i = start + 1;
-        i < lines.length && !REPORT_FIELD_LINE.test(lines[i]) && !REPORT_KNOWN_LABEL.test(lines[i]);
+        i < lines.length &&
+        !REPORT_FIELD_LINE.test(lines[i]) &&
+        !REPORT_KNOWN_LABEL.test(lines[i]) &&
+        !REPORT_SECTION_HEAD.test(lines[i]);
         i++
     ) {
         body.push(lines[i]);
@@ -377,10 +383,13 @@ function extractReportField(text: string, label: RegExp): string | null {
     return body.join('\n').trim();
 }
 
-// 괄호 안내문구·기호만 있으면 빈칸으로 간주
+// 괄호 안내문구·번호(1. 2.)·기호만 있으면 빈칸으로 간주
 function isBlankReportField(value: string | null): boolean {
     if (value === null) return true;
-    const stripped = value.replace(/\([^)]*\)|\[[^\]]*\]/g, '').replace(/[\s\-_.·~:：xX]/g, '');
+    const stripped = value
+        .replace(/\([^)]*\)|\[[^\]]*\]/g, '')
+        .replace(/^\s*\d+\s*[.)]/gm, '')
+        .replace(/[\s\-_.·~:：xX]/g, '');
     return stripped.length === 0;
 }
 
@@ -2303,10 +2312,10 @@ bot.on('text', async (ctx) => {
         text.includes('다음 만남일');
 
     if (isReport) {
-        // 진행내용 / 섭외자 느낀점이 비어 있으면 제출로 처리하지 않음 (일정 갱신도 보류)
+        // 진행내용 / 상담반응 및 특이사항이 비어 있으면 제출로 처리하지 않음 (일정 갱신도 보류)
         const missingFields = [
             { name: '진행내용', label: /진행\s*내용/ },
-            { name: '섭외자 느낀점', label: /섭외자\s*느낀\s*점/ },
+            { name: '상담반응 및 특이사항', label: /상담\s*반응(?:\s*및\s*특이\s*사항)?/ },
         ]
             .filter((f) => isBlankReportField(extractReportField(text, f.label)))
             .map((f) => f.name);
