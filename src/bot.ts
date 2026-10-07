@@ -548,7 +548,7 @@ bot.hears(/^[\/!](start|help|도움말)(?:@\w+)?$/i, async (ctx) => {
             '   - 인터뷰어: <code>/인터뷰어 강북 1팀 귀요미</code>\n' +
             '   - 타이퍼: <code>/타이퍼 강북 1팀 김공주</code> (해제: <code>/타이퍼 없음</code>)\n' +
             '   - 예정일: <code>/인터뷰일 MM-DD</code>\n' +
-            '• <b>결과 보고서 양식</b>: <code>/인터뷰양식</code>\n' +
+            '• <b>결과 보고서 양식</b>: <code>/인터뷰사후양식</code>\n' +
             '   <i>(결과 보고서에서 [신청] 시 교사 만남으로 자동 전환)</i>\n\n' +
             '<b>3. 교사 만남 및 일정 관리</b>\n' +
             '• <b>만남일 설정</b>: <code>/만남일 MM-DD</code> 또는 <code>/만남일 미정</code>\n' +
@@ -698,17 +698,27 @@ bot.action('type_teacher', async (ctx) => {
 });
 
 // 인터뷰 사전 보고서 양식 출력 (/인터뷰사전양식)
+// 예시는 일반 텍스트로 보여주고, 탭하여 복사되는 <code> 블록은 빈 양식만 제공
 bot.hears(/^[\/!](인터뷰사전양식|사전양식|사전보고서양식)(?:@\w+)?$/i, async (ctx) => {
-    const sample =
+    const example =
         `[인터뷰 사전 보고서]\n` +
         `• 인터뷰어: 강북 1팀 귀요미\n` +
         `• 타이퍼: 강북 1팀 김공주\n` +
         `• 인터뷰일시: 10-12\n` +
         `• 사전메모: 마음 문 열려 있음`;
+    const blank =
+        `[인터뷰 사전 보고서]\n` +
+        `• 인터뷰어: \n` +
+        `• 타이퍼: \n` +
+        `• 인터뷰일시: \n` +
+        `• 사전메모: `;
 
     await ctx.reply(
-        `📋 <b>[인터뷰 사전 보고서 양식]</b>\n아래 양식을 복사하여 작성 후 이 방에 전송해주세요.\n\n` +
-            `<code>${sample}</code>\n\n` +
+        `📋 <b>[인터뷰 사전 보고서 양식]</b>\n\n` +
+            `✏️ <b>작성 예시</b>\n` +
+            `<i>${escapeHtml(example)}</i>\n\n` +
+            `👇 <b>아래 빈 양식을 눌러 복사</b>한 뒤 작성하여 이 방에 전송해주세요.\n` +
+            `<code>${escapeHtml(blank)}</code>\n\n` +
             `💡 <b>안내:</b>\n` +
             `• 인터뷰어/타이퍼는 <code>지역 팀 이름</code> 형태로 적어주시면 됩니다.\n` +
             `• 타이퍼가 없는 경우 <code>없음</code> 또는 <code>미지정</code>으로 작성하세요.`,
@@ -716,18 +726,28 @@ bot.hears(/^[\/!](인터뷰사전양식|사전양식|사전보고서양식)(?:@\
     );
 });
 
-// 인터뷰 결과 보고서 양식 출력 (/인터뷰양식)
-bot.hears(/^[\/!](인터뷰양식|인터뷰보고서양식)(?:@\w+)?$/i, async (ctx) => {
-    const sample =
+// 인터뷰 결과(사후) 보고서 양식 출력 (/인터뷰사후양식)
+// 예시는 일반 텍스트로 보여주고, 탭하여 복사되는 <code> 블록은 빈 양식만 제공
+bot.hears(/^[\/!](인터뷰사후양식|사후양식|사후보고서양식)(?:@\w+)?$/i, async (ctx) => {
+    const example =
         `[인터뷰 결과 보고서]\n` +
         `• 후속신청: 신청\n` +
         `• 미신청사유: (미신청 시 상세 사유 작성)\n` +
-        `• 다음만남일: MM-DD\n` +
-        `• 종합소견: 면담 내용 요약 작성`;
+        `• 다음만남일: 10-15\n` +
+        `• 종합소견: 말씀에 관심이 많고 질문을 적극적으로 함`;
+    const blank =
+        `[인터뷰 결과 보고서]\n` +
+        `• 후속신청: \n` +
+        `• 미신청사유: \n` +
+        `• 다음만남일: \n` +
+        `• 종합소견: `;
 
     await ctx.reply(
-        `📋 <b>[인터뷰 결과 보고서 양식]</b>\n아래 양식을 복사하여 작성 후 이 방에 전송해주세요.\n\n` +
-            `<code>${sample}</code>\n\n` +
+        `📋 <b>[인터뷰 결과 보고서 양식]</b>\n\n` +
+            `✏️ <b>작성 예시</b>\n` +
+            `<i>${escapeHtml(example)}</i>\n\n` +
+            `👇 <b>아래 빈 양식을 눌러 복사</b>한 뒤 작성하여 이 방에 전송해주세요.\n` +
+            `<code>${escapeHtml(blank)}</code>\n\n` +
             `💡 <b>안내:</b>\n` +
             `• 후속신청: <b>신청</b> ➔ 다음 교사 만남 일정으로 자동 인계됩니다.\n` +
             `• 후속신청: <b>미신청</b> ➔ 사유가 저장되고 방이 중단 처리됩니다.`,
@@ -2116,14 +2136,14 @@ bot.on('text', async (ctx) => {
         text.includes('인터뷰 계획서');
 
     if (isInterviewPreReport) {
-        const interviewerMatch = text.match(/인터뷰어\s*[:：\-]?\s*([^\n\r]+)/i);
+        const interviewerMatch = text.match(/인터뷰어[ \t]*[:：\-]?[ \t]*([^\n\r]+)/i);
         const interviewerRaw = interviewerMatch ? interviewerMatch[1].trim() : '';
 
-        const typerMatch = text.match(/타이퍼\s*[:：\-]?\s*([^\n\r]+)/i);
+        const typerMatch = text.match(/타이퍼[ \t]*[:：\-]?[ \t]*([^\n\r]+)/i);
         const typerRaw = typerMatch ? typerMatch[1].trim() : '';
 
         const dateMatch = text.match(
-            /(?:인터뷰\s*(?:예정일|일시|일)|만남\s*(?:예정일|일시|일)|일시|일정)\s*[:：\-]?\s*([^\n\r]+)/i
+            /(?:인터뷰[ \t]*(?:예정일|일시|일)|만남[ \t]*(?:예정일|일시|일)|일시|일정)[ \t]*[:：\-]?[ \t]*([^\n\r]+)/i
         );
         const dateRaw = dateMatch ? dateMatch[1].trim() : '';
 
@@ -2231,15 +2251,15 @@ bot.on('text', async (ctx) => {
         text.includes('인터뷰 보고서');
 
     if (isInterviewReport) {
-        const followUpMatch = text.match(/후속\s*신청\s*[:：\-]?\s*([^\n\r]+)/i);
+        const followUpMatch = text.match(/후속[ \t]*신청[ \t]*[:：\-]?[ \t]*([^\n\r]+)/i);
         const followUpRaw = followUpMatch ? followUpMatch[1].trim() : '';
 
         const isNotApplied = /미신청|안함|거절|취소|보류|불가|X|x/i.test(followUpRaw);
         const isApplied = /신청|완료|진행|O|o/i.test(followUpRaw) && !isNotApplied;
 
         if (isNotApplied) {
-            const reasonMatch = text.match(/미신청\s*사유\s*[:：\-]?\s*([^\n\r]+)/i);
-            const reason = reasonMatch ? reasonMatch[1].trim() : '사유 미입력';
+            const reasonMatch = text.match(/미신청[ \t]*사유[ \t]*[:：\-]?[ \t]*([^\n\r]+)/i);
+            const reason = reasonMatch?.[1].trim() || '사유 미입력';
 
             await updateChat(chatId, {
                 meeting_type: '인터뷰',
@@ -2497,7 +2517,7 @@ async function triggerNightReminder() {
                         `📋 <b>[인터뷰 결과 보고서 제출 안내]</b>\n` +
                             `오늘 인터뷰 만남 잘 마치셨나요?\n` +
                             `금일 인터뷰에 대한 <b>인터뷰 결과 보고서</b>를 등록해 주세요!\n\n` +
-                            `💡 양식이 필요하시면 <code>/인터뷰양식</code>을 입력하세요.`,
+                            `💡 양식이 필요하시면 <code>/인터뷰사후양식</code>을 입력하세요.`,
                         { parse_mode: 'HTML' }
                     );
                 } else {
