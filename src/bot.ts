@@ -355,20 +355,27 @@ function parseFlexibleDate(rawText: string): string | null {
     return null;
 }
 
-// 보고서 항목 내용 추출: 라벨 뒤(같은 줄 + 다음 항목 라벨 전까지의 줄) 텍스트, 라벨이 없으면 null
-const REPORT_FIELD_LINE = /^\s*[•\-*▪◾■□○●▶►✔✅☑️\d.)]*\s*[가-힣A-Za-z][가-힣A-Za-z0-9 ()\/·,]{0,20}\s*[:：]/;
-const REPORT_KNOWN_LABEL =
-    /^\s*[•\-*▪◾■□○●▶►✔✅☑️\d.)]*\s*(?:진행\s*내용|진행\s*내역|상담\s*반응|섭외자\s*느낀\s*점|입막음|다음\s*만남)/;
+// 보고서 항목 내용 추출: 라벨 줄의 나머지 + 다음 항목 전까지의 줄, 라벨이 없으면 null
+// 줄 머리의 기호/번호 (예: '▶️', '▪️', '•', '2.')
+const REPORT_LINE_PREFIX = String.raw`^\s*[•\-*▪◾■□○●▶►✔✅☑️\d.)]*\s*`;
+// '• 항목: 값' 형태의 줄 (머리 기호가 있어야 항목으로 간주 — 본문의 '공과 제목 : ...' 같은 줄은 내용)
+const REPORT_FIELD_LINE = /^\s*[•▪◾■□○●▶►✔✅☑️]+\s*[가-힣A-Za-z][가-힣A-Za-z0-9 ()\/·,\-]{0,20}\s*[:：]/u;
+const REPORT_KNOWN_LABEL = new RegExp(
+    REPORT_LINE_PREFIX +
+        String.raw`(?:진행\s*내용|진행\s*내역|상담\s*반응|교육\s*후\s*반응|특이\s*사항|섭외자\s*느낀\s*점|입막음|다음\s*만남)`,
+    'u'
+);
 // 양식의 섹션 머리 기호 (▶️ 진행내용, ▪️만남일시, 🖤 해결해야 할 것 등)
 const REPORT_SECTION_HEAD = /^\s*(?:▶|►|▪|◾|■|🖤|🏷)/u;
 
 function extractReportField(text: string, label: RegExp): string | null {
     const lines = text.split(/\r?\n/);
-    const start = lines.findIndex((l) => label.test(l));
+    const anchored = new RegExp(REPORT_LINE_PREFIX + label.source, 'u');
+    const start = lines.findIndex((l) => anchored.test(l));
     if (start < 0) return null;
 
-    const m = lines[start].match(label)!;
-    const first = lines[start].slice(m.index! + m[0].length).replace(/^\s*[:：\-]?\s*/, '');
+    const m = lines[start].match(anchored)!;
+    const first = lines[start].slice(m[0].length).replace(/^\s*[:：\-]?\s*/, '');
     const body = [first];
     for (
         let i = start + 1;
@@ -2333,11 +2340,15 @@ bot.on('text', async (ctx) => {
 
     if (isReport) {
         // 진행내용 / 상담반응 및 특이사항이 비어 있으면 제출로 처리하지 않음 (일정 갱신도 보류)
+        // 양식마다 제목이 달라 후보 라벨 중 하나라도 작성되어 있으면 인정
         const missingFields = [
-            { name: '진행내용', label: /진행\s*내용/ },
-            { name: '상담반응 및 특이사항', label: /상담\s*반응(?:\s*및\s*특이\s*사항)?/ },
+            { name: '진행내용', labels: [/진행\s*내용/] },
+            {
+                name: '상담반응 및 특이사항',
+                labels: [/상담\s*반응(?:\s*및\s*특이\s*사항)?/, /교육\s*후\s*반응/, /특이\s*사항/],
+            },
         ]
-            .filter((f) => isBlankReportField(extractReportField(text, f.label)))
+            .filter((f) => f.labels.every((label) => isBlankReportField(extractReportField(text, label))))
             .map((f) => f.name);
 
         if (missingFields.length > 0) {
