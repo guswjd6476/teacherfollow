@@ -54,7 +54,8 @@ async function initDb() {
             ADD COLUMN IF NOT EXISTS follow_up_applied VARCHAR(20),
             ADD COLUMN IF NOT EXISTS follow_up_reason TEXT,
             ADD COLUMN IF NOT EXISTS interview_report_submitted INTEGER DEFAULT 0,
-            ADD COLUMN IF NOT EXISTS stop_category VARCHAR(30);
+            ADD COLUMN IF NOT EXISTS stop_category VARCHAR(30),
+            ADD COLUMN IF NOT EXISTS stage_notified_date VARCHAR(10);
         `);
         console.log('✅ [DB 점검] counseling_chats 테이블 신규 컬럼 점검 완료');
     } catch (err: unknown) {
@@ -135,6 +136,9 @@ interface ChatRecord {
     guide_name?: string | null;
     guide_region?: string | null;
     guide_district?: string | null;
+    teacher_name?: string | null;
+    teacher_region?: string | null;
+    teacher_district?: string | null;
     meeting_type?: '인터뷰' | '교사' | '' | null;
     interviewer_name?: string | null;
     interviewer_code?: string | null;
@@ -151,6 +155,7 @@ interface ChatRecord {
     stop_category?: string | null;
     progress_stage?: '섭등예정' | '예정가능일' | '가능가능일' | '';
     progress_note?: string;
+    stage_notified_date?: string | null;
     feedback_submitted: number;
     report_submitted: number;
     d_minus_1_notified: number;
@@ -203,6 +208,13 @@ async function findMemberFromDB(name: string, region: string, teamRaw: string) {
     return res.rows[0] || null;
 }
 
+// 교사 표시 ('이름 (지역 구역)') — students."교사_고유번호" → members 조인 결과 사용
+function teacherText(row: { teacher_name?: string | null; teacher_region?: string | null; teacher_district?: string | null }): string {
+    if (!row.teacher_name) return '미등록';
+    const where = [row.teacher_region, row.teacher_district].filter(Boolean).join(' ');
+    return `${escapeHtml(row.teacher_name)}${where ? ` (${escapeHtml(where)})` : ''}`;
+}
+
 // 전체 방 목록 조회
 async function getAllChats(): Promise<ChatRecord[]> {
     const query = `
@@ -213,10 +225,14 @@ async function getAllChats(): Promise<ChatRecord[]> {
             s."단계" AS student_stage,
             m."이름" AS guide_name,
             m."지역" AS guide_region,
-            m."구역" AS guide_district
+            m."구역" AS guide_district,
+            t."이름" AS teacher_name,
+            t."지역" AS teacher_region,
+            t."구역" AS teacher_district
         FROM counseling_chats c
         LEFT JOIN students s ON c.matched_member_id::text = s.id::text
         LEFT JOIN members m ON s."인도자_고유번호" = m."고유번호"
+        LEFT JOIN members t ON s."교사_고유번호" = t."고유번호"
         ORDER BY c.created_at ASC;
     `;
     const res = await neonPool.query(query);
@@ -292,7 +308,7 @@ async function upsertMeetingDate(chatId: string | number, title: string, meeting
 // 방 정보 동적 업데이트
 async function updateChat(chatId: string | number, patch: Partial<ChatRecord>) {
     const id = String(chatId);
-    const ignoredKeys = ['chat_id', 'matched_student_name', 'student_target', 'student_stage', 'guide_name', 'guide_region', 'guide_district'];
+    const ignoredKeys = ['chat_id', 'matched_student_name', 'student_target', 'student_stage', 'guide_name', 'guide_region', 'guide_district', 'teacher_name', 'teacher_region', 'teacher_district'];
     const keys = Object.keys(patch).filter((k) => !ignoredKeys.includes(k));
     if (keys.length === 0) return;
 
@@ -988,9 +1004,13 @@ bot.hears(/^[\/!]행정확인(?:@\w+)?$/i, async (ctx) => {
                 s.*,
                 m."이름" AS guide_name,
                 m."지역" AS guide_region,
-                m."구역" AS guide_district
+                m."구역" AS guide_district,
+                t."이름" AS teacher_name,
+                t."지역" AS teacher_region,
+                t."구역" AS teacher_district
             FROM students s
             LEFT JOIN members m ON s."인도자_고유번호" = m."고유번호"
+            LEFT JOIN members t ON s."교사_고유번호" = t."고유번호"
             WHERE s.id::text = $1::text
             LIMIT 1;
         `;
@@ -1017,6 +1037,9 @@ bot.hears(/^[\/!]행정확인(?:@\w+)?$/i, async (ctx) => {
         msg += `━━━━━━━━━━━━━━━━━━\n`;
         msg += `• <b>담당 인도자</b>: ${guideInfo}\n`;
         msg += `• <b>현재 단계</b>: <b>${stage}</b>\n`;
+        if (getStudentStageRank(s['단계']) >= 2) {
+            msg += `• <b>교사</b>: ${teacherText(s)}\n`;
+        }
         msg += `• <b>목표월</b>: ${formatTargetMonth(s.target)}\n\n`;
 
         msg += `🗓 <b>[단계별 등록일]</b>\n`;
@@ -1847,9 +1870,13 @@ bot.hears(/^(?:[\/!]?관리자\s+)(미초대|봇미초대|초대누락)$/i, asyn
                 s.*,
                 m."이름" AS guide_name,
                 m."지역" AS guide_region,
-                m."구역" AS guide_district
+                m."구역" AS guide_district,
+                t."이름" AS teacher_name,
+                t."지역" AS teacher_region,
+                t."구역" AS teacher_district
             FROM students s
             LEFT JOIN members m ON s."인도자_고유번호" = m."고유번호"
+            LEFT JOIN members t ON s."교사_고유번호" = t."고유번호"
             WHERE LEFT(TRIM(COALESCE(s."단계"::text, '')), 1) IN ('합', '섭')
               AND NOT EXISTS (
                   SELECT 1 FROM counseling_chats c
@@ -1877,6 +1904,7 @@ bot.hears(/^(?:[\/!]?관리자\s+)(미초대|봇미초대|초대누락)$/i, asyn
             return (
                 `<b>${idx}. ${escapeHtml(s['이름'] || '이름 없음')}</b> [${escapeHtml(s['단계'] || '-')}]\n` +
                 `   • 인도자: ${guideInfo}\n` +
+                `   • 교사: ${teacherText(s)}\n` +
                 `   • 합_등록일: ${hapDate ? escapeHtml(hapDate) : '미등록'}\n\n`
             );
         });
@@ -1957,6 +1985,7 @@ bot.hears(/^(?:[\/!]?관리자\s+)(구분|단계|특수|진행구분)$/i, async 
                 const mDate = c.meeting_date ? ` [만남일: ${c.meeting_date}]` : '';
                 const member = c.matched_student_name ? ` (👤 ${escapeHtml(c.matched_student_name)})` : '';
                 msg += `${i + 1}. <b>${escapeHtml(c.room_title)}</b>${member}${mDate}${note}\n`;
+                msg += `   └ 교사: ${teacherText(c)}\n`;
             });
             msg += `\n`;
         }
@@ -1968,6 +1997,7 @@ bot.hears(/^(?:[\/!]?관리자\s+)(구분|단계|특수|진행구분)$/i, async 
                 const mDate = c.meeting_date ? ` [만남일: ${c.meeting_date}]` : '';
                 const member = c.matched_student_name ? ` (👤 ${escapeHtml(c.matched_student_name)})` : '';
                 msg += `${i + 1}. <b>${escapeHtml(c.room_title)}</b>${member}${mDate}${note}\n`;
+                msg += `   └ 교사: ${teacherText(c)}\n`;
             });
             msg += `\n`;
         }
@@ -1979,6 +2009,7 @@ bot.hears(/^(?:[\/!]?관리자\s+)(구분|단계|특수|진행구분)$/i, async 
                 const mDate = c.meeting_date ? ` [만남일: ${c.meeting_date}]` : '';
                 const member = c.matched_student_name ? ` (👤 ${escapeHtml(c.matched_student_name)})` : '';
                 msg += `${i + 1}. <b>${escapeHtml(c.room_title)}</b>${member}${mDate}${note}\n`;
+                msg += `   └ 교사: ${teacherText(c)}\n`;
             });
             msg += `\n`;
         }
@@ -2026,6 +2057,7 @@ bot.hears(/^(?:[\/!]?관리자\s+)(?:(\d{1,2})\s*월\s*)?(섭등예정|예정가
             const memberBadge = c.matched_student_name ? ` (👤 ${escapeHtml(c.matched_student_name)})` : '';
             let itemStr = `<b>${i}. ${escapeHtml(c.room_title || '대화방')}</b>${memberBadge}\n`;
             itemStr += `   • ${targetStage}: <b>${formatStageDate(c.progress_note)}</b>\n`;
+            itemStr += `   • 교사: ${teacherText(c)}\n`;
             itemStr += `   • 만남일정: ${c.meeting_date || '일정 미등록'}\n`;
             if (!month) itemStr += `   • 목표월: ${formatTargetMonth(c.student_target)}\n`;
             itemStr += `   • Chat ID: <code>${c.chat_id}</code>\n\n`;
@@ -2469,6 +2501,32 @@ async function triggerMorningReminder() {
     const chats = await getAllChats();
 
     for (const chat of chats) {
+        // 진행 구분 예정일(섭등예정 / 예정가능일 / 가능가능일) 당일 안내 — 같은 날짜로는 한 번만
+        const stageDate = getStageDate(chat.progress_note);
+        const todayStr = today.format('YYYY-MM-DD');
+        if (
+            chat.progress_stage &&
+            chat.meeting_date !== '중단' &&
+            stageDate?.format('YYYY-MM-DD') === todayStr &&
+            chat.stage_notified_date !== todayStr
+        ) {
+            try {
+                const stageLabel = chat.progress_stage === '섭등예정' ? '섭등예정일' : chat.progress_stage;
+                const member = chat.matched_student_name ? ` (👤 ${escapeHtml(chat.matched_student_name)})` : '';
+                await bot.telegram.sendMessage(
+                    chat.chat_id,
+                    `📌 <b>[${stageLabel} 당일 안내]</b>${member}\n` +
+                        `오늘(${today.format('MM/DD')})은 <b>${stageLabel}</b>입니다.\n` +
+                        `진행 상황을 확인해 주세요!\n\n` +
+                        `💡 날짜가 바뀌었다면 <code>/${chat.progress_stage} MM-DD</code>로 다시 등록해주세요.`,
+                    { parse_mode: 'HTML' }
+                );
+                await updateChat(chat.chat_id, { stage_notified_date: todayStr });
+            } catch (err: unknown) {
+                console.error(`[구분 예정일 알림 실패] Chat: ${chat.chat_id}`, getErrorMessage(err));
+            }
+        }
+
         if (!chat.meeting_date || chat.meeting_date === '미정' || chat.meeting_date === '중단') continue;
 
         const mDate = dayjs(chat.meeting_date).startOf('day');
@@ -2507,14 +2565,16 @@ async function triggerMorningReminder() {
         // D+1 미제출 알림
         if (diffDays === 1 && !chat.report_submitted && !chat.overdue_1_notified) {
             try {
-                const reportTitle = chat.meeting_type === '인터뷰' ? '인터뷰 결과 보고서' : '만남 보고서';
+                const isInterview = chat.meeting_type === '인터뷰';
+                const reportTitle = isInterview ? '인터뷰 사후 보고서(결과 보고서)' : '만남 보고서';
                 await bot.telegram.sendMessage(
                     chat.chat_id,
-                    `⚠️ <b>[보고서 미제출 안내]</b>\n` +
-                        `어제(${mDate.format(
-                            'MM/DD'
-                        )}) 진행된 만남의 <b>${reportTitle}</b>가 아직 제출되지 않았습니다.\n` +
-                        `확인 후 작성해 주세요.`,
+                    `⚠️ <b>[${isInterview ? '인터뷰 사후 보고서' : '보고서'} 미제출 안내]</b>\n` +
+                        `어제(${mDate.format('MM/DD')}) 진행된 ${
+                            isInterview ? '인터뷰' : '만남'
+                        }의 <b>${reportTitle}</b>가 아직 제출되지 않았습니다.\n` +
+                        `확인 후 작성해 주세요.` +
+                        (isInterview ? `\n\n💡 양식: <code>/인터뷰사후양식</code>` : ''),
                     { parse_mode: 'HTML' }
                 );
                 await updateChat(chat.chat_id, { overdue_1_notified: 1 });
@@ -2529,8 +2589,12 @@ async function triggerMorningReminder() {
                 await bot.telegram.sendMessage(
                     chat.chat_id,
                     `🚨 <b>[보고서 제출 지연 경고]</b>\n` +
-                        `만남일(${mDate.format('MM/DD')})로부터 2일이 경과했습니다.\n` +
-                        `만남 보고서는 <b>2일 이내 필수 제출</b> 대상입니다!`,
+                        `${chat.meeting_type === '인터뷰' ? '인터뷰일' : '만남일'}(${mDate.format(
+                            'MM/DD'
+                        )})로부터 2일이 경과했습니다.\n` +
+                        `${
+                            chat.meeting_type === '인터뷰' ? '인터뷰 사후 보고서' : '만남 보고서'
+                        }는 <b>2일 이내 필수 제출</b> 대상입니다!`,
                     { parse_mode: 'HTML' }
                 );
                 await updateChat(chat.chat_id, { overdue_2_notified: 1 });
@@ -2569,9 +2633,9 @@ async function triggerNightReminder() {
                 if (chat.meeting_type === '인터뷰') {
                     await bot.telegram.sendMessage(
                         chat.chat_id,
-                        `📋 <b>[인터뷰 결과 보고서 제출 안내]</b>\n` +
-                            `오늘 인터뷰 만남 잘 마치셨나요?\n` +
-                            `금일 인터뷰에 대한 <b>인터뷰 결과 보고서</b>를 등록해 주세요!\n\n` +
+                        `📋 <b>[인터뷰 사후 보고서 미제출 안내]</b>\n` +
+                            `오늘(${mDate.format('MM/DD')}) 인터뷰의 <b>사후 보고서(결과 보고서)</b>가 아직 올라오지 않았습니다.\n` +
+                            `인터뷰를 마치셨다면 사후 보고서를 등록해 주세요!\n\n` +
                             `💡 양식이 필요하시면 <code>/인터뷰사후양식</code>을 입력하세요.`,
                         { parse_mode: 'HTML' }
                     );
