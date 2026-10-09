@@ -170,6 +170,7 @@ interface ChatRecord {
     teacher_name?: string | null;
     teacher_region?: string | null;
     teacher_district?: string | null;
+    teacher_code?: string | null;
     meeting_type?: '인터뷰' | '교사' | '' | null;
     interviewer_name?: string | null;
     interviewer_code?: string | null;
@@ -246,6 +247,12 @@ function teacherText(row: { teacher_name?: string | null; teacher_region?: strin
     return `${escapeHtml(row.teacher_name)}${where ? ` (${escapeHtml(where)})` : ''}`;
 }
 
+// 타부서 교사: 교사_고유번호가 우리 부서 고유번호('00'으로 시작)가 아닌 uid
+function isOtherDeptTeacher(c: { teacher_code?: string | null }): boolean {
+    const code = String(c.teacher_code ?? '').trim();
+    return code !== '' && !code.startsWith('00');
+}
+
 // 전체 방 목록 조회
 async function getAllChats(): Promise<ChatRecord[]> {
     const query = `
@@ -259,7 +266,8 @@ async function getAllChats(): Promise<ChatRecord[]> {
             m."구역" AS guide_district,
             t."이름" AS teacher_name,
             t."지역" AS teacher_region,
-            t."구역" AS teacher_district
+            t."구역" AS teacher_district,
+            s."교사_고유번호"::text AS teacher_code
         FROM counseling_chats c
         LEFT JOIN students s ON c.matched_member_id::text = s.id::text
         LEFT JOIN members m ON s."인도자_고유번호" = m."고유번호"
@@ -339,7 +347,7 @@ async function upsertMeetingDate(chatId: string | number, title: string, meeting
 // 방 정보 동적 업데이트
 async function updateChat(chatId: string | number, patch: Partial<ChatRecord>) {
     const id = String(chatId);
-    const ignoredKeys = ['chat_id', 'matched_student_name', 'student_target', 'student_stage', 'guide_name', 'guide_region', 'guide_district', 'teacher_name', 'teacher_region', 'teacher_district'];
+    const ignoredKeys = ['chat_id', 'matched_student_name', 'student_target', 'student_stage', 'guide_name', 'guide_region', 'guide_district', 'teacher_name', 'teacher_region', 'teacher_district', 'teacher_code'];
     const keys = Object.keys(patch).filter((k) => !ignoredKeys.includes(k));
     if (keys.length === 0) return;
 
@@ -651,7 +659,7 @@ bot.hears(/^[\/!](start|help|도움말)(?:@\w+)?$/i, async (ctx) => {
             '• <b>만남 명단 조회</b>: <code>관리자 오늘만남</code>, <code>관리자 내일만남</code>, <code>관리자 일자만남 MM-DD</code>\n' +
             '• <b>보고서 미제출 명단</b>: <code>관리자 미제출</code>\n' +
             '• <b>미등록 및 미정 방 조회</b>: <code>관리자 미등록</code>\n' +
-            '• <b>만남일 경과 미갱신 방</b>: <code>관리자 미갱신</code>\n' +
+            '• <b>만남일 경과 미갱신 방</b>: <code>관리자 미갱신</code> (타부서 교사 제외, 포함: <code>관리자 미갱신 타부서포함</code>)\n' +
             '• <b>합등 이상 봇 미초대 명단</b>: <code>관리자 미초대</code>\n' +
             '• <b>만남 중단 방 목록</b>: <code>관리자 중단</code>\n' +
             '• <b>특수 구분 현황 (3가지 종합)</b>: <code>관리자 구분</code>\n' +
@@ -1899,7 +1907,8 @@ bot.hears(
 );
 
 // 만남일 경과 후 미갱신 방 명단 (관리자 미갱신)
-bot.hears(/^(?:[\/!]?관리자\s+)(미갱신\s*명단|미갱신|일정\s*미갱신)$/i, async (ctx) => {
+// 관리자 미갱신: 기본은 타부서 교사 제외 / '관리자 미갱신 타부서포함'이면 포함 — 교사 지역 내림차순
+bot.hears(/^(?:[\/!]?관리자\s+)(미갱신\s*명단|미갱신|일정\s*미갱신)(\s*타부서\s*포함)?$/i, async (ctx) => {
     try {
         const userId = String(ctx.from?.id);
         if (!isAdmin(userId)) {
@@ -1907,11 +1916,11 @@ bot.hears(/^(?:[\/!]?관리자\s+)(미갱신\s*명단|미갱신|일정\s*미갱�
             return;
         }
 
+        const includeOtherDept = Boolean(ctx.match[2]);
         const today = dayjs().tz('Asia/Seoul').startOf('day');
         const allChats = await getAllChats();
 
-        const expiredChats = allChats
-            .filter((chat) => {
+        const overdueAll = allChats.filter((chat) => {
                 if (
                     !chat.meeting_date ||
                     chat.meeting_date.trim() === '' ||
@@ -1921,17 +1930,44 @@ bot.hears(/^(?:[\/!]?관리자\s+)(미갱신\s*명단|미갱신|일정\s*미갱�
                     return false;
                 const mDate = dayjs(chat.meeting_date).startOf('day');
                 return mDate.isBefore(today);
-            })
-            .sort((a, b) => dayjs(a.meeting_date).valueOf() - dayjs(b.meeting_date).valueOf());
+            });
+        const otherDeptCount = overdueAll.filter(isOtherDeptTeacher).length;
+
+        // 교사 지역 내림차순 (지역 없음은 맨 뒤), 같은 지역은 오래된 만남일 먼저
+        const expiredChats = overdueAll
+            .filter((chat) => includeOtherDept || !isOtherDeptTeacher(chat))
+            .sort((a, b) => {
+                const ra = a.teacher_region || '';
+                const rb = b.teacher_region || '';
+                if (ra !== rb) {
+                    if (!ra) return 1;
+                    if (!rb) return -1;
+                    return rb.localeCompare(ra, 'ko');
+                }
+                return dayjs(a.meeting_date).valueOf() - dayjs(b.meeting_date).valueOf();
+            });
 
         if (expiredChats.length === 0) {
-            await ctx.reply('🎉 <b>일정이 만료되어 갱신되지 않은 대화방이 없습니다!</b>', { parse_mode: 'HTML' });
+            await ctx.reply(
+                '🎉 <b>일정이 만료되어 갱신되지 않은 대화방이 없습니다!</b>' +
+                    (!includeOtherDept && otherDeptCount
+                        ? `\n(타부서 교사 ${otherDeptCount}건 제외됨 · <code>관리자 미갱신 타부서포함</code>)`
+                        : ''),
+                { parse_mode: 'HTML' }
+            );
             return;
         }
 
         const header =
-            `⌛ <b>[만남일 경과 후 미갱신 대화방] (총 ${expiredChats.length}건)</b>\n` +
+            `⌛ <b>[만남일 경과 후 미갱신 대화방${includeOtherDept ? ' · 타부서 포함' : ''}] (총 ${
+                expiredChats.length
+            }건, 교사 지역 내림차순)</b>\n` +
             `<i>(이전 만남일이 지났으나 다음 일정이 설정되지 않음)</i>\n` +
+            (includeOtherDept
+                ? ''
+                : otherDeptCount
+                ? `💡 타부서 교사 ${otherDeptCount}건 제외됨 · 포함하려면 <code>관리자 미갱신 타부서포함</code>\n`
+                : '') +
             `━━━━━━━━━━━━━━━━━━\n\n`;
 
         await sendChunkedList(ctx, header, expiredChats, (chat, idx) => {
@@ -1942,6 +1978,7 @@ bot.hears(/^(?:[\/!]?관리자\s+)(미갱신\s*명단|미갱신|일정\s*미갱�
 
             return (
                 `<b>${idx}. ${escapeHtml(chat.room_title || '대화방')}</b>${memberBadge}${typeBadge}\n` +
+                `   • 교사: ${isOtherDeptTeacher(chat) && !chat.teacher_name ? '타부서 교사' : teacherText(chat)}\n` +
                 `   • 지난 만남일: ${mDate.format('YYYY-MM-DD')} (${diffDays}일 경과)\n\n`
             );
         });
