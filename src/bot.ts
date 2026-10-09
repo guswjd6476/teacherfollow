@@ -58,6 +58,15 @@ async function initDb() {
             ADD COLUMN IF NOT EXISTS stage_notified_date VARCHAR(10);
         `);
         console.log('✅ [DB 점검] counseling_chats 테이블 신규 컬럼 점검 완료');
+
+        // 진행 구분 이름 변경 반영 (섭등예정→섭등목표, 예정가능일→예정목표, 가능가능일→가능목표)
+        for (const [oldName, newName] of Object.entries(LEGACY_STAGE_NAMES)) {
+            const res = await neonPool.query(
+                `UPDATE counseling_chats SET progress_stage = $2 WHERE progress_stage = $1;`,
+                [oldName, newName]
+            );
+            if (res.rowCount) console.log(`✅ [DB 점검] 진행 구분 이름 변경: ${oldName} → ${newName} (${res.rowCount}건)`);
+        }
     } catch (err: unknown) {
         console.error('⚠️ [DB 점검 경고]:', getErrorMessage(err));
     }
@@ -81,6 +90,28 @@ function getErrorMessage(err: unknown): string {
 function escapeHtml(text?: string | number | null): string {
     if (text === undefined || text === null) return '';
     return String(text).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+}
+
+// 진행 구분 (방 단위 목표 단계) — 이름 변경 시 이 목록만 수정
+const PROGRESS_STAGES = ['섭등목표', '예정목표', '가능목표', '확정목표'] as const;
+type ProgressStage = (typeof PROGRESS_STAGES)[number];
+// 이전 이름 → 새 이름 (기존 명령어 호환 및 DB 값 변환용)
+const LEGACY_STAGE_NAMES: Record<string, ProgressStage> = {
+    섭등예정: '섭등목표',
+    예정가능일: '예정목표',
+    가능가능일: '가능목표',
+};
+const STAGE_CODES: Record<ProgressStage, string> = { 섭등목표: 'sub', 예정목표: 'yej', 가능목표: 'gan', 확정목표: 'hwa' };
+const STAGE_EMOJI: Record<ProgressStage, string> = { 섭등목표: '📌', 예정목표: '🗓', 가능목표: '✨', 확정목표: '✅' };
+// 명령어 정규식용: 새 이름 + 이전 이름
+const STAGE_COMMAND_ALT = [...PROGRESS_STAGES, ...Object.keys(LEGACY_STAGE_NAMES)].join('|');
+
+function normalizeStage(raw: string): ProgressStage {
+    return LEGACY_STAGE_NAMES[raw] ?? (raw as ProgressStage);
+}
+
+function isProgressStage(v: unknown): v is ProgressStage {
+    return PROGRESS_STAGES.includes(v as ProgressStage);
 }
 
 // 만남 중단 / 인터뷰 후속 미신청 사유 분류 (버튼 선택 → counseling_chats.stop_category 저장)
@@ -153,7 +184,7 @@ interface ChatRecord {
     meeting_date: string;
     stop_reason?: string;
     stop_category?: string | null;
-    progress_stage?: '섭등예정' | '예정가능일' | '가능가능일' | '';
+    progress_stage?: ProgressStage | '';
     progress_note?: string;
     stage_notified_date?: string | null;
     feedback_submitted: number;
@@ -386,7 +417,7 @@ function formatStageDate(note?: string | null): string {
     return `${d.format('YYYY-MM-DD')} (${'일월화수목금토'[d.day()]})`;
 }
 
-// 진행 구분(섭등예정 등) 조회 대상: 행정 단계가 합 이상(합·섭)인 대상자만
+// 진행 구분(섭등목표 등) 조회 대상: 행정 단계가 합 이상(합·섭)인 대상자만
 function isHapOrAbove(c: { student_stage?: string | null }): boolean {
     return getStudentStageRank(c.student_stage) >= 2;
 }
@@ -510,7 +541,8 @@ async function sendChunkedList<T>(
     header: string,
     items: T[],
     renderItem: (item: T, globalIndex: number) => string,
-    chunkSize = 15
+    chunkSize = 15,
+    lastMessageExtra: Record<string, unknown> = {}
 ) {
     for (let i = 0; i < items.length; i += chunkSize) {
         const chunk = items.slice(i, i + chunkSize);
@@ -523,7 +555,8 @@ async function sendChunkedList<T>(
             message += renderItem(item, i + idx + 1);
         });
 
-        await ctx.reply(message, { parse_mode: 'HTML' });
+        const isLast = i + chunkSize >= items.length;
+        await ctx.reply(message, { parse_mode: 'HTML', ...(isLast ? lastMessageExtra : {}) });
     }
 }
 
@@ -609,7 +642,7 @@ bot.hears(/^[\/!](start|help|도움말)(?:@\w+)?$/i, async (ctx) => {
             '• <b>피드백 제출</b>: 메시지 내 <code>#피드백</code> 태그 포함\n' +
             '• <b>만남 보고서 제출</b>: 양식 내 <code>다음만남일: MM-DD</code> 포함\n\n' +
             '<b>4. 방 진행 단계 (특수 구분)</b>\n' +
-            '• <b>단계 설정</b>: <code>/섭등예정 MM-DD</code>, <code>/예정가능일 MM-DD</code>, <code>/가능가능일 MM-DD</code> (날짜만 입력)\n' +
+            '• <b>단계 설정</b>: <code>/섭등목표 MM-DD</code>, <code>/예정목표 MM-DD</code>, <code>/가능목표 MM-DD</code>, <code>/확정목표 MM-DD</code> (날짜만 입력)\n' +
             '• <b>단계 해제</b>: <code>/구분해제</code> (일반 상태로 복귀)\n\n' +
             '👑 <b>관리자 전용 명령어</b>\n' +
             '• <b>인터뷰 예정건 모아보기</b>: <code>관리자 인터뷰</code>\n' +
@@ -621,7 +654,7 @@ bot.hears(/^[\/!](start|help|도움말)(?:@\w+)?$/i, async (ctx) => {
             '• <b>합등 이상 봇 미초대 명단</b>: <code>관리자 미초대</code>\n' +
             '• <b>만남 중단 방 목록</b>: <code>관리자 중단</code>\n' +
             '• <b>특수 구분 현황 (3가지 종합)</b>: <code>관리자 구분</code>\n' +
-            '• <b>구분별 단독 조회</b>: <code>관리자 n월 섭등예정</code>, <code>관리자 n월 예정가능일</code>, <code>관리자 n월 가능가능일</code>\n' +
+            '• <b>구분별 단독 조회</b>: <code>관리자 n월 섭등목표</code>, <code>관리자 n월 예정목표</code>, <code>관리자 n월 가능목표</code>, <code>관리자 n월 확정목표</code>\n' +
             '• <b>일반방 조회 (특수 3종 및 중단 제외)</b>: <code>관리자 n월 일반</code>\n' +
             '   <i>(n월 = 대상자 목표월, 생략 시 전체)</i>\n' +
             '• <b>전체 종합 관리 현황</b>: <code>관리자 점검</code>',
@@ -1185,7 +1218,7 @@ bot.hears(/^[\/!]상태확인(?:@\w+)?$/i, async (ctx) => {
 
     const stageText = record.progress_stage
         ? `🏷 <b>진행 단계</b>: <b>${record.progress_stage}</b>${
-              record.progress_note ? ` (예정일: ${formatStageDate(record.progress_note)})` : ''
+              record.progress_note ? ` (${record.progress_stage}일: ${formatStageDate(record.progress_note)})` : ''
           }\n`
         : '';
 
@@ -1401,9 +1434,9 @@ bot.hears(/^[\/!]만남일(?:@\w+)?(?:\s+(.+))?$/i, async (ctx) => {
     }
 });
 
-// 방 구분 설정 (/섭등예정, /예정가능일, /가능가능일 MM-DD) — 예정일은 날짜만 허용
-bot.hears(/^[\/!](섭등예정|예정가능일|가능가능일)(?:@\w+)?(?:\s+(.+))?$/i, async (ctx) => {
-    const stage = ctx.match[1] as '섭등예정' | '예정가능일' | '가능가능일';
+// 방 구분 설정 (/섭등목표, /예정목표, /가능목표, /확정목표 MM-DD) — 날짜만 허용
+bot.hears(new RegExp(`^[\\/!](${STAGE_COMMAND_ALT})(?:@\\w+)?(?:\\s+(.+))?$`, 'i'), async (ctx) => {
+    const stage = normalizeStage(ctx.match[1]);
     const rawDate = ctx.match[2]?.trim() || '';
     const stageDate = parseFlexibleDate(rawDate);
     const title = 'title' in ctx.chat ? ctx.chat.title : ctx.chat.first_name || '대화방';
@@ -1427,7 +1460,7 @@ bot.hears(/^[\/!](섭등예정|예정가능일|가능가능일)(?:@\w+)?(?:\s+(.
         });
 
         let replyMsg = `📌 <b>대화방 구분이 [${stage}]으로 설정되었습니다.</b>\n`;
-        replyMsg += `• 예정일: <b>${formatStageDate(stageDate)}</b>\n`;
+        replyMsg += `• ${stage}일: <b>${formatStageDate(stageDate)}</b>\n`;
         replyMsg += `\n💡 일반 상태로 복귀하려면 <code>/구분해제</code>를 입력하세요.`;
 
         await ctx.reply(replyMsg, { parse_mode: 'HTML' });
@@ -1585,7 +1618,7 @@ bot.hears(/^(?:[\/!]?관리자\s+)(교사|교사만남|교사목록|교사건)$/
 
 // 날짜별 만남 조회 (관리자 오늘만남, 관리자 내일만남, 관리자 일자만남 MM-DD)
 bot.hears(
-    /^(?:[\/!]?관리자(?:\s+(?!\d{1,2}\s*월\s*(?:섭등예정|예정가능일|가능가능일|일반|일반방|미분류)$)(?!(?:미초대|봇미초대|초대누락|미제출|미등록|미정|미갱신|최초미등록|점검|현황|중단|구분|단계|특수|섭등예정|예정가능일|가능가능일|일반|일반방|미분류|인터뷰|인터뷰예정|인터뷰목록|인터뷰건|교사|교사만남|교사목록|교사건))(.+))?|[\/!](?:만남명단|만남일정)(?:@\w+)?(?:\s+(.+))?)$/i,
+    /^(?:[\/!]?관리자(?:\s+(?!\d{1,2}\s*월\s*(?:섭등목표|예정목표|가능목표|확정목표|섭등예정|예정가능일|가능가능일|일반|일반방|미분류)$)(?!(?:미초대|봇미초대|초대누락|미제출|미등록|미정|미갱신|최초미등록|점검|현황|중단|구분|단계|특수|섭등목표|예정목표|가능목표|확정목표|섭등예정|예정가능일|가능가능일|일반|일반방|미분류|인터뷰|인터뷰예정|인터뷰목록|인터뷰건|교사|교사만남|교사목록|교사건))(.+))?|[\/!](?:만남명단|만남일정)(?:@\w+)?(?:\s+(.+))?)$/i,
     async (ctx) => {
         try {
             const userId = String(ctx.from?.id);
@@ -1961,14 +1994,14 @@ bot.hears(/^(?:[\/!]?관리자\s+)(구분|단계|특수|진행구분)$/i, async 
         }
 
         const allChats = (await getAllChats()).filter(isHapOrAbove);
-        const subdeung = allChats.filter((c) => c.progress_stage === '섭등예정');
-        const yejeong = allChats.filter((c) => c.progress_stage === '예정가능일');
-        const ganeung = allChats.filter((c) => c.progress_stage === '가능가능일');
-
-        const totalSpecial = subdeung.length + yejeong.length + ganeung.length;
+        const groups = PROGRESS_STAGES.map((stage) => ({
+            stage,
+            chats: allChats.filter((c) => c.progress_stage === stage),
+        }));
+        const totalSpecial = groups.reduce((sum, g) => sum + g.chats.length, 0);
 
         if (totalSpecial === 0) {
-            await ctx.reply('✨ <b>행정 합 이상 중 [섭등예정 / 예정가능일 / 가능가능일]로 지정된 대화방이 없습니다.</b>', {
+            await ctx.reply(`✨ <b>행정 합 이상 중 [${PROGRESS_STAGES.join(' / ')}]로 지정된 대화방이 없습니다.</b>`, {
                 parse_mode: 'HTML',
             });
             return;
@@ -1978,34 +2011,11 @@ bot.hears(/^(?:[\/!]?관리자\s+)(구분|단계|특수|진행구분)$/i, async 
         msg += `기준시각: ${dayjs().tz('Asia/Seoul').format('YYYY-MM-DD HH:mm')}\n`;
         msg += `━━━━━━━━━━━━━━━━━━\n\n`;
 
-        if (subdeung.length > 0) {
-            msg += `📌 <b>[섭등예정] (${subdeung.length}건)</b>\n`;
-            sortByStageDateDesc(subdeung).forEach((c, i) => {
-                const note = ` (예정일: ${formatStageDate(c.progress_note)})`;
-                const mDate = c.meeting_date ? ` [만남일: ${c.meeting_date}]` : '';
-                const member = c.matched_student_name ? ` (👤 ${escapeHtml(c.matched_student_name)})` : '';
-                msg += `${i + 1}. <b>${escapeHtml(c.room_title)}</b>${member}${mDate}${note}\n`;
-                msg += `   └ 교사: ${teacherText(c)}\n`;
-            });
-            msg += `\n`;
-        }
-
-        if (yejeong.length > 0) {
-            msg += `🗓 <b>[예정가능일] (${yejeong.length}건)</b>\n`;
-            sortByStageDateDesc(yejeong).forEach((c, i) => {
-                const note = ` (예정일: ${formatStageDate(c.progress_note)})`;
-                const mDate = c.meeting_date ? ` [만남일: ${c.meeting_date}]` : '';
-                const member = c.matched_student_name ? ` (👤 ${escapeHtml(c.matched_student_name)})` : '';
-                msg += `${i + 1}. <b>${escapeHtml(c.room_title)}</b>${member}${mDate}${note}\n`;
-                msg += `   └ 교사: ${teacherText(c)}\n`;
-            });
-            msg += `\n`;
-        }
-
-        if (ganeung.length > 0) {
-            msg += `✨ <b>[가능가능일] (${ganeung.length}건)</b>\n`;
-            sortByStageDateDesc(ganeung).forEach((c, i) => {
-                const note = ` (예정일: ${formatStageDate(c.progress_note)})`;
+        for (const { stage, chats } of groups) {
+            if (chats.length === 0) continue;
+            msg += `${STAGE_EMOJI[stage]} <b>[${stage}] (${chats.length}건)</b>\n`;
+            sortByStageDateDesc(chats).forEach((c, i) => {
+                const note = ` (${stage}일: ${formatStageDate(c.progress_note)})`;
                 const mDate = c.meeting_date ? ` [만남일: ${c.meeting_date}]` : '';
                 const member = c.matched_student_name ? ` (👤 ${escapeHtml(c.matched_student_name)})` : '';
                 msg += `${i + 1}. <b>${escapeHtml(c.room_title)}</b>${member}${mDate}${note}\n`;
@@ -2020,51 +2030,101 @@ bot.hears(/^(?:[\/!]?관리자\s+)(구분|단계|특수|진행구분)$/i, async 
     }
 });
 
-// 구분별 단독 조회 (관리자 섭등예정, 관리자 예정가능일, 관리자 가능가능일)
-bot.hears(/^(?:[\/!]?관리자\s+)(?:(\d{1,2})\s*월\s*)?(섭등예정|예정가능일|가능가능일)$/i, async (ctx) => {
+// 구분별 단독 조회 (관리자 섭등목표 / 예정목표 / 가능목표 / 확정목표) — 정렬 버튼 지원
+type StageSortMode = 'date' | 'target';
+
+// 목표월순: 이번 달부터 가까운 순 (10월 기준 10 → 11 → 12 → 1 …), 목표월 없음은 맨 뒤 / 같은 달은 예정일 최신순
+function sortByTargetMonth<T extends { student_target?: unknown; progress_note?: string }>(chats: T[]): T[] {
+    const current = dayjs().tz('Asia/Seoul').month() + 1;
+    const key = (c: T) => {
+        const m = getTargetMonthNumber(c.student_target);
+        return m ? (m - current + 12) % 12 : 99;
+    };
+    return sortByStageDateDesc(chats).sort((a, b) => key(a) - key(b));
+}
+
+async function sendStageList(ctx: any, stage: ProgressStage, month: number | null, mode: StageSortMode) {
+    const monthLabel = month ? `${month}월 목표 ` : '';
+    const allChats = await getAllChats();
+    const filtered = filterByTargetMonth(
+        allChats.filter((c) => c.progress_stage === stage && isHapOrAbove(c)),
+        month
+    );
+    const targets = mode === 'target' ? sortByTargetMonth(filtered) : sortByStageDateDesc(filtered);
+
+    if (targets.length === 0) {
+        await ctx.reply(`✨ <b>행정 합 이상 중 [${monthLabel}${stage}] 상태인 대화방이 없습니다.</b>`, {
+            parse_mode: 'HTML',
+        });
+        return;
+    }
+
+    const sortLabel = mode === 'target' ? '목표월순' : `${stage} 최신순`;
+    const header =
+        `🏷 <b>[${monthLabel}${stage} 대화방 목록 · 행정 합 이상] (총 ${targets.length}건, ${sortLabel})</b>\n` +
+        `기준시각: ${dayjs().tz('Asia/Seoul').format('YYYY-MM-DD HH:mm')}\n` +
+        (month ? '' : `💡 <code>관리자 10월 ${stage}</code>처럼 월을 붙이면 해당 목표월만 조회됩니다.\n`) +
+        `━━━━━━━━━━━━━━━━━━\n\n`;
+
+    const code = STAGE_CODES[stage];
+    const m = month ?? 0;
+    const sortButtons = {
+        reply_markup: {
+            inline_keyboard: [
+                [
+                    { text: `${mode === 'date' ? '✅ ' : ''}📅 날짜순`, callback_data: `ssort:${code}:${m}:date` },
+                    { text: `${mode === 'target' ? '✅ ' : ''}🎯 목표월순`, callback_data: `ssort:${code}:${m}:target` },
+                ],
+            ],
+        },
+    };
+
+    await sendChunkedList(
+        ctx,
+        header,
+        targets,
+        (c, i) => {
+            const memberBadge = c.matched_student_name ? ` (👤 ${escapeHtml(c.matched_student_name)})` : '';
+            let itemStr = `<b>${i}. ${escapeHtml(c.room_title || '대화방')}</b>${memberBadge}\n`;
+            itemStr += `   • ${stage}: <b>${formatStageDate(c.progress_note)}</b>\n`;
+            if (!month) itemStr += `   • 목표월: <b>${formatTargetMonth(c.student_target)}</b>\n`;
+            itemStr += `   • 교사: ${teacherText(c)}\n`;
+            itemStr += `   • 만남일정: ${c.meeting_date || '일정 미등록'}\n`;
+            itemStr += `   • Chat ID: <code>${c.chat_id}</code>\n\n`;
+            return itemStr;
+        },
+        15,
+        sortButtons
+    );
+}
+
+bot.hears(new RegExp(`^(?:[\\/!]?관리자\\s+)(?:(\\d{1,2})\\s*월\\s*)?(${STAGE_COMMAND_ALT})$`, 'i'), async (ctx) => {
     try {
         const userId = String(ctx.from?.id);
         if (!isAdmin(userId)) {
             await ctx.reply('⛔ 접근 권한이 없습니다.', { parse_mode: 'HTML' });
             return;
         }
-
-        const month = parseMonthArg(ctx.match[1]);
-        const targetStage = ctx.match[2] as '섭등예정' | '예정가능일' | '가능가능일';
-        const monthLabel = month ? `${month}월 목표 ` : '';
-        const allChats = await getAllChats();
-        const targets = sortByStageDateDesc(
-            filterByTargetMonth(
-                allChats.filter((c) => c.progress_stage === targetStage && isHapOrAbove(c)),
-                month
-            )
-        );
-
-        if (targets.length === 0) {
-            await ctx.reply(`✨ <b>행정 합 이상 중 [${monthLabel}${targetStage}] 상태인 대화방이 없습니다.</b>`, {
-                parse_mode: 'HTML',
-            });
-            return;
-        }
-
-        const header =
-            `🏷 <b>[${monthLabel}${targetStage} 대화방 목록 · 행정 합 이상] (총 ${targets.length}건, ${targetStage} 최신순)</b>\n` +
-            `기준시각: ${dayjs().tz('Asia/Seoul').format('YYYY-MM-DD HH:mm')}\n` +
-            (month ? '' : `💡 <code>관리자 10월 ${targetStage}</code>처럼 월을 붙이면 해당 목표월만 조회됩니다.\n`) +
-            `━━━━━━━━━━━━━━━━━━\n\n`;
-
-        await sendChunkedList(ctx, header, targets, (c, i) => {
-            const memberBadge = c.matched_student_name ? ` (👤 ${escapeHtml(c.matched_student_name)})` : '';
-            let itemStr = `<b>${i}. ${escapeHtml(c.room_title || '대화방')}</b>${memberBadge}\n`;
-            itemStr += `   • ${targetStage}: <b>${formatStageDate(c.progress_note)}</b>\n`;
-            itemStr += `   • 교사: ${teacherText(c)}\n`;
-            itemStr += `   • 만남일정: ${c.meeting_date || '일정 미등록'}\n`;
-            if (!month) itemStr += `   • 목표월: ${formatTargetMonth(c.student_target)}\n`;
-            itemStr += `   • Chat ID: <code>${c.chat_id}</code>\n\n`;
-            return itemStr;
-        });
+        await sendStageList(ctx, normalizeStage(ctx.match[2]), parseMonthArg(ctx.match[1]), 'date');
     } catch (err: unknown) {
         console.error('[단계별 조회 에러]:', err);
+    }
+});
+
+// 버튼 콜백: 구분별 목록 정렬 전환 (ssort:<구분코드>:<목표월|0>:<date|target>)
+bot.action(/^ssort:(sub|yej|gan|hwa):(\d{1,2}):(date|target)$/, async (ctx) => {
+    try {
+        if (!isAdmin(String(ctx.from?.id))) {
+            await ctx.answerCbQuery('관리자만 사용할 수 있습니다.');
+            return;
+        }
+        const stage = PROGRESS_STAGES.find((k) => STAGE_CODES[k] === ctx.match[1])!;
+        const mode = ctx.match[3] as StageSortMode;
+        await ctx.answerCbQuery(mode === 'target' ? '목표월순으로 정렬합니다.' : '날짜순으로 정렬합니다.');
+        await sendStageList(ctx, stage, parseMonthArg(ctx.match[2]), mode);
+    } catch (err: unknown) {
+        console.error('[구분 목록 정렬 에러]:', err);
+        await ctx.answerCbQuery('처리 중 오류가 발생했습니다.').catch(() => {});
     }
 });
 
@@ -2083,7 +2143,7 @@ bot.hears(/^(?:[\/!]?관리자\s+)(?:(\d{1,2})\s*월\s*)?(일반|일반방|미�
         const normalChats = filterByTargetMonth(
             allChats.filter(
                 (c) =>
-                    (!c.progress_stage || !['섭등예정', '예정가능일', '가능가능일'].includes(c.progress_stage)) &&
+                    !isProgressStage(c.progress_stage) &&
                     c.meeting_date !== '중단'
             ),
             month
@@ -2156,13 +2216,8 @@ bot.hears(/^(?:[\/!]?관리자\s+)(점검|현황|종합\s*점검|전체\s*점검
             return dayjs(c.meeting_date).startOf('day').isBefore(today);
         });
 
-        const subdeung = allChats.filter((c) => c.progress_stage === '섭등예정').length;
-        const yejeong = allChats.filter((c) => c.progress_stage === '예정가능일').length;
-        const ganeung = allChats.filter((c) => c.progress_stage === '가능가능일').length;
         const normalCount = allChats.filter(
-            (c) =>
-                (!c.progress_stage || !['섭등예정', '예정가능일', '가능가능일'].includes(c.progress_stage)) &&
-                c.meeting_date !== '중단'
+            (c) => !isProgressStage(c.progress_stage) && c.meeting_date !== '중단'
         ).length;
 
         const interviewCount = allChats.filter((c) => c.meeting_type === '인터뷰' && c.meeting_date !== '중단').length;
@@ -2178,9 +2233,9 @@ bot.hears(/^(?:[\/!]?관리자\s+)(점검|현황|종합\s*점검|전체\s*점검
         msg += `• 교사 만남 진행: <b>${teacherCount}개 방</b> (조회: <code>관리자 교사</code>)\n\n`;
 
         msg += `🏷 <b>[진행 단계별 현황]</b>\n`;
-        msg += `• 섭등예정: <b>${subdeung}개</b>\n`;
-        msg += `• 예정가능일: <b>${yejeong}개</b>\n`;
-        msg += `• 가능가능일: <b>${ganeung}개</b>\n`;
+        for (const stage of PROGRESS_STAGES) {
+            msg += `• ${stage}: <b>${allChats.filter((c) => c.progress_stage === stage).length}개</b>\n`;
+        }
         msg += `• 일반(중단 제외): <b>${normalCount}개</b> (조회: <code>관리자 일반</code>)\n\n`;
 
         msg += `🗓 <b>[일정 및 보고서 상태]</b>\n`;
@@ -2501,7 +2556,7 @@ async function triggerMorningReminder() {
     const chats = await getAllChats();
 
     for (const chat of chats) {
-        // 진행 구분 예정일(섭등예정 / 예정가능일 / 가능가능일) 당일 안내 — 같은 날짜로는 한 번만
+        // 진행 구분 날짜(섭등목표 / 예정목표 / 가능목표 / 확정목표) 당일 안내 — 같은 날짜로는 한 번만
         const stageDate = getStageDate(chat.progress_note);
         const todayStr = today.format('YYYY-MM-DD');
         if (
@@ -2511,7 +2566,7 @@ async function triggerMorningReminder() {
             chat.stage_notified_date !== todayStr
         ) {
             try {
-                const stageLabel = chat.progress_stage === '섭등예정' ? '섭등예정일' : chat.progress_stage;
+                const stageLabel = `${chat.progress_stage}일`;
                 const member = chat.matched_student_name ? ` (👤 ${escapeHtml(chat.matched_student_name)})` : '';
                 await bot.telegram.sendMessage(
                     chat.chat_id,
