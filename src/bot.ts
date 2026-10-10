@@ -55,9 +55,13 @@ async function initDb() {
             ADD COLUMN IF NOT EXISTS follow_up_reason TEXT,
             ADD COLUMN IF NOT EXISTS interview_report_submitted INTEGER DEFAULT 0,
             ADD COLUMN IF NOT EXISTS stop_category VARCHAR(30),
-            ADD COLUMN IF NOT EXISTS stage_notified_date VARCHAR(10);
+            ADD COLUMN IF NOT EXISTS stage_notified_date VARCHAR(10),
+            ADD COLUMN IF NOT EXISTS meeting_time VARCHAR(20),
+            ADD COLUMN IF NOT EXISTS last_message_at TIMESTAMPTZ;
         `);
         console.log('✅ [DB 점검] counseling_chats 테이블 신규 컬럼 점검 완료');
+
+        await neonPool.query(`CREATE TABLE IF NOT EXISTS bot_meta (key TEXT PRIMARY KEY, value TEXT);`);
 
         // 진행 구분 이름 변경 반영 (섭등예정→섭등목표, 예정가능일→예정목표, 가능가능일→가능목표)
         for (const [oldName, newName] of Object.entries(LEGACY_STAGE_NAMES)) {
@@ -194,6 +198,8 @@ interface ChatRecord {
     d_day_22_notified: number;
     overdue_1_notified: number;
     overdue_2_notified: number;
+    meeting_time?: string | null;
+    last_message_at?: string | null;
     created_at: string;
     updated_at: string;
 }
@@ -297,34 +303,34 @@ async function getChatRecord(chatId: string | number): Promise<ChatRecord | unde
     return res.rows[0];
 }
 
-// 방 기본 레코드 보장
+// 방 기본 레코드 보장 (+ 마지막 대화 시각 기록 — updated_at은 일정·상태가 바뀔 때만 갱신)
 async function ensureChatRecord(chatId: string | number, title: string) {
     const id = String(chatId);
     const safeTitle = title || '대화방';
 
     const query = `
-        INSERT INTO counseling_chats (chat_id, room_title, updated_at)
-        VALUES ($1, $2, NOW())
+        INSERT INTO counseling_chats (chat_id, room_title, updated_at, last_message_at)
+        VALUES ($1, $2, NOW(), NOW())
         ON CONFLICT (chat_id) DO UPDATE SET
             room_title = EXCLUDED.room_title,
-            updated_at = NOW();
+            last_message_at = NOW();
     `;
     await neonPool.query(query, [id, safeTitle]);
 }
 
 // 만남일 등록/변경
-async function upsertMeetingDate(chatId: string | number, title: string, meetingDate: string) {
+async function upsertMeetingDate(chatId: string | number, title: string, meetingDate: string, meetingTime = '') {
     const id = String(chatId);
     const safeTitle = title || '대화방';
 
     const query = `
         INSERT INTO counseling_chats (
-            chat_id, room_title, meeting_date, stop_reason,
+            chat_id, room_title, meeting_date, meeting_time, stop_reason,
             feedback_submitted, report_submitted,
             d_minus_1_notified, d_day_22_notified, overdue_1_notified, overdue_2_notified,
             updated_at
         ) VALUES (
-            $1, $2, $3, '',
+            $1, $2, $3, $4, '',
             0, 0,
             0, 0, 0, 0,
             NOW()
@@ -332,6 +338,7 @@ async function upsertMeetingDate(chatId: string | number, title: string, meeting
         ON CONFLICT (chat_id) DO UPDATE SET
             room_title = EXCLUDED.room_title,
             meeting_date = EXCLUDED.meeting_date,
+            meeting_time = EXCLUDED.meeting_time,
             stop_reason = '',
             feedback_submitted = 0,
             report_submitted = 0,
@@ -341,7 +348,7 @@ async function upsertMeetingDate(chatId: string | number, title: string, meeting
             overdue_2_notified = 0,
             updated_at = NOW();
     `;
-    await neonPool.query(query, [id, safeTitle, meetingDate]);
+    await neonPool.query(query, [id, safeTitle, meetingDate, meetingTime || null]);
 }
 
 // 방 정보 동적 업데이트
@@ -435,6 +442,47 @@ function getPastDateWarning(ymd: string): string {
     return ymd < todayStr ? `\n\n⚠️ <b>이미 지난 날짜</b>입니다 (${ymd}). 잘못 입력했다면 다시 입력해주세요.` : '';
 }
 
+// 입력에서 시간 추출 (예: 19:00, 19시, 오후 7시, 7시 반, 오후 2시 30분) — 표시용 문자열 반환, 없으면 ''
+// 오전/오후 표기가 없고 12시 미만이면 입력 그대로 'N시'로 둔다 (오전/오후 추측하지 않음)
+function parseFlexibleTime(rawText: string): string {
+    if (!rawText) return '';
+    const text = rawText.normalize('NFKC');
+    const m =
+        text.match(/(오전|오후|아침|새벽|낮|저녁|밤)?\s*(\d{1,2})\s*:\s*(\d{2})(?!\d)/) ||
+        text.match(/(오전|오후|아침|새벽|낮|저녁|밤)?\s*(\d{1,2})\s*시(?!간)\s*(?:(\d{1,2})\s*분|(반))?/);
+    if (!m) return '';
+    let hour = parseInt(m[2], 10);
+    const minute = m[4] === '반' ? 30 : m[3] ? parseInt(m[3], 10) : 0;
+    if (hour > 24 || minute > 59) return '';
+    const period = m[1];
+    if (period && ['오후', '저녁', '밤'].includes(period) && hour < 12) hour += 12;
+    if (period === '낮' && hour <= 6) hour += 12;
+    if (period && ['오전', '아침', '새벽'].includes(period) && hour === 12) hour = 0;
+    if (!period && hour < 12) return minute ? `${hour}시 ${minute}분` : `${hour}시`;
+    return `${String(hour % 24).padStart(2, '0')}:${String(minute).padStart(2, '0')}`;
+}
+
+// 시간 추출 전에 날짜 부분(10.8 / 2026.10.8 / 10월 8일)을 제거 — '10.8'의 8을 시간으로 오인하지 않도록
+function stripDatePart(rawText: string): string {
+    return rawText
+        .normalize('NFKC')
+        .replace(/(?:(?:\d{4}|1[3-9]|[2-9]\d)\s*[\-\/\.년]\s*)?\d{1,2}\s*[\-\/\.월]\s*\d{1,2}\s*일?/, ' ');
+}
+
+// 마지막 대화 시각 표시 (예: 10/08 21:30 (2일 전))
+function formatLastMessage(value?: string | Date | null): string {
+    if (!value) return '기록 없음';
+    const d = dayjs(value).tz('Asia/Seoul');
+    if (!d.isValid()) return '기록 없음';
+    const days = dayjs().tz('Asia/Seoul').startOf('day').diff(d.startOf('day'), 'day');
+    return `${d.format('MM/DD HH:mm')} (${days === 0 ? '오늘' : `${days}일 전`})`;
+}
+
+// 날짜(+시간) 표시용
+function formatMeetingWhen(date: string, time?: string | null): string {
+    return time ? `${date} ${time}` : date;
+}
+
 // 날짜 + 요일 표시 (예: 2026-10-08 (목))
 function formatYmdWithDay(ymd: string): string {
     const d = dayjs(ymd);
@@ -512,6 +560,13 @@ function isBlankReportField(value: string | null): boolean {
         .replace(/^\s*\d+\s*[.)]/gm, '')
         .replace(/[\s\-_.·~:：xX]/g, '');
     return stripped.length === 0;
+}
+
+// 봇이 처리하는 보고서·피드백 메시지인지 (수정된 메시지 재처리 대상 판별용 — handleIncomingText의 감지 조건과 동일하게 유지)
+function isReportLikeText(text: string): boolean {
+    return /인터뷰\s*사전\s*보고서|인터뷰 신청서|인터뷰 계획서|인터뷰 결과|인터뷰\s*보고서|상담,복음방 보고서|상담 보고서|복음방 보고서|만남 보고서|다음\s*만남일|#피드백/.test(
+        text
+    );
 }
 
 // 보고서의 '다음만남일' 값 추출
@@ -608,7 +663,31 @@ async function sendChunkedList<T>(
         });
 
         const isLast = i + chunkSize >= items.length;
-        await ctx.reply(message, { parse_mode: 'HTML', ...(isLast ? lastMessageExtra : {}) });
+        await replyLong(ctx, message, isLast ? lastMessageExtra : {});
+    }
+}
+
+// 텔레그램 메시지 길이 제한(4096자) 대응: 줄 단위로 나눠 여러 메시지로 전송 (HTML 태그는 줄 안에서 닫혀 있어야 함)
+const TELEGRAM_SAFE_LENGTH = 3800;
+
+function splitLongMessage(text: string, limit = TELEGRAM_SAFE_LENGTH): string[] {
+    const parts: string[] = [];
+    let current = '';
+    for (const line of text.split('\n')) {
+        if (current && current.length + line.length + 1 > limit) {
+            parts.push(current);
+            current = '';
+        }
+        current += (current ? '\n' : '') + line;
+    }
+    if (current.trim()) parts.push(current);
+    return parts;
+}
+
+async function replyLong(ctx: any, html: string, lastMessageExtra: Record<string, unknown> = {}) {
+    const parts = splitLongMessage(html);
+    for (let i = 0; i < parts.length; i++) {
+        await ctx.reply(parts[i], { parse_mode: 'HTML', ...(i === parts.length - 1 ? lastMessageExtra : {}) });
     }
 }
 
@@ -693,26 +772,30 @@ bot.hears(/^[\/!](start|help|도움말)(?:@\w+)?$/i, async (ctx) => {
             '• <b>만남 중단 처리</b>: <code>/만남중단 [상세 사유]</code> → 사유 버튼 선택\n' +
             '• <b>피드백 제출</b>: 메시지 내 <code>#피드백</code> 태그 포함\n' +
             '• <b>만남 보고서 양식</b>: <code>/만남보고서양식</code> 또는 <code>/교사만남양식</code>\n' +
-            '• <b>만남 보고서 제출</b>: 양식 내 <code>다음만남일: MM-DD</code> 포함\n\n' +
+            '• <b>만남 보고서 제출</b>: 양식 내 <code>다음만남일: MM-DD</code> 포함\n' +
+            '   <i>(보고서를 수정하거나 사진 설명글로 올려도 인식됩니다)</i>\n\n' +
             '<b>4. 방 진행 단계 (특수 구분)</b>\n' +
             '• <b>단계 설정</b>: <code>/섭등목표 MM-DD</code>, <code>/예정목표 MM-DD</code>, <code>/가능목표 MM-DD</code>, <code>/확정목표 MM-DD</code> (날짜만 입력)\n' +
             '• <b>단계 해제</b>: <code>/구분해제</code> (일반 상태로 복귀)\n\n' +
             '📅 <b>날짜 입력 형식</b>: <code>10-08</code>, <code>10/8</code>, <code>10.8(목)</code>, <code>10월 8일</code>, <code>2026.10.8</code>, <code>내일</code>\n' +
+            '   시간도 함께 적으면 저장됩니다: <code>/만남일 10.8(목) 오후 7시</code>, <code>10/8 19:30</code>\n' +
             '   <i>(요일이 실제와 다르거나 지난 날짜면 안내해 드립니다)</i>\n\n' +
             '👑 <b>관리자 전용 명령어</b>\n' +
             '• <b>인터뷰 예정건 모아보기</b>: <code>관리자 인터뷰</code>\n' +
             '• <b>교사 만남 진행건 모아보기</b>: <code>관리자 교사</code>\n' +
             '• <b>만남 명단 조회</b>: <code>관리자 오늘만남</code>, <code>관리자 내일만남</code>, <code>관리자 일자만남 MM-DD</code>\n' +
-            '• <b>보고서 미제출 명단</b>: <code>관리자 미제출</code>\n' +
+            '• <b>보고서 미제출 명단</b>: <code>관리자 미제출</code> (일괄 독촉: <code>관리자 미제출 알림</code>)\n' +
             '• <b>미등록 및 미정 방 조회</b>: <code>관리자 미등록</code>\n' +
             '• <b>만남일 경과 미갱신 방</b>: <code>관리자 미갱신</code> (타부서 교사 제외, 포함: <code>관리자 미갱신 타부서포함</code>)\n' +
+            '   일괄 독촉: <code>관리자 미갱신 알림</code>, <code>관리자 미갱신 타부서포함 알림</code>\n' +
             '• <b>합등 이상 봇 미초대 명단</b>: <code>관리자 미초대</code>\n' +
             '• <b>만남 중단 방 목록</b>: <code>관리자 중단</code>\n' +
             '• <b>특수 구분 현황 (3가지 종합)</b>: <code>관리자 구분</code>\n' +
             '• <b>구분별 단독 조회</b>: <code>관리자 n월 섭등목표</code>, <code>관리자 n월 예정목표</code>, <code>관리자 n월 가능목표</code>, <code>관리자 n월 확정목표</code>\n' +
             '• <b>일반방 조회 (특수 3종 및 중단 제외)</b>: <code>관리자 n월 일반</code>\n' +
             '   <i>(n월 = 대상자 목표월, 생략 시 전체)</i>\n' +
-            '• <b>전체 종합 관리 현황</b>: <code>관리자 점검</code>',
+            '• <b>전체 종합 관리 현황</b>: <code>관리자 점검</code>\n' +
+            '• <b>주간 요약</b>: <code>관리자 주간요약</code> (매주 월요일 오전 관리자에게 자동 발송)',
         { parse_mode: 'HTML' }
     );
 });
@@ -1102,11 +1185,12 @@ bot.hears(/^[\/!](인터뷰일|인터뷰일자|인터뷰일정)(?:@\w+)?(?:(?:\s
             return;
         }
 
-        await upsertMeetingDate(ctx.chat.id, title, formatted);
+        const time = parseFlexibleTime(stripDatePart(rawInput));
+        await upsertMeetingDate(ctx.chat.id, title, formatted, time);
         await updateChat(ctx.chat.id, { meeting_type: '인터뷰', interview_date: formatted });
 
         await ctx.reply(
-            `🎙️ <b>인터뷰 예정일이 [${formatYmdWithDay(formatted)}]로 변경되었습니다!</b>` +
+            `🎙️ <b>인터뷰 예정일이 [${formatMeetingWhen(formatYmdWithDay(formatted), time)}]로 변경되었습니다!</b>` +
                 getWeekdayWarning(rawInput, formatted) +
                 getPastDateWarning(formatted),
             { parse_mode: 'HTML' }
@@ -1396,7 +1480,7 @@ bot.hears(/^[\/!]상태확인(?:@\w+)?$/i, async (ctx) => {
             memberText +
             typeText +
             stageText +
-            `• <b>다음 만남일</b>: ${mDate.format('YYYY년 MM월 DD일')}\n` +
+            `• <b>다음 만남일</b>: ${formatMeetingWhen(mDate.format('YYYY년 MM월 DD일'), record.meeting_time)}\n` +
             `• <b>피드백 작성</b>: ${feedbackStatus}\n` +
             `• <b>보고서 제출</b>: ${reportStatus}`,
         { parse_mode: 'HTML' }
@@ -1545,10 +1629,11 @@ bot.hears(/^[\/!]만남일(?:@\w+)?(?:(?:\s+|(?=\d))([\s\S]+))?$/i, async (ctx) 
             return;
         }
 
-        await upsertMeetingDate(ctx.chat.id, title, formatted);
+        const time = parseFlexibleTime(stripDatePart(rawInput));
+        await upsertMeetingDate(ctx.chat.id, title, formatted, time);
 
         await ctx.reply(
-            `🗓 만남일이 <b>${formatYmdWithDay(formatted)}</b>로 등록되었습니다.\n\n` +
+            `🗓 만남일이 <b>${formatMeetingWhen(formatYmdWithDay(formatted), time)}</b>로 등록되었습니다.\n\n` +
                 `• <b>만남 전날 (10:00)</b>: 피드백(#피드백) 등록 요청 알림\n` +
                 `• <b>만남 당일 (22:00)</b>: 만남 보고서 등록 알림\n` +
                 `• <b>미제출 시</b>: 1일/2일 경과 경고 알림` +
@@ -1665,7 +1750,7 @@ bot.hears(/^(?:[\/!]?관리자\s+)(인터뷰|인터뷰예정|인터뷰목록|인
                 const mDate = dayjs(chat.meeting_date).startOf('day');
                 const diff = mDate.diff(today, 'day');
                 const dDayStr = diff === 0 ? '오늘' : diff > 0 ? `D-${diff}` : `${Math.abs(diff)}일 경과`;
-                dateDisplay = `${mDate.format('YYYY-MM-DD')} (${dDayStr})`;
+                dateDisplay = `${formatMeetingWhen(mDate.format('YYYY-MM-DD'), chat.meeting_time)} (${dDayStr})`;
             }
 
             return (
@@ -1728,7 +1813,7 @@ bot.hears(/^(?:[\/!]?관리자\s+)(교사|교사만남|교사목록|교사건)$/
                 const mDate = dayjs(chat.meeting_date).startOf('day');
                 const diff = mDate.diff(today, 'day');
                 const dDayStr = diff === 0 ? '오늘' : diff > 0 ? `D-${diff}` : `${Math.abs(diff)}일 경과`;
-                dateDisplay = `${mDate.format('YYYY-MM-DD')} (${dDayStr})`;
+                dateDisplay = `${formatMeetingWhen(mDate.format('YYYY-MM-DD'), chat.meeting_time)} (${dDayStr})`;
             }
 
             return (
@@ -1747,7 +1832,7 @@ bot.hears(/^(?:[\/!]?관리자\s+)(교사|교사만남|교사목록|교사건)$/
 
 // 날짜별 만남 조회 (관리자 오늘만남, 관리자 내일만남, 관리자 일자만남 MM-DD)
 bot.hears(
-    /^(?:[\/!]?관리자(?:\s+(?!\d{1,2}\s*월\s*(?:섭등목표|예정목표|가능목표|확정목표|섭등예정|예정가능일|가능가능일|일반|일반방|미분류)$)(?!(?:미초대|봇미초대|초대누락|미제출|미등록|미정|미갱신|최초미등록|점검|현황|중단|구분|단계|특수|섭등목표|예정목표|가능목표|확정목표|섭등예정|예정가능일|가능가능일|일반|일반방|미분류|인터뷰|인터뷰예정|인터뷰목록|인터뷰건|교사|교사만남|교사목록|교사건))(.+))?|[\/!](?:만남명단|만남일정)(?:@\w+)?(?:\s+(.+))?)$/i,
+    /^(?:[\/!]?관리자(?:\s+(?!\d{1,2}\s*월\s*(?:섭등목표|예정목표|가능목표|확정목표|섭등예정|예정가능일|가능가능일|일반|일반방|미분류)$)(?!(?:미초대|봇미초대|초대누락|미제출|미등록|미정|미갱신|최초미등록|점검|현황|중단|구분|단계|특수|섭등목표|예정목표|가능목표|확정목표|섭등예정|예정가능일|가능가능일|일반|일반방|미분류|인터뷰|인터뷰예정|인터뷰목록|인터뷰건|교사|교사만남|교사목록|교사건|주간))(.+))?|[\/!](?:만남명단|만남일정)(?:@\w+)?(?:\s+(.+))?)$/i,
     async (ctx) => {
         try {
             const userId = String(ctx.from?.id);
@@ -1820,6 +1905,7 @@ bot.hears(
                     `<b>${idx}. ${escapeHtml(
                         chat.room_title || '대화방'
                     )}${memberBadge}${typeBadge}${stageBadge}</b>\n` +
+                    (chat.meeting_time ? `   • 시간: <b>${escapeHtml(chat.meeting_time)}</b>\n` : '') +
                     detailLine +
                     `\n`
                 );
@@ -1959,9 +2045,10 @@ bot.hears(
                 });
             }
 
-            await ctx.reply(message, { parse_mode: 'HTML' });
+            await replyLong(ctx, message);
         } catch (err: unknown) {
             console.error('[미등록/미정 조회 에러]:', err);
+            await ctx.reply(`⚠️ 조회 중 오류 발생: ${getErrorMessage(err)}`);
         }
     }
 );
@@ -2039,7 +2126,8 @@ bot.hears(/^(?:[\/!]?관리자\s+)(미갱신\s*명단|미갱신|일정\s*미갱�
             return (
                 `<b>${idx}. ${escapeHtml(chat.room_title || '대화방')}</b>${memberBadge}${typeBadge}\n` +
                 `   • 교사: ${isOtherDeptTeacher(chat) && !chat.teacher_name ? '타부서 교사' : teacherText(chat)}\n` +
-                `   • 지난 만남일: ${mDate.format('YYYY-MM-DD')} (${diffDays}일 경과)\n\n`
+                `   • 지난 만남일: ${mDate.format('YYYY-MM-DD')} (${diffDays}일 경과)\n` +
+                `   • 마지막 대화: ${formatLastMessage(chat.last_message_at)}\n\n`
             );
         });
     } catch (err: unknown) {
@@ -2182,9 +2270,10 @@ bot.hears(/^(?:[\/!]?관리자\s+)(구분|단계|특수|진행구분)$/i, async 
             msg += `\n`;
         }
 
-        await ctx.reply(msg, { parse_mode: 'HTML' });
+        await replyLong(ctx, msg);
     } catch (err: unknown) {
         console.error('[관리자 구분 조회 에러]:', err);
+        await ctx.reply(`⚠️ 조회 중 오류 발생: ${getErrorMessage(err)}`);
     }
 });
 
@@ -2409,9 +2498,246 @@ bot.hears(/^(?:[\/!]?관리자\s+)(점검|현황|종합\s*점검|전체\s*점검
     }
 });
 
+/* =====================================================
+ * 📢 관리자 일괄 독촉 (관리자 미제출 알림 / 관리자 미갱신 알림 [타부서포함])
+ * ===================================================== */
+type BulkKind = 'overdue' | 'expired' | 'expiredall';
+
+function isPastMeetingDate(c: ChatRecord, todayStr: string): boolean {
+    return /^\d{4}-\d{2}-\d{2}$/.test(c.meeting_date || '') && c.meeting_date < todayStr;
+}
+
+// 독촉 대상: 미제출 = 지난 만남(오늘 제외)의 보고서 미제출 / 미갱신 = 지난 만남일 이후 다음 일정 미등록
+async function getBulkTargets(kind: BulkKind): Promise<ChatRecord[]> {
+    const todayStr = dayjs().tz('Asia/Seoul').format('YYYY-MM-DD');
+    const chats = await getAllChats();
+    if (kind === 'overdue') return chats.filter((c) => isPastMeetingDate(c, todayStr) && !c.report_submitted);
+    return chats.filter(
+        (c) => isPastMeetingDate(c, todayStr) && (kind === 'expiredall' || !isOtherDeptTeacher(c))
+    );
+}
+
+function buildBulkMessage(kind: BulkKind, c: ChatRecord): string {
+    const date = dayjs(c.meeting_date).format('MM/DD');
+    if (kind === 'overdue') {
+        const isInterview = c.meeting_type === '인터뷰';
+        return (
+            `📋 <b>[보고서 제출 요청]</b>\n` +
+            `${date} ${isInterview ? '인터뷰' : '만남'}의 <b>${
+                isInterview ? '인터뷰 사후 보고서' : '만남 보고서'
+            }</b>가 아직 제출되지 않았습니다.\n` +
+            `확인 후 작성해 주세요!\n\n` +
+            `💡 양식: <code>${isInterview ? '/인터뷰사후양식' : '/만남보고서양식'}</code>`
+        );
+    }
+    return (
+        `🗓 <b>[다음 만남일 등록 요청]</b>\n` +
+        `지난 만남일(${date}) 이후 다음 일정이 등록되지 않았습니다.\n` +
+        `<code>/만남일 MM-DD</code> 또는 <code>/만남일 미정</code>으로 등록해 주세요.`
+    );
+}
+
+const BULK_LABEL: Record<BulkKind, string> = {
+    overdue: '보고서 미제출',
+    expired: '만남일 미갱신 (타부서 제외)',
+    expiredall: '만남일 미갱신 (타부서 포함)',
+};
+
+bot.hears(/^(?:[\/!]?관리자\s+)(미제출|미갱신)\s*(타부서\s*포함)?\s*(?:알림|독촉|일괄\s*알림)$/i, async (ctx) => {
+    try {
+        if (!isAdmin(String(ctx.from?.id))) {
+            await ctx.reply('⛔ 접근 권한이 없습니다.', { parse_mode: 'HTML' });
+            return;
+        }
+        const kind: BulkKind = ctx.match[1] === '미제출' ? 'overdue' : ctx.match[2] ? 'expiredall' : 'expired';
+        const targets = await getBulkTargets(kind);
+        if (targets.length === 0) {
+            await ctx.reply(`🎉 <b>[${BULK_LABEL[kind]}] 독촉할 대화방이 없습니다.</b>`, { parse_mode: 'HTML' });
+            return;
+        }
+
+        const preview = targets
+            .slice(0, 30)
+            .map(
+                (c, i) =>
+                    `${i + 1}. ${escapeHtml(c.room_title || '대화방')}${
+                        c.matched_student_name ? ` (👤 ${escapeHtml(c.matched_student_name)})` : ''
+                    } · ${dayjs(c.meeting_date).format('MM/DD')}`
+            )
+            .join('\n');
+
+        await replyLong(
+            ctx,
+            `📢 <b>[${BULK_LABEL[kind]}] 일괄 알림 확인</b>\n` +
+                `아래 <b>${targets.length}개 방</b>에 알림을 보냅니다.\n` +
+                `━━━━━━━━━━━━━━━━━━\n` +
+                preview +
+                (targets.length > 30 ? `\n… 외 ${targets.length - 30}개 방` : '') +
+                `\n━━━━━━━━━━━━━━━━━━\n<b>보낼 메시지 예시</b>\n${buildBulkMessage(kind, targets[0])}`,
+            {
+                reply_markup: {
+                    inline_keyboard: [
+                        [
+                            { text: `📢 ${targets.length}개 방에 보내기`, callback_data: `bulk:${kind}` },
+                            { text: '❌ 취소', callback_data: 'bulk:cancel' },
+                        ],
+                    ],
+                },
+            }
+        );
+    } catch (err: unknown) {
+        console.error('[일괄 알림 준비 에러]:', err);
+        await ctx.reply(`⚠️ 일괄 알림 준비 중 오류 발생: ${getErrorMessage(err)}`);
+    }
+});
+
+bot.action(/^bulk:(overdue|expired|expiredall|cancel)$/, async (ctx) => {
+    try {
+        if (!isAdmin(String(ctx.from?.id))) {
+            await ctx.answerCbQuery('관리자만 사용할 수 있습니다.');
+            return;
+        }
+        const action = ctx.match[1];
+        await ctx.editMessageReplyMarkup(undefined).catch(() => {});
+        if (action === 'cancel') {
+            await ctx.answerCbQuery('취소되었습니다.');
+            await ctx.reply('❌ 일괄 알림을 취소했습니다.');
+            return;
+        }
+        await ctx.answerCbQuery('발송을 시작합니다.');
+
+        // 버튼을 누른 시점 기준으로 대상을 다시 계산 (그 사이 제출된 방 제외)
+        const kind = action as BulkKind;
+        const targets = await getBulkTargets(kind);
+        let sent = 0;
+        const failed: string[] = [];
+        for (const c of targets) {
+            try {
+                await bot.telegram.sendMessage(c.chat_id, buildBulkMessage(kind, c), { parse_mode: 'HTML' });
+                sent++;
+            } catch (err: unknown) {
+                failed.push(`${c.room_title || c.chat_id} (${getErrorMessage(err)})`);
+            }
+            await new Promise((r) => setTimeout(r, 100)); // 텔레그램 전송 속도 제한 대응
+        }
+
+        await replyLong(
+            ctx,
+            `✅ <b>[${BULK_LABEL[kind]}] 일괄 알림 완료</b>\n• 성공: ${sent}개 방` +
+                (failed.length
+                    ? `\n• 실패: ${failed.length}개 방 (봇이 내보내졌거나 방이 삭제된 경우)\n` +
+                      failed.map((f) => `   - ${escapeHtml(f)}`).join('\n')
+                    : '')
+        );
+    } catch (err: unknown) {
+        console.error('[일괄 알림 발송 에러]:', err);
+        await ctx.reply(`⚠️ 일괄 알림 발송 중 오류 발생: ${getErrorMessage(err)}`);
+    }
+});
+
+/* =====================================================
+ * 📊 주간 요약 (관리자 주간요약 / 매주 월요일 오전 크론 때 관리자에게 자동 발송)
+ * ===================================================== */
+async function buildWeeklySummary(): Promise<string> {
+    const today = dayjs().tz('Asia/Seoul').startOf('day');
+    const todayStr = today.format('YYYY-MM-DD');
+    // 이번 주 월요일 ~ 일요일
+    const monday = today.subtract((today.day() + 6) % 7, 'day');
+    const weekDays = Array.from({ length: 7 }, (_, i) => monday.add(i, 'day').format('YYYY-MM-DD'));
+    const weekEnd = weekDays[6];
+    const weekAgo = today.subtract(7, 'day');
+
+    const chats = await getAllChats();
+    const active = chats.filter((c) => c.meeting_date !== '중단');
+
+    const meetingsThisWeek = active.filter((c) => weekDays.includes(c.meeting_date));
+    const stageThisWeek = active.filter((c) => {
+        const d = getStageDate(c.progress_note)?.format('YYYY-MM-DD');
+        return c.progress_stage && d && d >= weekDays[0] && d <= weekEnd;
+    });
+    const overdue = chats.filter((c) => isPastMeetingDate(c, todayStr) && !c.report_submitted);
+    const expired = chats.filter((c) => isPastMeetingDate(c, todayStr) && !isOtherDeptTeacher(c));
+    const undecided = chats.filter((c) => c.meeting_date === '미정');
+    const unassigned = chats.filter((c) => !c.meeting_date || c.meeting_date.trim() === '');
+    const newlyStopped = chats.filter(
+        (c) => c.meeting_date === '중단' && c.updated_at && dayjs(c.updated_at).isAfter(weekAgo)
+    );
+
+    let msg = `📊 <b>[주간 요약] ${dayjs(weekDays[0]).format('MM/DD')} ~ ${dayjs(weekEnd).format('MM/DD')}</b>\n`;
+    msg += `기준시각: ${dayjs().tz('Asia/Seoul').format('YYYY-MM-DD HH:mm')}\n`;
+    msg += `━━━━━━━━━━━━━━━━━━\n\n`;
+
+    msg += `🗓 <b>이번 주 만남 예정: ${meetingsThisWeek.length}건</b>\n`;
+    for (const day of weekDays) {
+        const n = meetingsThisWeek.filter((c) => c.meeting_date === day).length;
+        if (n) msg += `• ${dayjs(day).format('MM/DD')} (${'일월화수목금토'[dayjs(day).day()]}): ${n}건\n`;
+    }
+    const interviewN = meetingsThisWeek.filter((c) => c.meeting_type === '인터뷰').length;
+    msg += `  (인터뷰 ${interviewN} · 교사 ${meetingsThisWeek.length - interviewN})\n\n`;
+
+    msg += `🏷 <b>이번 주 진행 구분 목표일: ${stageThisWeek.length}건</b>\n`;
+    for (const c of sortByStageDateDesc(stageThisWeek).reverse()) {
+        msg += `• ${escapeHtml(c.progress_stage || '')} ${formatStageDate(c.progress_note)} · ${escapeHtml(
+            c.room_title || '대화방'
+        )}${c.matched_student_name ? ` (👤 ${escapeHtml(c.matched_student_name)})` : ''}\n`;
+    }
+    msg += `\n`;
+
+    msg += `⚠️ <b>확인 필요</b>\n`;
+    msg += `• 보고서 미제출: <b>${overdue.length}</b>건 (<code>관리자 미제출</code> · 독촉: <code>관리자 미제출 알림</code>)\n`;
+    msg += `• 만남일 경과 미갱신: <b>${expired.length}</b>건 (<code>관리자 미갱신</code> · 독촉: <code>관리자 미갱신 알림</code>)\n`;
+    msg += `• 일정 미정: <b>${undecided.length}</b>건 · 첫 만남일 미등록: <b>${unassigned.length}</b>건 (<code>관리자 미등록</code>)\n`;
+    msg += `• 최근 7일 중단: <b>${newlyStopped.length}</b>건 (<code>관리자 중단</code>)\n`;
+    return msg;
+}
+
+bot.hears(/^(?:[\/!]?관리자\s+)(주간\s*요약|주간\s*리포트|주간)$/i, async (ctx) => {
+    try {
+        if (!isAdmin(String(ctx.from?.id))) {
+            await ctx.reply('⛔ 접근 권한이 없습니다.', { parse_mode: 'HTML' });
+            return;
+        }
+        await replyLong(ctx, await buildWeeklySummary());
+    } catch (err: unknown) {
+        console.error('[주간 요약 에러]:', err);
+        await ctx.reply(`⚠️ 주간 요약 생성 중 오류 발생: ${getErrorMessage(err)}`);
+    }
+});
+
+// 월요일 오전 크론에서 호출: 관리자(ADMIN_IDS 개인 대화 또는 WEEKLY_REPORT_CHAT_ID)에게 주 1회 발송
+async function sendWeeklySummaryIfMonday() {
+    const today = dayjs().tz('Asia/Seoul');
+    if (today.day() !== 1) return;
+    const weekKey = today.format('YYYY-MM-DD');
+    const already = await neonPool.query(`SELECT value FROM bot_meta WHERE key = 'weekly_summary_sent'`);
+    if (already.rows[0]?.value === weekKey) return; // 같은 날 크론이 여러 번 호출돼도 한 번만
+
+    const targets = (process.env.WEEKLY_REPORT_CHAT_ID || '')
+        .split(',')
+        .map((v) => v.trim())
+        .filter(Boolean);
+    const recipients = targets.length ? targets : ADMIN_IDS;
+    if (recipients.length === 0) return;
+
+    const summary = await buildWeeklySummary();
+    for (const chatId of recipients) {
+        for (const part of splitLongMessage(summary)) {
+            await bot.telegram
+                .sendMessage(chatId, part, { parse_mode: 'HTML' })
+                .catch((err) => console.error(`[주간 요약 발송 실패] ${chatId}:`, getErrorMessage(err)));
+        }
+    }
+    await neonPool.query(
+        `INSERT INTO bot_meta (key, value) VALUES ('weekly_summary_sent', $1)
+         ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value`,
+        [weekKey]
+    );
+}
+
 // 10. 일반 텍스트 수신 (사전 보고서, 결과 보고서, 만남 보고서 및 #피드백 감지)
-bot.on('text', async (ctx) => {
-    const text = ctx.message.text.trim();
+// source: 'text' 일반 메시지 / 'edited' 수정된 메시지 / 'caption' 사진·파일 설명글
+async function handleIncomingText(ctx: any, rawText: string, source: 'text' | 'edited' | 'caption') {
+    const text = rawText.trim();
     const chatId = ctx.chat.id;
     const roomTitle = 'title' in ctx.chat ? ctx.chat.title : ctx.chat.first_name || '대화방';
 
@@ -2499,8 +2825,9 @@ bot.on('text', async (ctx) => {
                 const parsed = parseFlexibleDate(dateRaw);
                 if (parsed) formattedDate = parsed;
             }
+            const interviewTime = formattedDate === '미정' ? '' : parseFlexibleTime(stripDatePart(dateRaw));
 
-            await upsertMeetingDate(chatId, roomTitle, formattedDate);
+            await upsertMeetingDate(chatId, roomTitle, formattedDate, interviewTime);
 
             const patch: Partial<ChatRecord> = {
                 meeting_type: '인터뷰',
@@ -2525,7 +2852,9 @@ bot.on('text', async (ctx) => {
                       )})`
                     : '미지정'
             }\n`;
-            resMsg += `• <b>인터뷰 예정일</b>: <b>${formattedDate === '미정' ? '미정' : formatYmdWithDay(formattedDate)}</b>\n`;
+            resMsg += `• <b>인터뷰 예정일</b>: <b>${
+                formattedDate === '미정' ? '미정' : formatMeetingWhen(formatYmdWithDay(formattedDate), interviewTime)
+            }</b>\n`;
             if (formattedDate === '미정' && dateRaw && !dateRaw.includes('미정')) {
                 resMsg += `⚠️ 날짜(<code>${escapeHtml(dateRaw)}</code>)를 인식하지 못해 [미정]으로 등록했습니다. <code>/인터뷰일 MM-DD</code>로 다시 등록해주세요.\n`;
             } else if (formattedDate !== '미정') {
@@ -2595,7 +2924,8 @@ bot.on('text', async (ctx) => {
                 nextMeetingStr = nextDate;
             }
 
-            await upsertMeetingDate(chatId, roomTitle, nextMeetingStr);
+            const nextTime = nextMeetingStr === '미정' ? '' : parseFlexibleTime(stripDatePart(rawNextDate || ''));
+            await upsertMeetingDate(chatId, roomTitle, nextMeetingStr, nextTime);
             await updateChat(chatId, {
                 meeting_type: '교사',
                 follow_up_applied: '신청',
@@ -2608,7 +2938,9 @@ bot.on('text', async (ctx) => {
                 `🎉 <b>인터뷰 결과 보고서가 정상 반영되었습니다!</b>\n\n` +
                     `• <b>후속 신청</b>: <b>신청 완료 ✅</b>\n` +
                     `• <b>만남 단계</b>: <b>👨‍🏫 교사 만남</b>으로 자동 전환되었습니다.\n` +
-                    `• <b>다음 만남 예정일</b>: <b>${nextMeetingStr === '미정' ? '미정' : formatYmdWithDay(nextMeetingStr)}</b>\n` +
+                    `• <b>다음 만남 예정일</b>: <b>${
+                        nextMeetingStr === '미정' ? '미정' : formatMeetingWhen(formatYmdWithDay(nextMeetingStr), nextTime)
+                    }</b>\n` +
                     (nextMeetingStr === '미정' && rawNextDate && !isUndecided
                         ? `⚠️ 날짜(<code>${escapeHtml(rawNextDate)}</code>)를 인식하지 못해 [미정]으로 등록했습니다. <code>/만남일 MM-DD</code>로 다시 등록해주세요.\n`
                         : '') +
@@ -2689,9 +3021,13 @@ bot.on('text', async (ctx) => {
             return;
         }
 
-        await upsertMeetingDate(chatId, roomTitle, nextDate);
+        const nextTime = parseFlexibleTime(stripDatePart(rawNextDate || ''));
+        await upsertMeetingDate(chatId, roomTitle, nextDate, nextTime);
         await ctx.reply(
-            `✅ <b>만남 보고서가 정상 반영되었습니다.</b>\n다음 만남일이 <b>${formatYmdWithDay(nextDate)}</b>로 자동 갱신되었습니다.` +
+            `✅ <b>만남 보고서가 정상 반영되었습니다.</b>\n다음 만남일이 <b>${formatMeetingWhen(
+                formatYmdWithDay(nextDate),
+                nextTime
+            )}</b>로 자동 갱신되었습니다.` +
                 getWeekdayWarning(rawNextDate || '', nextDate) +
                 getPastDateWarning(nextDate),
             { parse_mode: 'HTML' }
@@ -2705,9 +3041,28 @@ bot.on('text', async (ctx) => {
         await ctx.reply('📝 <b>피드백 내용이 확인되었습니다.</b> 감사합니다.', { parse_mode: 'HTML' });
     }
     } catch (err: unknown) {
-        console.error('[텍스트 메시지 처리 에러]:', getErrorMessage(err));
+        console.error(`[텍스트 메시지 처리 에러] (${source}):`, getErrorMessage(err));
         await ctx.reply(`⚠️ 메시지 처리 중 오류가 발생했습니다: ${getErrorMessage(err)}`);
     }
+}
+
+bot.on('text', (ctx) => handleIncomingText(ctx, ctx.message.text, 'text'));
+
+// 보고서를 텔레그램에서 '수정'한 경우에도 다시 판정 (예: 빈 진행내용을 채워 넣음)
+bot.on('edited_message', async (ctx) => {
+    const msg: any = ctx.editedMessage;
+    const text: string | undefined = msg?.text ?? msg?.caption;
+    if (!text) return;
+    if (!isReportLikeText(text)) return; // 일반 대화 수정은 무시
+    await ctx.reply('✏️ <b>수정된 메시지를 다시 확인합니다.</b>', { parse_mode: 'HTML' });
+    await handleIncomingText(ctx, text, 'edited');
+});
+
+// 사진·파일에 설명글로 붙인 보고서 / #피드백도 인식
+bot.on(['photo', 'document', 'video'], async (ctx) => {
+    const caption: string | undefined = (ctx.message as any)?.caption;
+    if (!caption) return;
+    await handleIncomingText(ctx, caption, 'caption');
 });
 
 /* =====================================================
@@ -2767,7 +3122,7 @@ async function triggerMorningReminder() {
                     await bot.telegram.sendMessage(
                         chat.chat_id,
                         `🔔 <b>[D-1 인터뷰 만남 안내]</b>\n` +
-                            `내일(${mDate.format('MM/DD')})은 인터뷰 만남 예정일입니다.\n` +
+                            `내일(${formatMeetingWhen(mDate.format('MM/DD'), chat.meeting_time)})은 인터뷰 만남 예정일입니다.\n` +
                             `• 담당 인터뷰어: ${escapeHtml(chat.interviewer_info || '미등록')}\n` +
                             `• 타이퍼: ${escapeHtml(chat.typer_info || '미지정')}\n\n` +
                             `인터뷰 전 사전 준비사항과 대상자 상태를 점검해 주세요!`,
@@ -2777,7 +3132,7 @@ async function triggerMorningReminder() {
                     await bot.telegram.sendMessage(
                         chat.chat_id,
                         `🔔 <b>[D-1 만남 안내]</b>\n` +
-                            `내일(${mDate.format('MM/DD')})은 만남 예정일입니다.\n` +
+                            `내일(${formatMeetingWhen(mDate.format('MM/DD'), chat.meeting_time)})은 만남 예정일입니다.\n` +
                             `만남 전 <b>피드백 내용</b>을 <code>#피드백</code> 태그를 포함하여 작성해 주세요!`,
                         { parse_mode: 'HTML' }
                     );
@@ -2897,11 +3252,23 @@ const server = http.createServer(async (req, res) => {
 
     // DB 오류 등으로 알림이 실패해도 서버가 죽지 않고 500으로 응답 (크론 쪽에서 실패 확인 가능)
     const cronJobs: Record<string, [() => Promise<void>, string]> = {
-        '/cron-10am': [triggerMorningReminder, 'Morning reminder executed'],
+        '/cron-10am': [
+            async () => {
+                await triggerMorningReminder();
+                await sendWeeklySummaryIfMonday();
+            },
+            'Morning reminder executed',
+        ],
         '/cron-10pm': [triggerNightReminder, 'Night reminder executed'],
     };
     const cron = cronJobs[url.pathname];
     if (cron) {
+        // CRON_SECRET이 설정되어 있으면 ?key=비밀값 이 맞아야 실행 (주소만 알아도 누구나 실행하는 것 방지)
+        const cronSecret = process.env.CRON_SECRET;
+        if (cronSecret && url.searchParams.get('key') !== cronSecret) {
+            res.writeHead(403, { 'Content-Type': 'text/plain; charset=utf-8' });
+            return res.end('Forbidden');
+        }
         try {
             await cron[0]();
             res.writeHead(200, { 'Content-Type': 'text/plain; charset=utf-8' });
@@ -2927,7 +3294,10 @@ server.listen(PORT, async () => {
 
     const webhookUrl = 'https://teacherfollow.alwaysdata.net/webhook';
     try {
-        await bot.telegram.setWebhook(webhookUrl);
+        // 수정된 메시지(edited_message)도 받도록 명시 — 지정하지 않으면 이전 설정이 유지됨
+        await bot.telegram.setWebhook(webhookUrl, {
+            allowed_updates: ['message', 'edited_message', 'callback_query', 'my_chat_member'],
+        });
         console.log(`Telegram Webhook 등록 완료: ${webhookUrl}`);
     } catch (e: unknown) {
         console.error('Webhook 등록 에러:', getErrorMessage(e));
