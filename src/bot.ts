@@ -372,44 +372,73 @@ async function updateChat(chatId: string | number, patch: Partial<ChatRecord>) {
 /* =====================================================
  * 🔍 날짜 파싱 유틸리티
  * ===================================================== */
+// 입력 문자열에서 날짜를 찾아 'YYYY-MM-DD'로 변환 (실패 시 null)
+// 지원: 10.8(월), 10/8, 10-08, 10월 8일, 2026.10.8, 26.10.8, 오늘/내일/모레
 function parseFlexibleDate(rawText: string): string | null {
     if (!rawText) return null;
-    const now = dayjs().tz('Asia/Seoul');
+    // 전각 숫자·기호(１０．８ 등) → 반각
+    const text = rawText.normalize('NFKC');
+    const today = dayjs().tz('Asia/Seoul').startOf('day');
 
-    const threeParts = rawText.match(/(?:^|[^\d])(\d{1,4})[\-\/\.\s년]+(\d{1,2})[\-\/\.\s월]+(\d{1,2})(?:일)?/);
-    if (threeParts) {
-        const p1 = parseInt(threeParts[1], 10);
-        const month = parseInt(threeParts[2], 10);
-        const day = parseInt(threeParts[3], 10);
+    const toYmd = (year: number, month: number, day: number): string | null => {
+        const str = `${year}-${String(month).padStart(2, '0')}-${String(day).padStart(2, '0')}`;
+        return dayjs(str, 'YYYY-MM-DD', true).isValid() ? str : null; // 2/30 같은 없는 날짜는 거부
+    };
 
-        if (month >= 1 && month <= 12 && day >= 1 && day <= 31) {
-            let year = now.year();
-            if (threeParts[1].length === 4) {
-                year = p1;
-            } else {
-                if (now.month() === 11 && month === 1) year += 1;
-            }
-
-            const d = dayjs(`${year}-${String(month).padStart(2, '0')}-${String(day).padStart(2, '0')}`);
-            return d.isValid() ? d.format('YYYY-MM-DD') : null;
-        }
+    // 연도 포함: 2026.10.8 / 2026년 10월 8일 / 26.10.8 (두 자리 연도는 13 이상일 때만 연도로 인정 → 10.8 14시 오인 방지)
+    const withYear = text.match(/(?:^|[^\d])(\d{4}|\d{2})\s*[\-\/\.년]\s*(\d{1,2})\s*[\-\/\.월]\s*(\d{1,2})(?!\d)/);
+    if (withYear && (withYear[1].length === 4 || parseInt(withYear[1], 10) > 12)) {
+        const year = withYear[1].length === 4 ? parseInt(withYear[1], 10) : 2000 + parseInt(withYear[1], 10);
+        const ymd = toYmd(year, parseInt(withYear[2], 10), parseInt(withYear[3], 10));
+        if (ymd) return ymd;
     }
 
-    const twoParts = rawText.match(/(?:^|[^\d])(\d{1,2})[\-\/\.\s월]+(\d{1,2})(?:일)?/);
-    if (twoParts) {
-        const month = parseInt(twoParts[1], 10);
-        const day = parseInt(twoParts[2], 10);
-
-        if (month >= 1 && month <= 12 && day >= 1 && day <= 31) {
-            let year = now.year();
-            if (now.month() === 11 && month === 1) year += 1;
-
-            const d = dayjs(`${year}-${String(month).padStart(2, '0')}-${String(day).padStart(2, '0')}`);
-            return d.isValid() ? d.format('YYYY-MM-DD') : null;
+    // 월·일만: 10.8 / 10/8 / 10-08 / 10월 8일 (뒤의 시간·요일은 무시)
+    const monthDay = text.match(/(?:^|[^\d])(\d{1,2})\s*[\-\/\.월]\s*(\d{1,2})(?!\d)/);
+    if (monthDay) {
+        const month = parseInt(monthDay[1], 10);
+        const day = parseInt(monthDay[2], 10);
+        // 연도 생략 시 오늘 기준 ±6개월 안에 들어오는 해로 결정 (12월에 1월 입력 → 내년, 1월에 12월 입력 → 작년)
+        for (const year of [today.year(), today.year() + 1, today.year() - 1]) {
+            const ymd = toYmd(year, month, day);
+            if (!ymd) continue;
+            const diff = dayjs(ymd).diff(dayjs(today.format('YYYY-MM-DD')), 'day');
+            if (diff >= -183 && diff <= 183) return ymd;
         }
+        return toYmd(today.year(), month, day);
+    }
+
+    const relative = text.match(/오늘|내일|모레/);
+    if (relative) {
+        const offset = { 오늘: 0, 내일: 1, 모레: 2 }[relative[0] as '오늘' | '내일' | '모레'];
+        return today.add(offset, 'day').format('YYYY-MM-DD');
     }
 
     return null;
+}
+
+// 입력한 요일이 실제 날짜의 요일과 다르면 안내 문구 반환 (예: 10.8(월) 인데 10/8이 목요일)
+function getWeekdayWarning(rawText: string, ymd: string): string {
+    const text = rawText.normalize('NFKC');
+    const m = text.match(/\(\s*([월화수목금토일])(?:요일)?\s*\)|([월화수목금토일])요일/);
+    if (!m) return '';
+    const written = m[1] || m[2];
+    const actual = '일월화수목금토'[dayjs(ymd).day()];
+    return written === actual
+        ? ''
+        : `\n\n⚠️ 입력한 요일(${written})과 실제 요일이 다릅니다: <b>${ymd} (${actual})</b>\n날짜가 틀렸다면 다시 입력해주세요.`;
+}
+
+// 지난 날짜면 안내 문구 반환
+function getPastDateWarning(ymd: string): string {
+    const todayStr = dayjs().tz('Asia/Seoul').format('YYYY-MM-DD');
+    return ymd < todayStr ? `\n\n⚠️ <b>이미 지난 날짜</b>입니다 (${ymd}). 잘못 입력했다면 다시 입력해주세요.` : '';
+}
+
+// 날짜 + 요일 표시 (예: 2026-10-08 (목))
+function formatYmdWithDay(ymd: string): string {
+    const d = dayjs(ymd);
+    return d.isValid() ? `${ymd} (${'일월화수목금토'[d.day()]})` : ymd;
 }
 
 // 진행 구분 예정일 (progress_note에 'YYYY-MM-DD'로 저장) — 날짜가 아니면 null
@@ -485,8 +514,23 @@ function isBlankReportField(value: string | null): boolean {
     return stripped.length === 0;
 }
 
+// 보고서의 '다음만남일' 값 추출
+// 1순위: 줄 맨 앞(기호·이모지 뒤)에 있는 라벨 줄 — 본문 속 "다음 만남 때 ~" 같은 문장 오인 방지
+//        라벨 뒤가 비어 있으면 바로 아래 줄에 적은 날짜/미정을 사용
+// 2순위: 기존 방식 (문장 어디든 첫 번째 '다음 만남 …')
 function extractNextMeetingRaw(text: string): string | null {
-    const match = text.match(/다음\s*(?:만남일시|만남\s*일시|만남일|만남\s*일|만남|일정)\s*[:：\-]?\s*([^\n\r]+)/i);
+    const lines = text.split(/\r?\n/);
+    const labelRe = /^[^가-힣\d]*다음\s*(?:만남\s*(?:일시|일자|예정일|일)?|일정)\s*[:：\-]?\s*(.*)$/;
+    for (let i = 0; i < lines.length; i++) {
+        const m = lines[i].match(labelRe);
+        if (!m) continue;
+        const rest = m[1].trim();
+        if (rest) return rest;
+        const next = lines.slice(i + 1).find((l) => l.trim() !== '');
+        if (next && (parseFlexibleDate(next) || next.includes('미정'))) return next.trim();
+        return null;
+    }
+    const match = text.match(/다음[ \t]*(?:만남일시|만남[ \t]*일시|만남일|만남[ \t]*일|만남|일정)[ \t]*[:：\-]?[ \t]*([^\n\r]+)/i);
     return match && match[1] ? match[1].trim() : null;
 }
 
@@ -653,6 +697,8 @@ bot.hears(/^[\/!](start|help|도움말)(?:@\w+)?$/i, async (ctx) => {
             '<b>4. 방 진행 단계 (특수 구분)</b>\n' +
             '• <b>단계 설정</b>: <code>/섭등목표 MM-DD</code>, <code>/예정목표 MM-DD</code>, <code>/가능목표 MM-DD</code>, <code>/확정목표 MM-DD</code> (날짜만 입력)\n' +
             '• <b>단계 해제</b>: <code>/구분해제</code> (일반 상태로 복귀)\n\n' +
+            '📅 <b>날짜 입력 형식</b>: <code>10-08</code>, <code>10/8</code>, <code>10.8(목)</code>, <code>10월 8일</code>, <code>2026.10.8</code>, <code>내일</code>\n' +
+            '   <i>(요일이 실제와 다르거나 지난 날짜면 안내해 드립니다)</i>\n\n' +
             '👑 <b>관리자 전용 명령어</b>\n' +
             '• <b>인터뷰 예정건 모아보기</b>: <code>관리자 인터뷰</code>\n' +
             '• <b>교사 만남 진행건 모아보기</b>: <code>관리자 교사</code>\n' +
@@ -1028,7 +1074,7 @@ bot.hears(/^[\/!](타이퍼|타이퍼수정|타이퍼변경)(?:@\w+)?(?:\s+(.+))
 });
 
 // 인터뷰 예정일 개별 수정 (/인터뷰일 [MM-DD])
-bot.hears(/^[\/!](인터뷰일|인터뷰일자|인터뷰일정)(?:@\w+)?(?:\s+(.+))?$/i, async (ctx) => {
+bot.hears(/^[\/!](인터뷰일|인터뷰일자|인터뷰일정)(?:@\w+)?(?:(?:\s+|(?=\d))([\s\S]+))?$/i, async (ctx) => {
     const rawInput = ctx.match[2]?.trim();
     if (!rawInput) {
         await ctx.reply('⚠️ 날짜를 입력해주세요.\n예: <code>/인터뷰일 10-12</code> 또는 <code>/인터뷰일 미정</code>', {
@@ -1049,14 +1095,22 @@ bot.hears(/^[\/!](인터뷰일|인터뷰일자|인터뷰일정)(?:@\w+)?(?:\s+(.
 
         const formatted = parseFlexibleDate(rawInput);
         if (!formatted) {
-            await ctx.reply('⚠️ 올바른 날짜 형식이 아닙니다. (예: 10-12, 10/12, 2026-10-12)');
+            await ctx.reply(
+                `⚠️ 올바른 날짜 형식이 아닙니다. (예: 10-12, 10/12, 10.12(월), 10월 12일, 2026-10-12)\n` +
+                    `❌ 인식하지 못한 입력: ${rawInput}`
+            );
             return;
         }
 
         await upsertMeetingDate(ctx.chat.id, title, formatted);
         await updateChat(ctx.chat.id, { meeting_type: '인터뷰', interview_date: formatted });
 
-        await ctx.reply(`🎙️ <b>인터뷰 예정일이 [${formatted}]로 변경되었습니다!</b>`, { parse_mode: 'HTML' });
+        await ctx.reply(
+            `🎙️ <b>인터뷰 예정일이 [${formatYmdWithDay(formatted)}]로 변경되었습니다!</b>` +
+                getWeekdayWarning(rawInput, formatted) +
+                getPastDateWarning(formatted),
+            { parse_mode: 'HTML' }
+        );
     } catch (err: unknown) {
         console.error('[/인터뷰일 수정 에러]:', getErrorMessage(err));
         await ctx.reply(`⚠️ 인터뷰 일정 수정 중 오류 발생: ${getErrorMessage(err)}`);
@@ -1457,7 +1511,7 @@ bot.action(/^fu:(\w+)$/, async (ctx) => {
 });
 
 // 만남일 수동 설정 (/만남일 MM-DD, 만남일 미정 등)
-bot.hears(/^[\/!]만남일(?:@\w+)?(?:\s+(.+))?$/i, async (ctx) => {
+bot.hears(/^[\/!]만남일(?:@\w+)?(?:(?:\s+|(?=\d))([\s\S]+))?$/i, async (ctx) => {
     const rawInput = ctx.match[1]?.trim();
     if (!rawInput) {
         await ctx.reply(
@@ -1484,17 +1538,22 @@ bot.hears(/^[\/!]만남일(?:@\w+)?(?:\s+(.+))?$/i, async (ctx) => {
 
         const formatted = parseFlexibleDate(rawInput);
         if (!formatted) {
-            await ctx.reply('⚠️ 올바른 날짜 형식이 아닙니다. (예: 09-24, 9/24, 2026-09-24, 또는 미정)');
+            await ctx.reply(
+                `⚠️ 올바른 날짜 형식이 아닙니다. (예: 09-24, 9/24, 9.24(수), 9월 24일, 2026-09-24, 또는 미정)\n` +
+                    `❌ 인식하지 못한 입력: ${rawInput}`
+            );
             return;
         }
 
         await upsertMeetingDate(ctx.chat.id, title, formatted);
 
         await ctx.reply(
-            `🗓 만남일이 <b>${formatted}</b>로 등록되었습니다.\n\n` +
+            `🗓 만남일이 <b>${formatYmdWithDay(formatted)}</b>로 등록되었습니다.\n\n` +
                 `• <b>만남 전날 (10:00)</b>: 피드백(#피드백) 등록 요청 알림\n` +
                 `• <b>만남 당일 (22:00)</b>: 만남 보고서 등록 알림\n` +
-                `• <b>미제출 시</b>: 1일/2일 경과 경고 알림`,
+                `• <b>미제출 시</b>: 1일/2일 경과 경고 알림` +
+                getWeekdayWarning(rawInput, formatted) +
+                getPastDateWarning(formatted),
             { parse_mode: 'HTML' }
         );
     } catch (err: unknown) {
@@ -1504,7 +1563,7 @@ bot.hears(/^[\/!]만남일(?:@\w+)?(?:\s+(.+))?$/i, async (ctx) => {
 });
 
 // 방 구분 설정 (/섭등목표, /예정목표, /가능목표, /확정목표 MM-DD) — 날짜만 허용
-bot.hears(new RegExp(`^[\\/!](${STAGE_COMMAND_ALT})(?:@\\w+)?(?:\\s+(.+))?$`, 'i'), async (ctx) => {
+bot.hears(new RegExp(`^[\\/!](${STAGE_COMMAND_ALT})(?:@\\w+)?(?:(?:\\s+|(?=\\d))([\\s\\S]+))?$`, 'i'), async (ctx) => {
     const stage = normalizeStage(ctx.match[1]);
     const rawDate = ctx.match[2]?.trim() || '';
     const stageDate = parseFlexibleDate(rawDate);
@@ -1531,6 +1590,7 @@ bot.hears(new RegExp(`^[\\/!](${STAGE_COMMAND_ALT})(?:@\\w+)?(?:\\s+(.+))?$`, 'i
         let replyMsg = `📌 <b>대화방 구분이 [${stage}]으로 설정되었습니다.</b>\n`;
         replyMsg += `• ${stage}일: <b>${formatStageDate(stageDate)}</b>\n`;
         replyMsg += `\n💡 일반 상태로 복귀하려면 <code>/구분해제</code>를 입력하세요.`;
+        replyMsg += getWeekdayWarning(rawDate, stageDate) + getPastDateWarning(stageDate);
 
         await ctx.reply(replyMsg, { parse_mode: 'HTML' });
     } catch (err: unknown) {
@@ -2465,7 +2525,13 @@ bot.on('text', async (ctx) => {
                       )})`
                     : '미지정'
             }\n`;
-            resMsg += `• <b>인터뷰 예정일</b>: <b>${formattedDate}</b>\n\n`;
+            resMsg += `• <b>인터뷰 예정일</b>: <b>${formattedDate === '미정' ? '미정' : formatYmdWithDay(formattedDate)}</b>\n`;
+            if (formattedDate === '미정' && dateRaw && !dateRaw.includes('미정')) {
+                resMsg += `⚠️ 날짜(<code>${escapeHtml(dateRaw)}</code>)를 인식하지 못해 [미정]으로 등록했습니다. <code>/인터뷰일 MM-DD</code>로 다시 등록해주세요.\n`;
+            } else if (formattedDate !== '미정') {
+                resMsg += getWeekdayWarning(dateRaw, formattedDate).trimStart() + getPastDateWarning(formattedDate);
+            }
+            resMsg += `\n`;
             resMsg += `• <b>D-1 알림 (10:00)</b>: 인터뷰 안내 알림\n`;
             resMsg += `• <b>당일 알림 (22:00)</b>: 결과 보고서 등록 알림\n\n`;
             resMsg += `💡 개별 수정: <code>/인터뷰어</code>, <code>/타이퍼</code>, <code>/인터뷰일</code>`;
@@ -2542,7 +2608,11 @@ bot.on('text', async (ctx) => {
                 `🎉 <b>인터뷰 결과 보고서가 정상 반영되었습니다!</b>\n\n` +
                     `• <b>후속 신청</b>: <b>신청 완료 ✅</b>\n` +
                     `• <b>만남 단계</b>: <b>👨‍🏫 교사 만남</b>으로 자동 전환되었습니다.\n` +
-                    `• <b>다음 만남 예정일</b>: <b>${nextMeetingStr}</b>\n\n` +
+                    `• <b>다음 만남 예정일</b>: <b>${nextMeetingStr === '미정' ? '미정' : formatYmdWithDay(nextMeetingStr)}</b>\n` +
+                    (nextMeetingStr === '미정' && rawNextDate && !isUndecided
+                        ? `⚠️ 날짜(<code>${escapeHtml(rawNextDate)}</code>)를 인식하지 못해 [미정]으로 등록했습니다. <code>/만남일 MM-DD</code>로 다시 등록해주세요.\n`
+                        : '') +
+                    `\n` +
                     `앞으로 교사 만남 주기(D-1 피드백, 당일 만남보고서)에 맞춰 자동 관리됩니다.`,
                 { parse_mode: 'HTML' }
             );
@@ -2612,6 +2682,7 @@ bot.on('text', async (ctx) => {
             await updateChat(chatId, { report_submitted: 1 });
             await ctx.reply(
                 '⚠️ 만남 보고서는 확인되었으나 <b>다음만남일</b> 날짜를 인식하지 못했습니다.\n' +
+                    (rawNextDate ? `❌ 인식하지 못한 입력: ${escapeHtml(rawNextDate)}\n` : '') +
                     '<code>/만남일 MM-DD</code> 또는 <code>/만남일 미정</code>으로 일정을 등록해주세요.',
                 { parse_mode: 'HTML' }
             );
@@ -2620,7 +2691,9 @@ bot.on('text', async (ctx) => {
 
         await upsertMeetingDate(chatId, roomTitle, nextDate);
         await ctx.reply(
-            `✅ <b>만남 보고서가 정상 반영되었습니다.</b>\n다음 만남일이 <b>${nextDate}</b>로 자동 갱신되었습니다.`,
+            `✅ <b>만남 보고서가 정상 반영되었습니다.</b>\n다음 만남일이 <b>${formatYmdWithDay(nextDate)}</b>로 자동 갱신되었습니다.` +
+                getWeekdayWarning(rawNextDate || '', nextDate) +
+                getPastDateWarning(nextDate),
             { parse_mode: 'HTML' }
         );
         return;
@@ -2822,16 +2895,22 @@ const server = http.createServer(async (req, res) => {
         return bot.webhookCallback('/webhook')(req, res);
     }
 
-    if (url.pathname === '/cron-10am') {
-        await triggerMorningReminder();
-        res.writeHead(200, { 'Content-Type': 'text/plain; charset=utf-8' });
-        return res.end('Morning reminder executed');
-    }
-
-    if (url.pathname === '/cron-10pm') {
-        await triggerNightReminder();
-        res.writeHead(200, { 'Content-Type': 'text/plain; charset=utf-8' });
-        return res.end('Night reminder executed');
+    // DB 오류 등으로 알림이 실패해도 서버가 죽지 않고 500으로 응답 (크론 쪽에서 실패 확인 가능)
+    const cronJobs: Record<string, [() => Promise<void>, string]> = {
+        '/cron-10am': [triggerMorningReminder, 'Morning reminder executed'],
+        '/cron-10pm': [triggerNightReminder, 'Night reminder executed'],
+    };
+    const cron = cronJobs[url.pathname];
+    if (cron) {
+        try {
+            await cron[0]();
+            res.writeHead(200, { 'Content-Type': 'text/plain; charset=utf-8' });
+            return res.end(cron[1]);
+        } catch (err: unknown) {
+            console.error(`[${url.pathname} 실행 에러]:`, getErrorMessage(err));
+            res.writeHead(500, { 'Content-Type': 'text/plain; charset=utf-8' });
+            return res.end(`Reminder failed: ${getErrorMessage(err)}`);
+        }
     }
 
     res.writeHead(200, { 'Content-Type': 'text/plain; charset=utf-8' });
