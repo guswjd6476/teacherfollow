@@ -39,6 +39,41 @@ neonPool.on('error', (err: unknown) => {
 
 // DB 스키마 컬럼 자동 추가
 async function initDb() {
+    // 사용 인증 테이블 — 다른 점검이 실패해도 인증은 동작하도록 먼저 따로 처리
+    try {
+        await neonPool.query(`
+            CREATE TABLE IF NOT EXISTS verified_users (
+                user_id TEXT PRIMARY KEY,
+                name TEXT,
+                username TEXT,
+                status VARCHAR(20) NOT NULL DEFAULT 'pending',
+                requested_at TIMESTAMPTZ DEFAULT NOW(),
+                decided_at TIMESTAMPTZ,
+                decided_by TEXT
+            );
+            CREATE TABLE IF NOT EXISTS authorized_chats (
+                chat_id TEXT PRIMARY KEY,
+                authorized_by TEXT,
+                authorized_at TIMESTAMPTZ DEFAULT NOW()
+            );
+            CREATE TABLE IF NOT EXISTS bot_meta (key TEXT PRIMARY KEY, value TEXT);
+        `);
+
+        // 인증 기능 도입 전부터 쓰던 방은 그대로 사용 가능하도록 1회 이전
+        const migrated = await neonPool.query(`SELECT 1 FROM bot_meta WHERE key = 'auth_chats_migrated'`);
+        if (migrated.rows.length === 0) {
+            const res = await neonPool.query(`
+                INSERT INTO authorized_chats (chat_id, authorized_by)
+                SELECT chat_id::text, 'migration' FROM counseling_chats
+                ON CONFLICT (chat_id) DO NOTHING;
+            `);
+            await neonPool.query(`INSERT INTO bot_meta (key, value) VALUES ('auth_chats_migrated', NOW()::text);`);
+            console.log(`✅ [DB 점검] 기존 방 ${res.rowCount}개를 인증된 방으로 이전`);
+        }
+    } catch (err: unknown) {
+        console.error('⚠️ [인증 테이블 점검 경고]:', getErrorMessage(err));
+    }
+
     try {
         await neonPool.query(`
             ALTER TABLE counseling_chats 
@@ -700,6 +735,260 @@ bot.catch((err: unknown, ctx) => {
     console.error(`[Telegraf 처리 에러] Chat ID: ${ctx.chat?.id}`, err);
 });
 
+/* =====================================================
+ * 🔐 사용 인증
+ * - 사람: 봇 개인 대화에서 /start → [인증 요청] → 관리자 승인 (1회)
+ * - 방: 인증된 사람(또는 관리자)이 초대한 방만 사용 가능, 그 외에는 안내 후 자동 퇴장
+ * ===================================================== */
+async function getUserAuthStatus(userId?: number | string): Promise<string | null> {
+    if (!userId) return null;
+    if (isAdmin(userId)) return 'approved';
+    const res = await neonPool.query(`SELECT status FROM verified_users WHERE user_id = $1`, [String(userId)]);
+    return res.rows[0]?.status ?? null;
+}
+
+async function isVerifiedUser(userId?: number | string): Promise<boolean> {
+    return (await getUserAuthStatus(userId)) === 'approved';
+}
+
+async function isAuthorizedChat(chatId: number | string): Promise<boolean> {
+    const res = await neonPool.query(`SELECT 1 FROM authorized_chats WHERE chat_id = $1`, [String(chatId)]);
+    return res.rows.length > 0;
+}
+
+async function authorizeChat(chatId: number | string, byUserId: number | string) {
+    await neonPool.query(
+        `INSERT INTO authorized_chats (chat_id, authorized_by) VALUES ($1, $2) ON CONFLICT (chat_id) DO NOTHING;`,
+        [String(chatId), String(byUserId)]
+    );
+}
+
+function displayName(user: { first_name?: string; last_name?: string; username?: string }): string {
+    const name = [user.first_name, user.last_name].filter(Boolean).join(' ') || '이름 없음';
+    return user.username ? `${name} (@${user.username})` : name;
+}
+
+const AUTH_REQUEST_KEYBOARD = {
+    reply_markup: { inline_keyboard: [[{ text: '🔐 인증 요청하기', callback_data: 'auth_request' }]] },
+};
+
+bot.use(async (ctx, next) => {
+    const chat = ctx.chat;
+    // 봇 초대/퇴장 이벤트는 my_chat_member 핸들러에서 초대한 사람을 직접 확인
+    if (!chat || ctx.myChatMember) return next();
+
+    if (chat.type === 'private') {
+        const status = await getUserAuthStatus(ctx.from?.id);
+        if (status === 'approved') return next();
+
+        const data = ctx.callbackQuery && 'data' in ctx.callbackQuery ? ctx.callbackQuery.data : '';
+        if (data === 'auth_request') return handleAuthRequest(ctx);
+        if (ctx.callbackQuery) return ctx.answerCbQuery('🔒 인증 후 사용할 수 있습니다.');
+
+        if (ctx.message) {
+            if (status === 'pending') {
+                await ctx.reply('⏳ 인증 요청이 접수되어 관리자 승인을 기다리고 있습니다. 승인되면 알려드릴게요.');
+            } else if (status === 'rejected') {
+                await ctx.reply('⛔ 사용 권한이 없습니다. 필요하시면 관리자에게 문의해주세요.');
+            } else {
+                await ctx.reply(
+                    '🔒 <b>이 봇은 인증된 사용자만 사용할 수 있습니다.</b>\n\n' +
+                        '아래 버튼을 눌러 인증을 요청해주세요. 관리자가 승인하면 바로 사용할 수 있습니다.\n' +
+                        '<i>(인증은 처음 한 번만 하면 됩니다)</i>',
+                    { parse_mode: 'HTML', ...AUTH_REQUEST_KEYBOARD }
+                );
+            }
+        }
+        return;
+    }
+
+    const message = ctx.message as Record<string, any> | undefined;
+    if (await isAuthorizedChat(chat.id)) {
+        // 일반 그룹이 슈퍼그룹으로 바뀌면 방 ID가 바뀌므로 인증을 새 ID로 이어받음
+        if (message?.migrate_to_chat_id) await authorizeChat(message.migrate_to_chat_id, 'migration');
+        return next();
+    }
+    if (message?.migrate_from_chat_id && (await isAuthorizedChat(message.migrate_from_chat_id))) {
+        await authorizeChat(chat.id, 'migration');
+        return next();
+    }
+    // 인증되지 않은 방의 메시지는 무시
+});
+
+async function handleAuthRequest(ctx: any) {
+    await ctx.answerCbQuery();
+    const from = ctx.from;
+    const userId = String(from.id);
+
+    const status = await getUserAuthStatus(userId);
+    if (status === 'pending') {
+        await ctx.reply('⏳ 이미 인증 요청이 접수되어 있습니다. 관리자 승인을 기다려주세요.');
+        return;
+    }
+    if (status === 'rejected') {
+        await ctx.reply('⛔ 사용 권한이 없습니다. 필요하시면 관리자에게 문의해주세요.');
+        return;
+    }
+
+    const name = [from.first_name, from.last_name].filter(Boolean).join(' ');
+    await neonPool.query(
+        `INSERT INTO verified_users (user_id, name, username, status, requested_at)
+         VALUES ($1, $2, $3, 'pending', NOW())
+         ON CONFLICT (user_id) DO UPDATE SET name = EXCLUDED.name, username = EXCLUDED.username,
+             status = 'pending', requested_at = NOW();`,
+        [userId, name, from.username || null]
+    );
+
+    let delivered = 0;
+    for (const adminId of ADMIN_IDS) {
+        try {
+            await bot.telegram.sendMessage(
+                adminId,
+                '🔐 <b>[봇 사용 인증 요청]</b>\n\n' +
+                    `• 이름: <b>${escapeHtml(displayName(from))}</b>\n` +
+                    `• 텔레그램 ID: <code>${userId}</code>\n\n` +
+                    '승인하면 이 사람이 봇을 사용하고 방에 초대할 수 있습니다.',
+                {
+                    parse_mode: 'HTML',
+                    reply_markup: {
+                        inline_keyboard: [
+                            [
+                                { text: '✅ 승인', callback_data: `auth_ok:${userId}` },
+                                { text: '❌ 거절', callback_data: `auth_no:${userId}` },
+                            ],
+                        ],
+                    },
+                }
+            );
+            delivered++;
+        } catch (err: unknown) {
+            // 관리자가 봇과 개인 대화를 시작하지 않았으면 보낼 수 없음
+            console.error(`[인증 요청 알림 실패] Admin: ${adminId}`, getErrorMessage(err));
+        }
+    }
+
+    await ctx.reply(
+        delivered > 0
+            ? '📨 인증 요청을 보냈습니다. 관리자가 승인하면 알려드릴게요.'
+            : '📨 인증 요청이 접수되었습니다. 관리자에게 승인을 요청해주세요.'
+    );
+}
+
+// 관리자: 인증 요청 승인/거절 버튼
+bot.action(/^auth_(ok|no):(\d+)$/, async (ctx) => {
+    if (!isAdmin(ctx.from?.id)) {
+        await ctx.answerCbQuery('⛔ 관리자만 처리할 수 있습니다.');
+        return;
+    }
+    const approved = ctx.match[1] === 'ok';
+    const userId = ctx.match[2];
+
+    const res = await neonPool.query(
+        `UPDATE verified_users SET status = $2, decided_at = NOW(), decided_by = $3
+         WHERE user_id = $1 AND status = 'pending'
+         RETURNING name, username;`,
+        [userId, approved ? 'approved' : 'rejected', String(ctx.from?.id)]
+    );
+
+    if (!res.rowCount) {
+        await ctx.answerCbQuery('이미 처리된 요청입니다.');
+        await ctx.editMessageReplyMarkup(undefined).catch(() => {});
+        return;
+    }
+
+    const user = res.rows[0];
+    await ctx.answerCbQuery(approved ? '승인했습니다.' : '거절했습니다.');
+    await ctx
+        .editMessageText(
+            `🔐 <b>[봇 사용 인증 요청]</b>\n\n` +
+                `• 이름: <b>${escapeHtml(displayName({ first_name: user.name, username: user.username }))}</b>\n` +
+                `• 텔레그램 ID: <code>${userId}</code>\n\n` +
+                (approved ? '✅ <b>승인 완료</b>' : '❌ <b>거절됨</b>') +
+                ` (처리: ${escapeHtml(displayName(ctx.from))})`,
+            { parse_mode: 'HTML' }
+        )
+        .catch(() => {});
+
+    try {
+        await bot.telegram.sendMessage(
+            userId,
+            approved
+                ? '✅ <b>인증이 승인되었습니다!</b>\n\n이제 상담방에 봇을 초대해서 사용할 수 있습니다. 사용법은 /도움말 을 입력하세요.'
+                : '⛔ 인증 요청이 거절되었습니다. 필요하시면 관리자에게 문의해주세요.',
+            { parse_mode: 'HTML' }
+        );
+    } catch (err: unknown) {
+        console.error(`[인증 결과 알림 실패] User: ${userId}`, getErrorMessage(err));
+    }
+});
+
+// 관리자: 인증 사용자 목록 (관리자 인증목록)
+bot.hears(/^(?:[\/!]?관리자\s+)(인증\s*목록|인증\s*현황|인증)$/i, async (ctx) => {
+    try {
+        if (!isAdmin(ctx.from?.id)) {
+            await ctx.reply('⛔ 접근 권한이 없습니다.', { parse_mode: 'HTML' });
+            return;
+        }
+
+        const res = await neonPool.query(
+            `SELECT user_id, name, username, status FROM verified_users
+             ORDER BY CASE status WHEN 'pending' THEN 0 WHEN 'approved' THEN 1 ELSE 2 END, requested_at DESC;`
+        );
+        if (res.rows.length === 0) {
+            await ctx.reply('ℹ️ 인증 요청한 사용자가 아직 없습니다.');
+            return;
+        }
+
+        const label: Record<string, string> = { pending: '⏳ 대기', approved: '✅ 승인', rejected: '⛔ 차단' };
+        const header =
+            `🔐 <b>[봇 사용 인증 현황] (총 ${res.rows.length}명)</b>\n` +
+            `<i>해제: <code>관리자 인증해제 ID</code> · 승인: <code>관리자 인증승인 ID</code></i>\n` +
+            `━━━━━━━━━━━━━━━━━━\n\n`;
+
+        await sendChunkedList(ctx, header, res.rows, (u: Record<string, any>, idx) =>
+            `${idx}. ${label[u.status] || u.status} <b>${escapeHtml(
+                displayName({ first_name: u.name, username: u.username })
+            )}</b> · <code>${escapeHtml(u.user_id)}</code>\n`
+        );
+    } catch (err: unknown) {
+        console.error('[인증 목록 조회 에러]:', err);
+        await ctx.reply(`⚠️ 인증 목록 조회 중 오류 발생: ${getErrorMessage(err)}`);
+    }
+});
+
+// 관리자: 인증 해제/승인 (관리자 인증해제 ID, 관리자 인증승인 ID)
+bot.hears(/^(?:[\/!]?관리자\s+)인증\s*(해제|승인)\s+(\d+)$/i, async (ctx) => {
+    try {
+        if (!isAdmin(ctx.from?.id)) {
+            await ctx.reply('⛔ 접근 권한이 없습니다.', { parse_mode: 'HTML' });
+            return;
+        }
+        const approve = ctx.match[1] === '승인';
+        const userId = ctx.match[2];
+
+        const res = await neonPool.query(
+            `UPDATE verified_users SET status = $2, decided_at = NOW(), decided_by = $3
+             WHERE user_id = $1 RETURNING name, username;`,
+            [userId, approve ? 'approved' : 'rejected', String(ctx.from?.id)]
+        );
+        if (!res.rowCount) {
+            await ctx.reply(`❌ ID <code>${escapeHtml(userId)}</code> 사용자를 찾을 수 없습니다.`, { parse_mode: 'HTML' });
+            return;
+        }
+
+        const name = escapeHtml(displayName({ first_name: res.rows[0].name, username: res.rows[0].username }));
+        await ctx.reply(
+            approve
+                ? `✅ <b>${name}</b> 님을 승인했습니다.`
+                : `⛔ <b>${name}</b> 님의 인증을 해제했습니다.\n<i>(이미 초대한 방은 그대로 사용됩니다. 막으려면 해당 방에서 봇을 내보내주세요)</i>`,
+            { parse_mode: 'HTML' }
+        );
+    } catch (err: unknown) {
+        console.error('[인증 변경 에러]:', err);
+        await ctx.reply(`⚠️ 인증 변경 중 오류 발생: ${getErrorMessage(err)}`);
+    }
+});
+
 // 방 제목 변경 시 DB 즉시 반영
 bot.on('new_chat_title', async (ctx) => {
     const newTitle = ctx.message.new_chat_title;
@@ -728,6 +1017,25 @@ bot.on('my_chat_member', async (ctx) => {
     if (status === 'member' || status === 'administrator') {
         const title = 'title' in ctx.chat ? ctx.chat.title : ctx.chat.first_name || '대화방';
         try {
+            const inviter = ctx.myChatMember.from;
+            if (ctx.chat.type === 'private') {
+                // 개인 대화 시작 — 미인증 사용자는 /start 메시지에서 인증 안내
+                if (!(await isVerifiedUser(inviter.id))) return;
+            } else if (!(await isAuthorizedChat(chatId))) {
+                if (!(await isVerifiedUser(inviter.id))) {
+                    await ctx.reply(
+                        '🔒 <b>인증된 사용자만 이 봇을 방에 초대할 수 있습니다.</b>\n\n' +
+                            `봇 개인 대화(@${escapeHtml(ctx.botInfo.username)})에서 /start 로 인증을 요청하고, ` +
+                            '관리자 승인 후 다시 초대해주세요.',
+                        { parse_mode: 'HTML' }
+                    );
+                    await ctx.leaveChat();
+                    console.log(`[미인증 초대 차단] Chat: ${chatId}, 초대자: ${inviter.id}`);
+                    return;
+                }
+                await authorizeChat(chatId, inviter.id);
+            }
+
             await ensureChatRecord(chatId, title);
 
             await ctx.reply(
@@ -743,6 +1051,7 @@ bot.on('my_chat_member', async (ctx) => {
     } else if (status === 'left' || status === 'kicked') {
         try {
             await neonPool.query(`DELETE FROM counseling_chats WHERE chat_id = $1;`, [String(chatId)]);
+            await neonPool.query(`DELETE FROM authorized_chats WHERE chat_id = $1;`, [String(chatId)]);
         } catch (err: unknown) {
             console.error('[방 퇴장 데이터 삭제 실패]:', getErrorMessage(err));
         }
@@ -795,7 +1104,8 @@ bot.hears(/^[\/!](start|help|도움말)(?:@\w+)?$/i, async (ctx) => {
             '• <b>일반방 조회 (특수 3종 및 중단 제외)</b>: <code>관리자 n월 일반</code>\n' +
             '   <i>(n월 = 대상자 목표월, 생략 시 전체)</i>\n' +
             '• <b>전체 종합 관리 현황</b>: <code>관리자 점검</code>\n' +
-            '• <b>주간 요약</b>: <code>관리자 주간요약</code> (매주 월요일 오전 관리자에게 자동 발송)',
+            '• <b>주간 요약</b>: <code>관리자 주간요약</code> (매주 월요일 오전 관리자에게 자동 발송)\n' +
+            '• <b>봇 사용 인증 현황</b>: <code>관리자 인증목록</code> (해제: <code>관리자 인증해제 ID</code>, 승인: <code>관리자 인증승인 ID</code>)',
         { parse_mode: 'HTML' }
     );
 });
