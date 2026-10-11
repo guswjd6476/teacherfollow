@@ -57,6 +57,13 @@ async function initDb() {
                 authorized_at TIMESTAMPTZ DEFAULT NOW()
             );
             CREATE TABLE IF NOT EXISTS bot_meta (key TEXT PRIMARY KEY, value TEXT);
+            CREATE TABLE IF NOT EXISTS region_chats (
+                chat_id TEXT NOT NULL,
+                region TEXT NOT NULL,
+                registered_by TEXT,
+                registered_at TIMESTAMPTZ DEFAULT NOW(),
+                PRIMARY KEY (chat_id, region)
+            );
         `);
 
         // 인증 기능 도입 전부터 쓰던 방은 그대로 사용 가능하도록 1회 이전
@@ -327,10 +334,14 @@ async function getChatRecord(chatId: string | number): Promise<ChatRecord | unde
             s."이름" AS matched_student_name,
             m."이름" AS guide_name,
             m."지역" AS guide_region,
-            m."구역" AS guide_district
+            m."구역" AS guide_district,
+            t."이름" AS teacher_name,
+            t."지역" AS teacher_region,
+            t."구역" AS teacher_district
         FROM counseling_chats c
         LEFT JOIN students s ON c.matched_member_id::text = s.id::text
         LEFT JOIN members m ON s."인도자_고유번호" = m."고유번호"
+        LEFT JOIN members t ON s."교사_고유번호" = t."고유번호"
         WHERE c.chat_id = $1
         LIMIT 1;
     `;
@@ -989,6 +1000,268 @@ bot.hears(/^(?:[\/!]?관리자\s+)인증\s*(해제|승인)\s+(\d+)$/i, async (ct
     }
 });
 
+/* =====================================================
+ * 📍 지역 담당방 (인도자·교사 지역별 담당자 단톡방으로 자동 알림)
+ * - 담당방에서 관리자가 /담당방등록 강북  (여러 지역: /담당방등록 강북,강남)
+ * - 알림: 보고서 지연(D+2), 만남 중단, 매일 오전 지역 요약
+ * - 인도자 지역과 교사 지역 담당방 모두에 보내고, 같은 방이면 한 번만
+ * ===================================================== */
+type RegionChat = { chat_id: string; region: string };
+
+function normalizeRegion(region?: string | null): string {
+    return (region || '').replace(/\s/g, '');
+}
+
+// '강북' 등록 시 members.지역 '강북' / '강북지역' 모두 매칭 (/최초등록과 같은 양방향 포함 비교)
+function regionMatches(registered: string, actual?: string | null): boolean {
+    const r = normalizeRegion(registered);
+    const a = normalizeRegion(actual);
+    return !!r && !!a && (a === r || a.includes(r) || r.includes(a));
+}
+
+async function getRegionChats(): Promise<RegionChat[]> {
+    const res = await neonPool.query(`SELECT chat_id, region FROM region_chats ORDER BY region, chat_id;`);
+    return res.rows;
+}
+
+async function isRegionChat(chatId: number | string): Promise<boolean> {
+    const res = await neonPool.query(`SELECT 1 FROM region_chats WHERE chat_id = $1 LIMIT 1`, [String(chatId)]);
+    return res.rows.length > 0;
+}
+
+function regionChatIdsFor(chat: Pick<ChatRecord, 'guide_region' | 'teacher_region'>, regionChats: RegionChat[]): string[] {
+    const ids = regionChats
+        .filter((rc) => regionMatches(rc.region, chat.guide_region) || regionMatches(rc.region, chat.teacher_region))
+        .map((rc) => rc.chat_id);
+    return [...new Set(ids)];
+}
+
+function regionRoomInfo(c: ChatRecord): string {
+    const guideWhere = [c.guide_region, c.guide_district].filter(Boolean).join(' ');
+    return (
+        `• 방: <b>${escapeHtml(c.room_title || '대화방')}</b>` +
+        (c.matched_student_name ? ` (👤 ${escapeHtml(c.matched_student_name)})` : '') +
+        `\n• 인도자: ${
+            c.guide_name ? `${escapeHtml(c.guide_name)}${guideWhere ? ` (${escapeHtml(guideWhere)})` : ''}` : '미등록'
+        }\n` +
+        `• 교사: ${teacherText(c)}\n`
+    );
+}
+
+// 상담방 하나에 대한 알림을 해당 지역 담당방들에 발송 (실패해도 상담방 처리는 계속)
+async function notifyRegionChats(chat: ChatRecord, message: string, regionChats?: RegionChat[]) {
+    try {
+        const targets = regionChatIdsFor(chat, regionChats ?? (await getRegionChats()));
+        for (const target of targets) {
+            await bot.telegram
+                .sendMessage(target, message, { parse_mode: 'HTML' })
+                .catch((err) => console.error(`[지역 담당방 알림 실패] ${target}:`, getErrorMessage(err)));
+        }
+    } catch (err: unknown) {
+        console.error('[지역 담당방 알림 에러]:', getErrorMessage(err));
+    }
+}
+
+// 담당방 등록 (/담당방등록 강북 또는 /담당방등록 강북,강남)
+bot.hears(/^[\/!]담당방\s*등록(?:@\w+)?(?:\s+(.+))?$/i, async (ctx) => {
+    try {
+        if (!isAdmin(ctx.from?.id)) {
+            await ctx.reply('⛔ 관리자만 담당방을 등록할 수 있습니다.');
+            return;
+        }
+        if (ctx.chat.type === 'private') {
+            await ctx.reply('⚠️ 지역 담당자 단톡방에서 입력해주세요.');
+            return;
+        }
+
+        const regions = (ctx.match[1] || '')
+            .split(/[,，/\s]+/)
+            .map((r) => r.trim())
+            .filter(Boolean);
+        if (regions.length === 0) {
+            await ctx.reply(
+                '⚠️ 지역을 입력해주세요.\n예: <code>/담당방등록 강북</code> (여러 지역: <code>/담당방등록 강북,강남</code>)',
+                { parse_mode: 'HTML' }
+            );
+            return;
+        }
+
+        // members 테이블에 없는 지역명은 오타일 가능성이 높으므로 등록하지 않음
+        const known = (await neonPool.query(`SELECT DISTINCT "지역" FROM members WHERE "지역" IS NOT NULL;`)).rows.map(
+            (r) => String(r['지역'])
+        );
+        const unknown = regions.filter((r) => !known.some((k) => regionMatches(r, k)));
+        if (unknown.length > 0) {
+            await ctx.reply(
+                `❌ 등록된 지역에서 찾을 수 없습니다: <b>${escapeHtml(unknown.join(', '))}</b>\n\n` +
+                    `• 사용 가능한 지역: ${escapeHtml(known.sort().join(', ') || '없음')}`,
+                { parse_mode: 'HTML' }
+            );
+            return;
+        }
+
+        const chatId = String(ctx.chat.id);
+        for (const region of regions) {
+            await neonPool.query(
+                `INSERT INTO region_chats (chat_id, region, registered_by) VALUES ($1, $2, $3)
+                 ON CONFLICT (chat_id, region) DO NOTHING;`,
+                [chatId, region, String(ctx.from?.id)]
+            );
+        }
+        // 담당방은 상담방이 아니므로 상담방 목록·점검에서 제외
+        await neonPool.query(`DELETE FROM counseling_chats WHERE chat_id = $1;`, [chatId]);
+
+        const all = (await neonPool.query(`SELECT region FROM region_chats WHERE chat_id = $1 ORDER BY region`, [chatId]))
+            .rows.map((r) => r.region);
+        await ctx.reply(
+            `📍 <b>지역 담당방으로 등록되었습니다.</b>\n\n` +
+                `• 담당 지역: <b>${escapeHtml(all.join(', '))}</b>\n\n` +
+                `이 지역 인도자·교사의 상담방에 대해 아래 알림이 이 방으로 옵니다.\n` +
+                `• 🚨 보고서 제출 지연 (만남일 2일 경과)\n` +
+                `• 🛑 만남 중단 발생\n` +
+                `• ☀️ 매일 오전 지역 요약 (오늘 만남 · 보고서 미제출)\n\n` +
+                `<i>해제: <code>/담당방해제</code> (특정 지역만: <code>/담당방해제 강북</code>)</i>`,
+            { parse_mode: 'HTML' }
+        );
+    } catch (err: unknown) {
+        console.error('[담당방 등록 에러]:', err);
+        await ctx.reply(`⚠️ 담당방 등록 중 오류 발생: ${getErrorMessage(err)}`);
+    }
+});
+
+// 담당방 해제 (/담당방해제 또는 /담당방해제 강북)
+bot.hears(/^[\/!]담당방\s*해제(?:@\w+)?(?:\s+(.+))?$/i, async (ctx) => {
+    try {
+        if (!isAdmin(ctx.from?.id)) {
+            await ctx.reply('⛔ 관리자만 담당방을 해제할 수 있습니다.');
+            return;
+        }
+        const chatId = String(ctx.chat.id);
+        const regions = (ctx.match[1] || '')
+            .split(/[,，/\s]+/)
+            .map((r) => r.trim())
+            .filter(Boolean);
+
+        const res = regions.length
+            ? await neonPool.query(`DELETE FROM region_chats WHERE chat_id = $1 AND region = ANY($2::text[]);`, [
+                  chatId,
+                  regions,
+              ])
+            : await neonPool.query(`DELETE FROM region_chats WHERE chat_id = $1;`, [chatId]);
+
+        if (!res.rowCount) {
+            await ctx.reply('ℹ️ 이 방은 해당 지역 담당방으로 등록되어 있지 않습니다.');
+            return;
+        }
+        const left = (await neonPool.query(`SELECT region FROM region_chats WHERE chat_id = $1 ORDER BY region`, [chatId]))
+            .rows.map((r) => r.region);
+        await ctx.reply(
+            left.length
+                ? `✅ 해제했습니다. 남은 담당 지역: <b>${escapeHtml(left.join(', '))}</b>`
+                : '✅ 지역 담당방 등록이 해제되었습니다. 더 이상 지역 알림이 오지 않습니다.',
+            { parse_mode: 'HTML' }
+        );
+    } catch (err: unknown) {
+        console.error('[담당방 해제 에러]:', err);
+        await ctx.reply(`⚠️ 담당방 해제 중 오류 발생: ${getErrorMessage(err)}`);
+    }
+});
+
+// 관리자: 등록된 담당방 목록 (관리자 담당방)
+bot.hears(/^(?:[\/!]?관리자\s+)(담당방|담당방\s*목록|지역\s*담당방)$/i, async (ctx) => {
+    try {
+        if (!isAdmin(ctx.from?.id)) {
+            await ctx.reply('⛔ 접근 권한이 없습니다.', { parse_mode: 'HTML' });
+            return;
+        }
+        const regionChats = await getRegionChats();
+        if (regionChats.length === 0) {
+            await ctx.reply(
+                'ℹ️ 등록된 지역 담당방이 없습니다.\n담당방에 봇을 초대한 뒤 그 방에서 <code>/담당방등록 지역명</code>을 입력하세요.',
+                { parse_mode: 'HTML' }
+            );
+            return;
+        }
+
+        let msg = `📍 <b>[지역 담당방 목록] (${regionChats.length}건)</b>\n━━━━━━━━━━━━━━━━━━\n\n`;
+        for (const rc of regionChats) {
+            let title = rc.chat_id;
+            try {
+                const info = await bot.telegram.getChat(rc.chat_id);
+                if ('title' in info && info.title) title = info.title;
+            } catch {
+                title = `${rc.chat_id} (⚠️ 봇이 방에 없음)`;
+            }
+            msg += `• <b>${escapeHtml(rc.region)}</b> → ${escapeHtml(title)}\n`;
+        }
+        await replyLong(ctx, msg);
+    } catch (err: unknown) {
+        console.error('[담당방 목록 에러]:', err);
+        await ctx.reply(`⚠️ 담당방 목록 조회 중 오류 발생: ${getErrorMessage(err)}`);
+    }
+});
+
+// 매일 오전 크론에서 호출: 지역 담당방마다 오늘 만남 · 보고서 미제출 요약 (하루 한 번)
+async function sendRegionDailySummaries() {
+    const today = dayjs().tz('Asia/Seoul').startOf('day');
+    const todayStr = today.format('YYYY-MM-DD');
+    const already = await neonPool.query(`SELECT value FROM bot_meta WHERE key = 'region_summary_sent'`);
+    if (already.rows[0]?.value === todayStr) return; // 같은 날 크론이 여러 번 호출돼도 한 번만
+
+    const regionChats = await getRegionChats();
+    if (regionChats.length === 0) return;
+    const chats = await getAllChats();
+
+    const regionsByChat = new Map<string, string[]>();
+    for (const rc of regionChats) regionsByChat.set(rc.chat_id, [...(regionsByChat.get(rc.chat_id) || []), rc.region]);
+
+    for (const [target, regions] of regionsByChat) {
+        const mine = chats.filter((c) =>
+            regions.some((r) => regionMatches(r, c.guide_region) || regionMatches(r, c.teacher_region))
+        );
+        const todayMeetings = mine.filter((c) => c.meeting_date === todayStr);
+        const overdue = mine
+            .filter((c) => isPastMeetingDate(c, todayStr) && !c.report_submitted)
+            .sort((a, b) => a.meeting_date.localeCompare(b.meeting_date));
+        if (todayMeetings.length === 0 && overdue.length === 0) continue;
+
+        const line = (c: ChatRecord) =>
+            `• ${escapeHtml(c.room_title || '대화방')}` +
+            (c.matched_student_name ? ` (👤 ${escapeHtml(c.matched_student_name)})` : '') +
+            ` · 인도자 ${escapeHtml(c.guide_name || '-')} · 교사 ${escapeHtml(c.teacher_name || '-')}`;
+
+        let msg =
+            `☀️ <b>[${escapeHtml(regions.join(', '))} 지역 오늘의 요약] ${today.format('MM/DD')} (${
+                '일월화수목금토'[today.day()]
+            })</b>\n━━━━━━━━━━━━━━━━━━\n\n`;
+        msg += `🗓 <b>오늘 만남: ${todayMeetings.length}건</b>\n`;
+        for (const c of todayMeetings) {
+            msg += `${line(c)}${c.meeting_type ? ` [${c.meeting_type}]` : ''}${
+                c.meeting_time ? ` ${escapeHtml(c.meeting_time)}` : ''
+            }\n`;
+        }
+        msg += `\n⚠️ <b>보고서 미제출: ${overdue.length}건</b>\n`;
+        for (const c of overdue) {
+            msg += `${line(c)} · 만남일 ${dayjs(c.meeting_date).format('MM/DD')} (${today.diff(
+                dayjs(c.meeting_date),
+                'day'
+            )}일 경과)\n`;
+        }
+
+        for (const part of splitLongMessage(msg)) {
+            await bot.telegram
+                .sendMessage(target, part, { parse_mode: 'HTML' })
+                .catch((err) => console.error(`[지역 요약 발송 실패] ${target}:`, getErrorMessage(err)));
+        }
+    }
+
+    await neonPool.query(
+        `INSERT INTO bot_meta (key, value) VALUES ('region_summary_sent', $1)
+         ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value`,
+        [todayStr]
+    );
+}
+
 // 방 제목 변경 시 DB 즉시 반영
 bot.on('new_chat_title', async (ctx) => {
     const newTitle = ctx.message.new_chat_title;
@@ -1052,6 +1325,7 @@ bot.on('my_chat_member', async (ctx) => {
         try {
             await neonPool.query(`DELETE FROM counseling_chats WHERE chat_id = $1;`, [String(chatId)]);
             await neonPool.query(`DELETE FROM authorized_chats WHERE chat_id = $1;`, [String(chatId)]);
+            await neonPool.query(`DELETE FROM region_chats WHERE chat_id = $1;`, [String(chatId)]);
         } catch (err: unknown) {
             console.error('[방 퇴장 데이터 삭제 실패]:', getErrorMessage(err));
         }
@@ -1105,7 +1379,9 @@ bot.hears(/^[\/!](start|help|도움말)(?:@\w+)?$/i, async (ctx) => {
             '   <i>(n월 = 대상자 목표월, 생략 시 전체)</i>\n' +
             '• <b>전체 종합 관리 현황</b>: <code>관리자 점검</code>\n' +
             '• <b>주간 요약</b>: <code>관리자 주간요약</code> (매주 월요일 오전 관리자에게 자동 발송)\n' +
-            '• <b>봇 사용 인증 현황</b>: <code>관리자 인증목록</code> (해제: <code>관리자 인증해제 ID</code>, 승인: <code>관리자 인증승인 ID</code>)',
+            '• <b>봇 사용 인증 현황</b>: <code>관리자 인증목록</code> (해제: <code>관리자 인증해제 ID</code>, 승인: <code>관리자 인증승인 ID</code>)\n' +
+            '• <b>지역 담당방 등록</b>: 담당방에서 <code>/담당방등록 강북</code> (해제: <code>/담당방해제</code>, 목록: <code>관리자 담당방</code>)\n' +
+            '   <i>(보고서 지연·만남 중단·매일 오전 지역 요약이 담당방으로 자동 발송)</i>',
         { parse_mode: 'HTML' }
     );
 });
@@ -1866,6 +2142,16 @@ bot.action(/^stop:(\w+)$/, async (ctx) => {
                 `\n💡 만남이 재개되면 <code>/만남일 MM-DD</code>를 입력하여 새 일정을 등록해주세요.`,
             { parse_mode: 'HTML' }
         );
+
+        const record = await getChatRecord(ctx.chat.id);
+        if (record) {
+            await notifyRegionChats(
+                record,
+                `🛑 <b>[만남 중단 발생]</b>\n` +
+                    regionRoomInfo(record) +
+                    `• 중단 사유: <b>${escapeHtml(label)}</b>${detail ? ` - ${escapeHtml(detail)}` : ''}`
+            );
+        }
     } catch (err: unknown) {
         console.error('[만남 중단 사유 선택 에러]:', getErrorMessage(err));
         await ctx.answerCbQuery('처리 중 오류가 발생했습니다.').catch(() => {});
@@ -1898,6 +2184,15 @@ bot.action(/^fu:(\w+)$/, async (ctx) => {
                 `• <b>대화방 상태</b>: 만남 중단 처리됨`,
             { parse_mode: 'HTML' }
         );
+
+        if (record) {
+            await notifyRegionChats(
+                record,
+                `🛑 <b>[만남 중단 발생 - 인터뷰 후속 미신청]</b>\n` +
+                    regionRoomInfo(record) +
+                    `• 미신청 사유: <b>${escapeHtml(label)}</b>${detail ? ` - ${escapeHtml(detail)}` : ''}`
+            );
+        }
     } catch (err: unknown) {
         console.error('[미신청 사유 선택 에러]:', getErrorMessage(err));
         await ctx.answerCbQuery('처리 중 오류가 발생했습니다.').catch(() => {});
@@ -3053,6 +3348,9 @@ async function handleIncomingText(ctx: any, rawText: string, source: 'text' | 'e
 
     try {
 
+    // 지역 담당방의 대화는 상담방 보고서로 처리하지 않음
+    if (await isRegionChat(chatId)) return;
+
     await ensureChatRecord(chatId, roomTitle);
 
     // 슬래시(/)나 느낌표(!)로 시작하는 정식 명령어 텍스트는 무시
@@ -3390,6 +3688,7 @@ async function triggerMorningReminder() {
     try {
     const today = dayjs().tz('Asia/Seoul').startOf('day');
     const chats = await getAllChats();
+    const regionChats = await getRegionChats();
 
     for (const chat of chats) {
         // 진행 구분 날짜(섭등목표 / 예정목표 / 가능목표 / 확정목표) 당일 안내 — 같은 날짜로는 한 번만
@@ -3489,6 +3788,16 @@ async function triggerMorningReminder() {
                     { parse_mode: 'HTML' }
                 );
                 await updateChat(chat.chat_id, { overdue_2_notified: 1 });
+
+                const isInterview = chat.meeting_type === '인터뷰';
+                await notifyRegionChats(
+                    chat,
+                    `🚨 <b>[보고서 제출 지연]</b>\n` +
+                        regionRoomInfo(chat) +
+                        `• ${isInterview ? '인터뷰일' : '만남일'}: <b>${mDate.format('MM/DD')}</b> (${diffDays}일 경과)\n\n` +
+                        `${isInterview ? '인터뷰 사후 보고서' : '만남 보고서'}가 아직 제출되지 않았습니다.`,
+                    regionChats
+                );
             } catch (err: unknown) {
                 console.error(`[D+2 경고 알림 실패] Chat: ${chat.chat_id}`, getErrorMessage(err));
             }
@@ -3566,6 +3875,7 @@ const server = http.createServer(async (req, res) => {
             async () => {
                 await triggerMorningReminder();
                 await sendWeeklySummaryIfMonday();
+                await sendRegionDailySummaries();
             },
             'Morning reminder executed',
         ],
