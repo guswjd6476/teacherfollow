@@ -1003,7 +1003,7 @@ bot.hears(/^(?:[\/!]?관리자\s+)인증\s*(해제|승인)\s+(\d+)$/i, async (ct
 /* =====================================================
  * 📍 지역 담당방 (인도자·교사 지역별 담당자 단톡방으로 자동 알림)
  * - 담당방에서 관리자가 /담당방등록 강북  (여러 지역: /담당방등록 강북,강남)
- * - 알림: 보고서 지연(D+2), 만남 중단, 매일 오전 지역 요약
+ * - 알림: 보고서 지연(D+2), 만남 중단, 매일 오전 10시·밤 10시 지역 요약
  * - 인도자 지역과 교사 지역 담당방 모두에 보내고, 같은 방이면 한 번만
  * ===================================================== */
 type RegionChat = { chat_id: string; region: string };
@@ -1119,7 +1119,8 @@ bot.hears(/^[\/!]담당방\s*등록(?:@\w+)?(?:\s+(.+))?$/i, async (ctx) => {
                 `이 지역 인도자·교사의 상담방에 대해 아래 알림이 이 방으로 옵니다.\n` +
                 `• 🚨 보고서 제출 지연 (만남일 2일 경과)\n` +
                 `• 🛑 만남 중단 발생\n` +
-                `• ☀️ 매일 오전 지역 요약 (오늘 만남 · 보고서 미제출)\n\n` +
+                `• ☀️ 매일 오전 10시 지역 요약 (오늘 만남 · 보고서 미제출)\n` +
+                `• 🌙 매일 밤 10시 마감 요약 (오늘 보고서 미제출 · 내일 만남)\n\n` +
                 `<i>해제: <code>/담당방해제</code> (특정 지역만: <code>/담당방해제 강북</code>)</i>`,
             { parse_mode: 'HTML' }
         );
@@ -1201,11 +1202,136 @@ bot.hears(/^(?:[\/!]?관리자\s+)(담당방|담당방\s*목록|지역\s*담당�
     }
 });
 
-// 매일 오전 크론에서 호출: 지역 담당방마다 오늘 만남 · 보고서 미제출 요약 (하루 한 번)
-async function sendRegionDailySummaries() {
+// 관리자: 담당방 공지 (/담당방공지 내용 → 전체, /담당방공지 [강북,강남] 내용 → 해당 지역만)
+// 미리보기 후 [보내기]를 눌러야 발송. 대기 중인 공지는 메모리에만 두므로 서버 재시작 시 다시 작성
+const pendingNotices = new Map<string, { text: string; targets: string[]; label: string; adminId: string }>();
+
+bot.hears(/^[\/!]담당방\s*공지(?:@\w+)?(?:\s+([\s\S]+))?$/i, async (ctx) => {
+    try {
+        if (!isAdmin(ctx.from?.id)) {
+            await ctx.reply('⛔ 관리자만 담당방 공지를 보낼 수 있습니다.');
+            return;
+        }
+
+        let body = ctx.match[1]?.trim() || '';
+        let wanted: string[] = [];
+        const bracket = body.match(/^\[([^\]]+)\]\s*([\s\S]*)$/);
+        if (bracket) {
+            wanted = bracket[1].split(/[,，/\s]+/).map((r) => r.trim()).filter(Boolean);
+            body = bracket[2].trim();
+        }
+        if (!body) {
+            await ctx.reply(
+                '⚠️ 공지 내용을 입력해주세요.\n\n' +
+                    '• 전체 담당방: <code>/담당방공지 내용</code>\n' +
+                    '• 특정 지역만: <code>/담당방공지 [강북,강남] 내용</code>\n' +
+                    '<i>(여러 줄로 작성할 수 있습니다)</i>',
+                { parse_mode: 'HTML' }
+            );
+            return;
+        }
+
+        const regionChats = await getRegionChats();
+        const selected = wanted.length
+            ? regionChats.filter((rc) => wanted.some((w) => regionMatches(w, rc.region)))
+            : regionChats;
+        const targets = [...new Set(selected.map((rc) => rc.chat_id))];
+        if (targets.length === 0) {
+            await ctx.reply(
+                wanted.length
+                    ? `❌ <b>${escapeHtml(wanted.join(', '))}</b> 지역으로 등록된 담당방이 없습니다. (<code>관리자 담당방</code>으로 확인)`
+                    : 'ℹ️ 등록된 지역 담당방이 없습니다.',
+                { parse_mode: 'HTML' }
+            );
+            return;
+        }
+
+        const label = wanted.length ? [...new Set(selected.map((rc) => rc.region))].join(', ') : '전체';
+        const id = Math.random().toString(36).slice(2, 10);
+        pendingNotices.set(id, { text: body, targets, label, adminId: String(ctx.from?.id) });
+
+        await ctx.reply(
+            `📢 <b>[담당방 공지 미리보기]</b>\n` +
+                `• 대상: <b>${escapeHtml(label)}</b> (담당방 ${targets.length}곳)\n` +
+                `━━━━━━━━━━━━━━━━━━\n` +
+                `${escapeHtml(body)}\n` +
+                `━━━━━━━━━━━━━━━━━━\n` +
+                `<i>아래 [보내기]를 눌러야 발송됩니다.</i>`,
+            {
+                parse_mode: 'HTML',
+                reply_markup: {
+                    inline_keyboard: [
+                        [
+                            { text: '📨 보내기', callback_data: `notice:send:${id}` },
+                            { text: '취소', callback_data: `notice:cancel:${id}` },
+                        ],
+                    ],
+                },
+            }
+        );
+    } catch (err: unknown) {
+        console.error('[담당방 공지 에러]:', err);
+        await ctx.reply(`⚠️ 담당방 공지 준비 중 오류 발생: ${getErrorMessage(err)}`);
+    }
+});
+
+bot.action(/^notice:(send|cancel):(\w+)$/, async (ctx) => {
+    try {
+        if (!isAdmin(ctx.from?.id)) {
+            await ctx.answerCbQuery('⛔ 관리자만 처리할 수 있습니다.');
+            return;
+        }
+        const [, action, id] = ctx.match;
+        const notice = pendingNotices.get(id);
+        pendingNotices.delete(id); // 두 번 눌러도 한 번만 발송
+
+        if (!notice) {
+            await ctx.answerCbQuery('이미 처리되었거나 만료된 공지입니다.');
+            await ctx.editMessageReplyMarkup(undefined).catch(() => {});
+            return;
+        }
+        if (action === 'cancel') {
+            await ctx.answerCbQuery('취소했습니다.');
+            await ctx.editMessageText('↩️ 담당방 공지가 취소되었습니다.');
+            return;
+        }
+
+        await ctx.answerCbQuery('발송 중입니다...');
+        const message = `📢 <b>[공지]</b>\n\n${escapeHtml(notice.text)}`;
+        const failed: string[] = [];
+        for (const target of notice.targets) {
+            try {
+                await bot.telegram.sendMessage(target, message, { parse_mode: 'HTML' });
+            } catch (err: unknown) {
+                console.error(`[담당방 공지 발송 실패] ${target}:`, getErrorMessage(err));
+                failed.push(target);
+            }
+        }
+
+        const sent = notice.targets.length - failed.length;
+        await ctx.editMessageText(
+            `✅ <b>담당방 공지 발송 완료</b> (대상: ${escapeHtml(notice.label)})\n` +
+                `• 성공: ${sent}곳` +
+                (failed.length ? `\n• 실패: ${failed.length}곳 (봇이 방에 없을 수 있음: <code>관리자 담당방</code>으로 확인)` : '') +
+                `\n━━━━━━━━━━━━━━━━━━\n${escapeHtml(notice.text)}`,
+            { parse_mode: 'HTML' }
+        );
+    } catch (err: unknown) {
+        console.error('[담당방 공지 발송 에러]:', err);
+        await ctx.answerCbQuery('처리 중 오류가 발생했습니다.').catch(() => {});
+    }
+});
+
+// 크론에서 호출: 지역 담당방마다 하루 요약 (오전 10시 'morning' / 밤 10시 'night', 각각 하루 한 번)
+// - 오전: 오늘 만남 · 보고서 미제출
+// - 밤: 오늘 만남 중 보고서 미제출 · 이전 만남 미제출 · 내일 만남
+//   (보고서가 제출되면 만남일이 다음 만남일로 바뀌므로, 밤에 만남일이 오늘인 방 = 아직 보고서가 안 올라온 방)
+async function sendRegionDailySummaries(mode: 'morning' | 'night') {
     const today = dayjs().tz('Asia/Seoul').startOf('day');
     const todayStr = today.format('YYYY-MM-DD');
-    const already = await neonPool.query(`SELECT value FROM bot_meta WHERE key = 'region_summary_sent'`);
+    const tomorrowStr = today.add(1, 'day').format('YYYY-MM-DD');
+    const metaKey = mode === 'morning' ? 'region_summary_sent' : 'region_night_summary_sent';
+    const already = await neonPool.query(`SELECT value FROM bot_meta WHERE key = $1`, [metaKey]);
     if (already.rows[0]?.value === todayStr) return; // 같은 날 크론이 여러 번 호출돼도 한 번만
 
     const regionChats = await getRegionChats();
@@ -1215,6 +1341,14 @@ async function sendRegionDailySummaries() {
     const regionsByChat = new Map<string, string[]>();
     for (const rc of regionChats) regionsByChat.set(rc.chat_id, [...(regionsByChat.get(rc.chat_id) || []), rc.region]);
 
+    const line = (c: ChatRecord) =>
+        `• ${escapeHtml(c.room_title || '대화방')}` +
+        (c.matched_student_name ? ` (👤 ${escapeHtml(c.matched_student_name)})` : '') +
+        ` · 인도자 ${escapeHtml(c.guide_name || '-')} · 교사 ${escapeHtml(c.teacher_name || '-')}`;
+    const meetingLine = (c: ChatRecord) =>
+        `${line(c)}${c.meeting_type ? ` [${c.meeting_type}]` : ''}${c.meeting_time ? ` ${escapeHtml(c.meeting_time)}` : ''}\n`;
+    const dayLabel = (d: dayjs.Dayjs) => `${d.format('MM/DD')} (${'일월화수목금토'[d.day()]})`;
+
     for (const [target, regions] of regionsByChat) {
         const mine = chats.filter((c) =>
             regions.some((r) => regionMatches(r, c.guide_region) || regionMatches(r, c.teacher_region))
@@ -1223,29 +1357,33 @@ async function sendRegionDailySummaries() {
         const overdue = mine
             .filter((c) => isPastMeetingDate(c, todayStr) && !c.report_submitted)
             .sort((a, b) => a.meeting_date.localeCompare(b.meeting_date));
-        if (todayMeetings.length === 0 && overdue.length === 0) continue;
 
-        const line = (c: ChatRecord) =>
-            `• ${escapeHtml(c.room_title || '대화방')}` +
-            (c.matched_student_name ? ` (👤 ${escapeHtml(c.matched_student_name)})` : '') +
-            ` · 인도자 ${escapeHtml(c.guide_name || '-')} · 교사 ${escapeHtml(c.teacher_name || '-')}`;
-
-        let msg =
-            `☀️ <b>[${escapeHtml(regions.join(', '))} 지역 오늘의 요약] ${today.format('MM/DD')} (${
-                '일월화수목금토'[today.day()]
-            })</b>\n━━━━━━━━━━━━━━━━━━\n\n`;
-        msg += `🗓 <b>오늘 만남: ${todayMeetings.length}건</b>\n`;
-        for (const c of todayMeetings) {
-            msg += `${line(c)}${c.meeting_type ? ` [${c.meeting_type}]` : ''}${
-                c.meeting_time ? ` ${escapeHtml(c.meeting_time)}` : ''
-            }\n`;
-        }
-        msg += `\n⚠️ <b>보고서 미제출: ${overdue.length}건</b>\n`;
+        let overdueText = '';
         for (const c of overdue) {
-            msg += `${line(c)} · 만남일 ${dayjs(c.meeting_date).format('MM/DD')} (${today.diff(
+            overdueText += `${line(c)} · 만남일 ${dayjs(c.meeting_date).format('MM/DD')} (${today.diff(
                 dayjs(c.meeting_date),
                 'day'
             )}일 경과)\n`;
+        }
+
+        const regionName = escapeHtml(regions.join(', '));
+        let msg: string;
+        if (mode === 'morning') {
+            if (todayMeetings.length === 0 && overdue.length === 0) continue;
+            msg = `☀️ <b>[${regionName} 지역 오늘의 요약] ${dayLabel(today)}</b>\n━━━━━━━━━━━━━━━━━━\n\n`;
+            msg += `🗓 <b>오늘 만남: ${todayMeetings.length}건</b>\n` + todayMeetings.map(meetingLine).join('');
+            msg += `\n⚠️ <b>보고서 미제출: ${overdue.length}건</b>\n` + overdueText;
+        } else {
+            const todayUnreported = todayMeetings.filter((c) => !c.report_submitted);
+            const tomorrowMeetings = mine.filter((c) => c.meeting_date === tomorrowStr);
+            if (todayUnreported.length === 0 && overdue.length === 0 && tomorrowMeetings.length === 0) continue;
+            msg = `🌙 <b>[${regionName} 지역 오늘 마감 요약] ${dayLabel(today)}</b>\n━━━━━━━━━━━━━━━━━━\n\n`;
+            msg +=
+                `📋 <b>오늘 만남 중 보고서 미제출: ${todayUnreported.length}건</b>\n` +
+                todayUnreported.map(meetingLine).join('');
+            msg += `\n⚠️ <b>이전 만남 보고서 미제출: ${overdue.length}건</b>\n` + overdueText;
+            msg +=
+                `\n🗓 <b>내일 만남: ${tomorrowMeetings.length}건</b>\n` + tomorrowMeetings.map(meetingLine).join('');
         }
 
         for (const part of splitLongMessage(msg)) {
@@ -1256,9 +1394,9 @@ async function sendRegionDailySummaries() {
     }
 
     await neonPool.query(
-        `INSERT INTO bot_meta (key, value) VALUES ('region_summary_sent', $1)
+        `INSERT INTO bot_meta (key, value) VALUES ($1, $2)
          ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value`,
-        [todayStr]
+        [metaKey, todayStr]
     );
 }
 
@@ -1381,7 +1519,8 @@ bot.hears(/^[\/!](start|help|도움말)(?:@\w+)?$/i, async (ctx) => {
             '• <b>주간 요약</b>: <code>관리자 주간요약</code> (매주 월요일 오전 관리자에게 자동 발송)\n' +
             '• <b>봇 사용 인증 현황</b>: <code>관리자 인증목록</code> (해제: <code>관리자 인증해제 ID</code>, 승인: <code>관리자 인증승인 ID</code>)\n' +
             '• <b>지역 담당방 등록</b>: 담당방에서 <code>/담당방등록 강북</code> (해제: <code>/담당방해제</code>, 목록: <code>관리자 담당방</code>)\n' +
-            '   <i>(보고서 지연·만남 중단·매일 오전 지역 요약이 담당방으로 자동 발송)</i>',
+            '   <i>(보고서 지연·만남 중단·매일 오전 10시/밤 10시 지역 요약이 담당방으로 자동 발송)</i>\n' +
+            '• <b>담당방 공지</b>: <code>/담당방공지 내용</code> (특정 지역만: <code>/담당방공지 [강북,강남] 내용</code>)',
         { parse_mode: 'HTML' }
     );
 });
@@ -3875,11 +4014,17 @@ const server = http.createServer(async (req, res) => {
             async () => {
                 await triggerMorningReminder();
                 await sendWeeklySummaryIfMonday();
-                await sendRegionDailySummaries();
+                await sendRegionDailySummaries('morning');
             },
             'Morning reminder executed',
         ],
-        '/cron-10pm': [triggerNightReminder, 'Night reminder executed'],
+        '/cron-10pm': [
+            async () => {
+                await triggerNightReminder();
+                await sendRegionDailySummaries('night');
+            },
+            'Night reminder executed',
+        ],
     };
     const cron = cronJobs[url.pathname];
     if (cron) {
