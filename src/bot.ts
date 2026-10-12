@@ -2,6 +2,7 @@ import dotenv from 'dotenv';
 dotenv.config();
 
 import http from 'http';
+import crypto from 'crypto';
 import { Pool } from 'pg';
 import { Telegraf } from 'telegraf';
 import dayjs from 'dayjs';
@@ -16,6 +17,15 @@ dayjs.extend(timezone);
 const BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 if (!BOT_TOKEN) {
     console.error('❌ TELEGRAM_BOT_TOKEN이 설정되지 않았습니다.');
+    process.exit(1);
+}
+
+// 웹훅 비밀값: 텔레그램이 보낸 요청에만 붙는 헤더로, 없거나 다르면 거절 (웹훅 주소로 가짜 업데이트를 보내는 것 방지)
+// WEBHOOK_SECRET을 지정하지 않으면 봇 토큰에서 만들어 사용 (토큰을 모르면 알 수 없음)
+const WEBHOOK_SECRET =
+    process.env.WEBHOOK_SECRET || crypto.createHash('sha256').update(`webhook:${BOT_TOKEN}`).digest('hex');
+if (!/^[A-Za-z0-9_-]{1,256}$/.test(WEBHOOK_SECRET)) {
+    console.error('❌ WEBHOOK_SECRET은 영문·숫자·_·- 로 된 1~256자여야 합니다.');
     process.exit(1);
 }
 
@@ -4598,11 +4608,13 @@ async function triggerNightReminder() {
 /* =====================================================
  * 🌐 HTTP 웹훅 서버 구동
  * ===================================================== */
+const webhookHandler = bot.webhookCallback('/webhook', { secretToken: WEBHOOK_SECRET });
+
 const server = http.createServer(async (req, res) => {
     const url = new URL(req.url || '/', `http://${req.headers.host}`);
 
     if (req.method === 'POST' && url.pathname === '/webhook') {
-        return bot.webhookCallback('/webhook')(req, res);
+        return webhookHandler(req, res);
     }
 
     // DB 오류 등으로 알림이 실패해도 서버가 죽지 않고 500으로 응답 (크론 쪽에서 실패 확인 가능)
@@ -4659,6 +4671,7 @@ server.listen(PORT, async () => {
         // 수정된 메시지(edited_message)는 받지 않음 — 지정하지 않으면 이전 설정이 유지됨
         await bot.telegram.setWebhook(webhookUrl, {
             allowed_updates: ['message', 'callback_query', 'my_chat_member'],
+            secret_token: WEBHOOK_SECRET,
         });
         console.log(`Telegram Webhook 등록 완료: ${webhookUrl}`);
     } catch (e: unknown) {
