@@ -655,13 +655,6 @@ function isBlankReportField(value: string | null): boolean {
     return stripped.length === 0;
 }
 
-// 봇이 처리하는 보고서·피드백 메시지인지 (수정된 메시지 재처리 대상 판별용 — handleIncomingText의 감지 조건과 동일하게 유지)
-function isReportLikeText(text: string): boolean {
-    return /인터뷰\s*사전\s*보고서|인터뷰 신청서|인터뷰 계획서|인터뷰 결과|인터뷰\s*보고서|상담,복음방 보고서|상담 보고서|복음방 보고서|만남 보고서|다음\s*만남일|#피드백/.test(
-        text
-    );
-}
-
 // 보고서의 '다음만남일' 값 추출
 // 1순위: 줄 맨 앞(기호·이모지 뒤)에 있는 라벨 줄 — 본문 속 "다음 만남 때 ~" 같은 문장 오인 방지
 //        라벨 뒤가 비어 있으면 바로 아래 줄에 적은 날짜/미정을 사용
@@ -1693,7 +1686,7 @@ bot.hears(/^[\/!](start|help|도움말)(?:@\w+)?$/i, async (ctx) => {
             '• <b>교사 만남 누적 회차</b>: <code>/교사만남회차</code> (보정: <code>/교사만남회차 총횟수</code>, 마지막 1회 취소: <code>/회차취소</code>)\n' +
             '• <b>섭등 후 회차</b>: <code>/섭등회차</code> (섭등일 만남 = 1회차, 보정: <code>/섭등회차 총횟수</code>)\n' +
             '• <b>만남 보고서 제출</b>: 양식 내 <code>다음만남일: MM-DD</code> 포함\n' +
-            '   <i>(보고서를 수정하거나 사진 설명글로 올려도 인식됩니다)</i>\n\n' +
+            '   <i>(사진 설명글로 올려도 인식됩니다. 이미 보낸 메시지를 편집하면 반영되지 않으니 다시 올려 주세요)</i>\n\n' +
             '<b>4. 지인 만남 (일정만 관리)</b>\n' +
             '• <b>지정</b>: <code>/최초등록</code> 후 [🤝 지인 만남] 선택 → <code>/만남일 MM-DD</code>로 일정 등록\n' +
             '• <b>교사 만남으로 전환</b>: <code>/교사전환</code>\n\n' +
@@ -3861,7 +3854,7 @@ async function recordTeacherMeeting(
         }
         const meetingDate = isDate && registered <= todayStr ? registered : todayStr;
 
-        const messageId = ctx.message?.message_id ?? ctx.editedMessage?.message_id ?? `${Date.now()}`;
+        const messageId = ctx.message?.message_id ?? `${Date.now()}`;
         const res = await neonPool.query(
             `INSERT INTO teacher_meetings (chat_id, student_id, message_id, meeting_date) VALUES ($1, $2, $3, $4)
              ON CONFLICT DO NOTHING;`,
@@ -4070,8 +4063,8 @@ bot.hears(/^[\/!](?:교사\s*만남\s*회차|만남\s*회차|회차)(?:@\w+)?(?:
 });
 
 // 10. 일반 텍스트 수신 (사전 보고서, 결과 보고서, 만남 보고서 및 #피드백 감지)
-// source: 'text' 일반 메시지 / 'edited' 수정된 메시지 / 'caption' 사진·파일 설명글
-async function handleIncomingText(ctx: any, rawText: string, source: 'text' | 'edited' | 'caption') {
+// source: 'text' 일반 메시지 / 'caption' 사진·파일 설명글
+async function handleIncomingText(ctx: any, rawText: string, source: 'text' | 'caption') {
     const text = rawText.trim();
     const chatId = ctx.chat.id;
     const roomTitle = 'title' in ctx.chat ? ctx.chat.title : ctx.chat.first_name || '대화방';
@@ -4400,16 +4393,6 @@ async function handleIncomingText(ctx: any, rawText: string, source: 'text' | 'e
 
 bot.on('text', (ctx) => handleIncomingText(ctx, ctx.message.text, 'text'));
 
-// 보고서를 텔레그램에서 '수정'한 경우에도 다시 판정 (예: 빈 진행내용을 채워 넣음)
-bot.on('edited_message', async (ctx) => {
-    const msg: any = ctx.editedMessage;
-    const text: string | undefined = msg?.text ?? msg?.caption;
-    if (!text) return;
-    if (!isReportLikeText(text)) return; // 일반 대화 수정은 무시
-    await ctx.reply('✏️ <b>수정된 메시지를 다시 확인합니다.</b>', { parse_mode: 'HTML' });
-    await handleIncomingText(ctx, text, 'edited');
-});
-
 // 사진·파일에 설명글로 붙인 보고서 / #피드백도 인식
 bot.on(['photo', 'document', 'video'], async (ctx) => {
     const caption: string | undefined = (ctx.message as any)?.caption;
@@ -4673,9 +4656,9 @@ server.listen(PORT, async () => {
 
     const webhookUrl = 'https://teacherfollow.alwaysdata.net/webhook';
     try {
-        // 수정된 메시지(edited_message)도 받도록 명시 — 지정하지 않으면 이전 설정이 유지됨
+        // 수정된 메시지(edited_message)는 받지 않음 — 지정하지 않으면 이전 설정이 유지됨
         await bot.telegram.setWebhook(webhookUrl, {
-            allowed_updates: ['message', 'edited_message', 'callback_query', 'my_chat_member'],
+            allowed_updates: ['message', 'callback_query', 'my_chat_member'],
         });
         console.log(`Telegram Webhook 등록 완료: ${webhookUrl}`);
     } catch (e: unknown) {
