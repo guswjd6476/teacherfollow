@@ -67,7 +67,7 @@ async function initDb() {
             -- 신규 만남 발생 기록 (인터뷰 매칭 = 상담 이하 / 교사 매칭 = 상담 1회차)
             -- category: 인터뷰매칭 / 지인매칭 / 교사매칭
             -- source: '최초등록'(첫 만남 유형 선택) / '인터뷰후속'(인터뷰 결과 보고서 후속 신청) / '지인후속'(/교사전환)
-            -- 교사 만남 누적 기록: 만남 보고서 1건 = 1회 (같은 메시지를 수정해 다시 올려도 1회)
+            -- 교사 만남 누적 기록: 대상자·만남일당 1회 (보고서를 고쳐서 다시 올려도 1회)
             CREATE TABLE IF NOT EXISTS teacher_meetings (
                 id SERIAL PRIMARY KEY,
                 chat_id TEXT NOT NULL,
@@ -77,6 +77,11 @@ async function initDb() {
                 recorded_at TIMESTAMPTZ DEFAULT NOW(),
                 UNIQUE (chat_id, message_id)
             );
+            DELETE FROM teacher_meetings a USING teacher_meetings b
+                WHERE a.chat_id = b.chat_id AND a.student_id = b.student_id
+                  AND a.meeting_date = b.meeting_date AND a.id > b.id;
+            CREATE UNIQUE INDEX IF NOT EXISTS teacher_meetings_once_per_date
+                ON teacher_meetings (chat_id, student_id, meeting_date);
             -- 기능 도입 전 진행한 회차 (/교사만남회차 n 으로 보정)
             ALTER TABLE counseling_chats ADD COLUMN IF NOT EXISTS teacher_meeting_base INTEGER DEFAULT 0;
             CREATE TABLE IF NOT EXISTS meeting_events (
@@ -1668,7 +1673,7 @@ bot.hears(/^[\/!](start|help|도움말)(?:@\w+)?$/i, async (ctx) => {
             '• <b>만남 중단 처리</b>: <code>/만남중단 [상세 사유]</code> → 사유 버튼 선택\n' +
             '• <b>피드백 제출</b>: 메시지 내 <code>#피드백</code> 태그 포함\n' +
             '• <b>만남 보고서 양식</b>: <code>/만남보고서양식</code> 또는 <code>/교사만남양식</code>\n' +
-            '• <b>교사 만남 누적 회차</b>: <code>/교사만남회차</code> (봇 도입 전 회차 보정: <code>/교사만남회차 총횟수</code>)\n' +
+            '• <b>교사 만남 누적 회차</b>: <code>/교사만남회차</code> (보정: <code>/교사만남회차 총횟수</code>, 마지막 1회 취소: <code>/회차취소</code>)\n' +
             '• <b>만남 보고서 제출</b>: 양식 내 <code>다음만남일: MM-DD</code> 포함\n' +
             '   <i>(보고서를 수정하거나 사진 설명글로 올려도 인식됩니다)</i>\n\n' +
             '<b>4. 지인 만남 (일정만 관리)</b>\n' +
@@ -3798,34 +3803,79 @@ async function sendWeeklySummaryIfMonday() {
     );
 }
 
-// 교사 만남 보고서 1건을 1회로 누적하고 현재 회차 반환 (인터뷰·지인 만남은 집계하지 않음)
-// 같은 메시지를 수정하거나 다시 판정해도 message_id 기준으로 한 번만 기록
-async function recordTeacherMeeting(ctx: any, chatId: number | string): Promise<number | null> {
+// 교사 만남 누적 (인터뷰·지인 만남은 집계하지 않음) — 보고서를 고쳐 여러 번 올려도 만남 1회로 판단
+// 1) 대상자·만남일당 1회
+// 2) 다음 만남일(미래)이 이미 잡혀 있는데 올라온 보고서 = 직전 보고서의 수정본 → 회차 유지
+// 3) 만남일이 미정·미등록이면 보고서를 올린 날 기준 하루 1회
+async function recordTeacherMeeting(
+    ctx: any,
+    chatId: number | string
+): Promise<{ round: number; added: boolean } | null> {
     try {
         const record = await getChatRecord(chatId);
         if (!record?.matched_member_id || record.meeting_type === '인터뷰' || record.meeting_type === '지인') return null;
 
-        const messageId = ctx.message?.message_id ?? ctx.editedMessage?.message_id;
-        if (!messageId) return null;
-
-        // 보고한 만남의 날짜: 등록된 만남일이 오늘 이전이면 그 날짜, 아니면(미정·미래) 보고한 날
+        const id = String(chatId);
+        const studentId = String(record.matched_member_id);
         const todayStr = dayjs().tz('Asia/Seoul').format('YYYY-MM-DD');
-        const meetingDate =
-            /^\d{4}-\d{2}-\d{2}$/.test(record.meeting_date || '') && record.meeting_date <= todayStr
-                ? record.meeting_date
-                : todayStr;
+        const registered = record.meeting_date || '';
+        const isDate = /^\d{4}-\d{2}-\d{2}$/.test(registered);
 
-        await neonPool.query(
+        if (isDate && registered > todayStr) {
+            const prev = await neonPool.query(
+                `SELECT 1 FROM teacher_meetings WHERE chat_id = $1 AND student_id = $2 LIMIT 1`,
+                [id, studentId]
+            );
+            if (prev.rows.length > 0) return { round: record.teacher_meeting_count ?? 0, added: false };
+        }
+        const meetingDate = isDate && registered <= todayStr ? registered : todayStr;
+
+        const messageId = ctx.message?.message_id ?? ctx.editedMessage?.message_id ?? `${Date.now()}`;
+        const res = await neonPool.query(
             `INSERT INTO teacher_meetings (chat_id, student_id, message_id, meeting_date) VALUES ($1, $2, $3, $4)
-             ON CONFLICT (chat_id, message_id) DO NOTHING;`,
-            [String(chatId), String(record.matched_member_id), String(messageId), meetingDate]
+             ON CONFLICT DO NOTHING;`,
+            [id, studentId, String(messageId), meetingDate]
         );
-        return (await getChatRecord(chatId))?.teacher_meeting_count ?? null;
+        const round = (await getChatRecord(chatId))?.teacher_meeting_count ?? 0;
+        return { round, added: !!res.rowCount };
     } catch (err: unknown) {
         console.error('[교사 만남 누적 실패]:', getErrorMessage(err));
         return null;
     }
 }
+
+// 마지막 누적 1회 취소 (/회차취소) — 잘못 누적된 경우
+bot.hears(/^[\/!](?:교사\s*만남\s*)?회차\s*취소(?:@\w+)?$/i, async (ctx) => {
+    try {
+        const record = await getChatRecord(ctx.chat.id);
+        if (!record?.matched_member_id) {
+            await ctx.reply('⚠️ 매칭된 대상자가 없습니다.');
+            return;
+        }
+        const res = await neonPool.query(
+            `DELETE FROM teacher_meetings WHERE id = (
+                SELECT id FROM teacher_meetings WHERE chat_id = $1 AND student_id = $2
+                ORDER BY meeting_date DESC, id DESC LIMIT 1
+             ) RETURNING meeting_date;`,
+            [String(ctx.chat.id), String(record.matched_member_id)]
+        );
+        if (!res.rowCount) {
+            await ctx.reply('ℹ️ 취소할 교사 만남 기록이 없습니다. (이전 진행분 보정은 <code>/교사만남회차 총횟수</code>)', {
+                parse_mode: 'HTML',
+            });
+            return;
+        }
+        const after = (await getChatRecord(ctx.chat.id))?.teacher_meeting_count ?? 0;
+        await ctx.reply(
+            `↩️ <b>${formatYmdWithDay(res.rows[0].meeting_date)}</b> 만남 기록을 취소했습니다.\n` +
+                `• 현재 누적: <b>${after}회</b>`,
+            { parse_mode: 'HTML' }
+        );
+    } catch (err: unknown) {
+        console.error('[/회차취소 에러]:', err);
+        await ctx.reply(`⚠️ 회차 취소 중 오류 발생: ${getErrorMessage(err)}`);
+    }
+});
 
 // 교사 만남 회차 확인·보정 (/교사만남회차 → 기록 보기, /교사만남회차 n → 현재까지 총 n회로 보정)
 bot.hears(/^[\/!](?:교사\s*만남\s*회차|만남\s*회차|회차)(?:@\w+)?(?:\s+(\d{1,3})\s*회?)?$/i, async (ctx) => {
@@ -3871,7 +3921,9 @@ bot.hears(/^[\/!](?:교사\s*만남\s*회차|만남\s*회차|회차)(?:@\w+)?(?:
         logs.forEach((l, i) => {
             msg += `${base + i + 1}회차 · ${l.meeting_date ? formatYmdWithDay(l.meeting_date) : '-'}\n`;
         });
-        msg += `\n<i>만남 보고서가 반영될 때마다 자동으로 1회씩 누적됩니다. 봇 도입 전 회차가 빠져 있으면 <code>/교사만남회차 총횟수</code>로 보정하세요.</i>`;
+        msg +=
+            `\n<i>만남 보고서가 반영되면 만남일당 1회씩 누적됩니다 (고쳐서 다시 올린 보고서는 수정본으로 처리).\n` +
+            `잘못 누적되면 <code>/회차취소</code>, 봇 도입 전 회차는 <code>/교사만남회차 총횟수</code>로 보정하세요.</i>`;
         await replyLong(ctx, msg);
     } catch (err: unknown) {
         console.error('[/교사만남회차 에러]:', err);
@@ -4143,8 +4195,12 @@ async function handleIncomingText(ctx: any, rawText: string, source: 'text' | 'e
         }
 
         // 만남일이 다음 일정으로 바뀌기 전에 이번 만남을 누적
-        const round = await recordTeacherMeeting(ctx, chatId);
-        const roundText = round ? `\n👨‍🏫 <b>교사 만남 ${round}회차</b>로 누적되었습니다.` : '';
+        const meeting = await recordTeacherMeeting(ctx, chatId);
+        const roundText = !meeting
+            ? ''
+            : meeting.added
+            ? `\n👨‍🏫 <b>교사 만남 ${meeting.round}회차</b>로 누적되었습니다.`
+            : `\n✏️ 직전 보고서의 수정본으로 반영했습니다. (교사 만남 <b>${meeting.round}회차</b> 유지)`;
 
         const rawNextDate = extractNextMeetingRaw(text);
 
