@@ -67,6 +67,18 @@ async function initDb() {
             -- 신규 만남 발생 기록 (인터뷰 매칭 = 상담 이하 / 교사 매칭 = 상담 1회차)
             -- category: 인터뷰매칭 / 지인매칭 / 교사매칭
             -- source: '최초등록'(첫 만남 유형 선택) / '인터뷰후속'(인터뷰 결과 보고서 후속 신청) / '지인후속'(/교사전환)
+            -- 교사 만남 누적 기록: 만남 보고서 1건 = 1회 (같은 메시지를 수정해 다시 올려도 1회)
+            CREATE TABLE IF NOT EXISTS teacher_meetings (
+                id SERIAL PRIMARY KEY,
+                chat_id TEXT NOT NULL,
+                student_id TEXT NOT NULL,
+                message_id TEXT NOT NULL,
+                meeting_date VARCHAR(10),
+                recorded_at TIMESTAMPTZ DEFAULT NOW(),
+                UNIQUE (chat_id, message_id)
+            );
+            -- 기능 도입 전 진행한 회차 (/교사만남회차 n 으로 보정)
+            ALTER TABLE counseling_chats ADD COLUMN IF NOT EXISTS teacher_meeting_base INTEGER DEFAULT 0;
             CREATE TABLE IF NOT EXISTS meeting_events (
                 id SERIAL PRIMARY KEY,
                 chat_id TEXT NOT NULL,
@@ -254,6 +266,8 @@ interface ChatRecord {
     overdue_2_notified: number;
     meeting_time?: string | null;
     last_message_at?: string | null;
+    teacher_meeting_base?: number | null;
+    teacher_meeting_count?: number;
     created_at: string;
     updated_at: string;
 }
@@ -332,7 +346,11 @@ async function getAllChats(): Promise<ChatRecord[]> {
             t."이름" AS teacher_name,
             t."지역" AS teacher_region,
             t."구역" AS teacher_district,
-            s."교사_고유번호"::text AS teacher_code
+            s."교사_고유번호"::text AS teacher_code,
+            COALESCE(c.teacher_meeting_base, 0) + (
+                SELECT COUNT(*) FROM teacher_meetings tm
+                WHERE tm.chat_id = c.chat_id AND tm.student_id = c.matched_member_id::text
+            )::int AS teacher_meeting_count
         FROM counseling_chats c
         LEFT JOIN students s ON c.matched_member_id::text = s.id::text
         LEFT JOIN members m ON s."인도자_고유번호" = m."고유번호"
@@ -354,7 +372,11 @@ async function getChatRecord(chatId: string | number): Promise<ChatRecord | unde
             m."구역" AS guide_district,
             t."이름" AS teacher_name,
             t."지역" AS teacher_region,
-            t."구역" AS teacher_district
+            t."구역" AS teacher_district,
+            COALESCE(c.teacher_meeting_base, 0) + (
+                SELECT COUNT(*) FROM teacher_meetings tm
+                WHERE tm.chat_id = c.chat_id AND tm.student_id = c.matched_member_id::text
+            )::int AS teacher_meeting_count
         FROM counseling_chats c
         LEFT JOIN students s ON c.matched_member_id::text = s.id::text
         LEFT JOIN members m ON s."인도자_고유번호" = m."고유번호"
@@ -417,7 +439,7 @@ async function upsertMeetingDate(chatId: string | number, title: string, meeting
 // 방 정보 동적 업데이트
 async function updateChat(chatId: string | number, patch: Partial<ChatRecord>) {
     const id = String(chatId);
-    const ignoredKeys = ['chat_id', 'matched_student_name', 'student_target', 'student_stage', 'guide_name', 'guide_region', 'guide_district', 'teacher_name', 'teacher_region', 'teacher_district', 'teacher_code'];
+    const ignoredKeys = ['chat_id', 'matched_student_name', 'student_target', 'student_stage', 'guide_name', 'guide_region', 'guide_district', 'teacher_name', 'teacher_region', 'teacher_district', 'teacher_code', 'teacher_meeting_count'];
     const keys = Object.keys(patch).filter((k) => !ignoredKeys.includes(k));
     if (keys.length === 0) return;
 
@@ -1646,6 +1668,7 @@ bot.hears(/^[\/!](start|help|도움말)(?:@\w+)?$/i, async (ctx) => {
             '• <b>만남 중단 처리</b>: <code>/만남중단 [상세 사유]</code> → 사유 버튼 선택\n' +
             '• <b>피드백 제출</b>: 메시지 내 <code>#피드백</code> 태그 포함\n' +
             '• <b>만남 보고서 양식</b>: <code>/만남보고서양식</code> 또는 <code>/교사만남양식</code>\n' +
+            '• <b>교사 만남 누적 회차</b>: <code>/교사만남회차</code> (봇 도입 전 회차 보정: <code>/교사만남회차 총횟수</code>)\n' +
             '• <b>만남 보고서 제출</b>: 양식 내 <code>다음만남일: MM-DD</code> 포함\n' +
             '   <i>(보고서를 수정하거나 사진 설명글로 올려도 인식됩니다)</i>\n\n' +
             '<b>4. 지인 만남 (일정만 관리)</b>\n' +
@@ -2354,7 +2377,9 @@ bot.hears(/^[\/!]상태확인(?:@\w+)?$/i, async (ctx) => {
 
     let typeText = '• <b>만남 유형</b>: ⚠️ 미선택\n';
     if (record.meeting_type === '교사') {
-        typeText = '• <b>만남 유형</b>: 👨‍🏫 <b>교사 만남 진행 중</b>\n';
+        typeText =
+            `• <b>만남 유형</b>: 👨‍🏫 <b>교사 만남 진행 중</b>\n` +
+            `   - <b>누적 만남</b>: <b>${record.teacher_meeting_count ?? 0}회</b> (기록 보기: <code>/교사만남회차</code>)\n`;
     } else if (record.meeting_type === '지인') {
         typeText =
             '• <b>만남 유형</b>: 🤝 <b>지인 만남 진행 중</b> (일정만 관리)\n' +
@@ -2792,6 +2817,7 @@ bot.hears(/^(?:[\/!]?관리자\s+)(교사|교사만남|교사목록|교사건)$/
             return (
                 `<b>${idx}. ${studentName}</b>${stageBadge} [${escapeHtml(chat.room_title || '대화방')}]\n` +
                 `   • 다음만남일: <b>${dateDisplay}</b>\n` +
+                `   • 누적 만남: <b>${chat.teacher_meeting_count ?? 0}회</b>\n` +
                 `   • 사전피드백: ${feedbackBadge} / 만남보고서: ${reportBadge}\n` +
                 `   • 담당인도자: ${escapeHtml(chat.guide_name || '-')} (${escapeHtml(
                     chat.guide_region || ''
@@ -3772,6 +3798,87 @@ async function sendWeeklySummaryIfMonday() {
     );
 }
 
+// 교사 만남 보고서 1건을 1회로 누적하고 현재 회차 반환 (인터뷰·지인 만남은 집계하지 않음)
+// 같은 메시지를 수정하거나 다시 판정해도 message_id 기준으로 한 번만 기록
+async function recordTeacherMeeting(ctx: any, chatId: number | string): Promise<number | null> {
+    try {
+        const record = await getChatRecord(chatId);
+        if (!record?.matched_member_id || record.meeting_type === '인터뷰' || record.meeting_type === '지인') return null;
+
+        const messageId = ctx.message?.message_id ?? ctx.editedMessage?.message_id;
+        if (!messageId) return null;
+
+        // 보고한 만남의 날짜: 등록된 만남일이 오늘 이전이면 그 날짜, 아니면(미정·미래) 보고한 날
+        const todayStr = dayjs().tz('Asia/Seoul').format('YYYY-MM-DD');
+        const meetingDate =
+            /^\d{4}-\d{2}-\d{2}$/.test(record.meeting_date || '') && record.meeting_date <= todayStr
+                ? record.meeting_date
+                : todayStr;
+
+        await neonPool.query(
+            `INSERT INTO teacher_meetings (chat_id, student_id, message_id, meeting_date) VALUES ($1, $2, $3, $4)
+             ON CONFLICT (chat_id, message_id) DO NOTHING;`,
+            [String(chatId), String(record.matched_member_id), String(messageId), meetingDate]
+        );
+        return (await getChatRecord(chatId))?.teacher_meeting_count ?? null;
+    } catch (err: unknown) {
+        console.error('[교사 만남 누적 실패]:', getErrorMessage(err));
+        return null;
+    }
+}
+
+// 교사 만남 회차 확인·보정 (/교사만남회차 → 기록 보기, /교사만남회차 n → 현재까지 총 n회로 보정)
+bot.hears(/^[\/!](?:교사\s*만남\s*회차|만남\s*회차|회차)(?:@\w+)?(?:\s+(\d{1,3})\s*회?)?$/i, async (ctx) => {
+    try {
+        const record = await getChatRecord(ctx.chat.id);
+        if (!record?.matched_member_id) {
+            await ctx.reply('⚠️ 먼저 <code>/최초등록</code>으로 대상자를 매칭해주세요.', { parse_mode: 'HTML' });
+            return;
+        }
+        const studentId = String(record.matched_member_id);
+        const logs = (
+            await neonPool.query(
+                `SELECT meeting_date FROM teacher_meetings WHERE chat_id = $1 AND student_id = $2 ORDER BY meeting_date, id;`,
+                [String(ctx.chat.id), studentId]
+            )
+        ).rows;
+
+        const wanted = ctx.match[1];
+        if (wanted !== undefined) {
+            const total = Number(wanted);
+            if (total < logs.length) {
+                await ctx.reply(
+                    `⚠️ 봇에 기록된 교사 만남이 이미 <b>${logs.length}회</b>입니다. ${logs.length} 이상으로 입력해주세요.`,
+                    { parse_mode: 'HTML' }
+                );
+                return;
+            }
+            await updateChat(ctx.chat.id, { teacher_meeting_base: total - logs.length });
+            await ctx.reply(
+                `✅ <b>교사 만남 누적 ${total}회</b>로 보정했습니다.\n` +
+                    `<i>(봇 기록 ${logs.length}회 + 이전 진행분 ${total - logs.length}회 · 다음 만남 보고서부터 ${total + 1}회차로 이어집니다)</i>`,
+                { parse_mode: 'HTML' }
+            );
+            return;
+        }
+
+        const base = Number(record.teacher_meeting_base || 0);
+        let msg =
+            `👨‍🏫 <b>[교사 만남 누적] ${escapeHtml(record.matched_student_name || '')}</b>\n` +
+            `• 총 <b>${base + logs.length}회</b>` +
+            (base ? ` (이전 진행분 ${base}회 + 봇 기록 ${logs.length}회)` : '') +
+            `\n\n`;
+        logs.forEach((l, i) => {
+            msg += `${base + i + 1}회차 · ${l.meeting_date ? formatYmdWithDay(l.meeting_date) : '-'}\n`;
+        });
+        msg += `\n<i>만남 보고서가 반영될 때마다 자동으로 1회씩 누적됩니다. 봇 도입 전 회차가 빠져 있으면 <code>/교사만남회차 총횟수</code>로 보정하세요.</i>`;
+        await replyLong(ctx, msg);
+    } catch (err: unknown) {
+        console.error('[/교사만남회차 에러]:', err);
+        await ctx.reply(`⚠️ 교사 만남 회차 조회 중 오류 발생: ${getErrorMessage(err)}`);
+    }
+});
+
 // 10. 일반 텍스트 수신 (사전 보고서, 결과 보고서, 만남 보고서 및 #피드백 감지)
 // source: 'text' 일반 메시지 / 'edited' 수정된 메시지 / 'caption' 사진·파일 설명글
 async function handleIncomingText(ctx: any, rawText: string, source: 'text' | 'edited' | 'caption') {
@@ -4035,6 +4142,10 @@ async function handleIncomingText(ctx: any, rawText: string, source: 'text' | 'e
             return;
         }
 
+        // 만남일이 다음 일정으로 바뀌기 전에 이번 만남을 누적
+        const round = await recordTeacherMeeting(ctx, chatId);
+        const roundText = round ? `\n👨‍🏫 <b>교사 만남 ${round}회차</b>로 누적되었습니다.` : '';
+
         const rawNextDate = extractNextMeetingRaw(text);
 
         if (rawNextDate && rawNextDate.includes('미정')) {
@@ -4044,7 +4155,8 @@ async function handleIncomingText(ctx: any, rawText: string, source: 'text' | 'e
             await ctx.reply(
                 '✅ <b>만남 보고서가 정상 반영되었습니다.</b>\n\n' +
                     '📌 <b>다음 만남일이 [미정]으로 기록되었습니다.</b>\n' +
-                    '추후 만남 일정이 다시 잡히면 <code>/만남일 MM-DD</code>로 알려주세요!',
+                    '추후 만남 일정이 다시 잡히면 <code>/만남일 MM-DD</code>로 알려주세요!' +
+                    roundText,
                 { parse_mode: 'HTML' }
             );
             return;
@@ -4057,7 +4169,8 @@ async function handleIncomingText(ctx: any, rawText: string, source: 'text' | 'e
             await ctx.reply(
                 '⚠️ 만남 보고서는 확인되었으나 <b>다음만남일</b> 날짜를 인식하지 못했습니다.\n' +
                     (rawNextDate ? `❌ 인식하지 못한 입력: ${escapeHtml(rawNextDate)}\n` : '') +
-                    '<code>/만남일 MM-DD</code> 또는 <code>/만남일 미정</code>으로 일정을 등록해주세요.',
+                    '<code>/만남일 MM-DD</code> 또는 <code>/만남일 미정</code>으로 일정을 등록해주세요.' +
+                    roundText,
                 { parse_mode: 'HTML' }
             );
             return;
@@ -4071,7 +4184,8 @@ async function handleIncomingText(ctx: any, rawText: string, source: 'text' | 'e
                 nextTime
             )}</b>로 자동 갱신되었습니다.` +
                 getWeekdayWarning(rawNextDate || '', nextDate) +
-                getPastDateWarning(nextDate),
+                getPastDateWarning(nextDate) +
+                roundText,
             { parse_mode: 'HTML' }
         );
         return;
