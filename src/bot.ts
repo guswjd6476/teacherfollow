@@ -84,6 +84,8 @@ async function initDb() {
                 ON teacher_meetings (chat_id, student_id, meeting_date);
             -- 기능 도입 전 진행한 회차 (/교사만남회차 n 으로 보정)
             ALTER TABLE counseling_chats ADD COLUMN IF NOT EXISTS teacher_meeting_base INTEGER DEFAULT 0;
+            -- 섭등 후 회차 중 봇 기록 이전 진행분 (/섭등회차 n 으로 보정)
+            ALTER TABLE counseling_chats ADD COLUMN IF NOT EXISTS seop_meeting_base INTEGER DEFAULT 0;
             CREATE TABLE IF NOT EXISTS meeting_events (
                 id SERIAL PRIMARY KEY,
                 chat_id TEXT NOT NULL,
@@ -272,6 +274,7 @@ interface ChatRecord {
     meeting_time?: string | null;
     last_message_at?: string | null;
     teacher_meeting_base?: number | null;
+    seop_meeting_base?: number | null;
     teacher_meeting_count?: number;
     created_at: string;
     updated_at: string;
@@ -688,16 +691,30 @@ function getStudentStageRank(stage: unknown): number {
 }
 
 // 단계별 등록일 조회 (예: '찾' → 찾_등록일 / 찾등록일 / 찾*등록* / 찾*일 순으로 탐색)
-function getStageRegDate(row: Record<string, any>, prefix: string): string | null {
+function stageRegDateKeys(row: Record<string, any>, prefix: string): string[] {
     const keys = Object.keys(row).filter((k) => k.startsWith(prefix));
-    const ordered = [
+    return [
         ...[`${prefix}_등록일`, `${prefix}등록일`].filter((k) => keys.includes(k)),
         ...keys.filter((k) => k.includes('등록')),
         ...keys.filter((k) => k.endsWith('일')),
     ];
-    for (const key of ordered) {
+}
+
+function getStageRegDate(row: Record<string, any>, prefix: string): string | null {
+    for (const key of stageRegDateKeys(row, prefix)) {
         const formatted = formatDateDisplay(row[key]);
         if (formatted !== '-') return formatted;
+    }
+    return null;
+}
+
+// 단계 등록일을 날짜 비교용 'YYYY-MM-DD'로 (없거나 날짜가 아니면 null)
+function getStageRegYmd(row: Record<string, any>, prefix: string): string | null {
+    for (const key of stageRegDateKeys(row, prefix)) {
+        const raw = row[key];
+        if (!raw || ['', 'EMPTY_STRING', 'NULL'].includes(String(raw).trim())) continue;
+        const d = raw instanceof Date ? dayjs(raw).tz('Asia/Seoul') : dayjs(String(raw).trim());
+        if (d.isValid()) return d.format('YYYY-MM-DD');
     }
     return null;
 }
@@ -1674,6 +1691,7 @@ bot.hears(/^[\/!](start|help|도움말)(?:@\w+)?$/i, async (ctx) => {
             '• <b>피드백 제출</b>: 메시지 내 <code>#피드백</code> 태그 포함\n' +
             '• <b>만남 보고서 양식</b>: <code>/만남보고서양식</code> 또는 <code>/교사만남양식</code>\n' +
             '• <b>교사 만남 누적 회차</b>: <code>/교사만남회차</code> (보정: <code>/교사만남회차 총횟수</code>, 마지막 1회 취소: <code>/회차취소</code>)\n' +
+            '• <b>섭등 후 회차</b>: <code>/섭등회차</code> (섭등일 만남 = 1회차, 보정: <code>/섭등회차 총횟수</code>)\n' +
             '• <b>만남 보고서 제출</b>: 양식 내 <code>다음만남일: MM-DD</code> 포함\n' +
             '   <i>(보고서를 수정하거나 사진 설명글로 올려도 인식됩니다)</i>\n\n' +
             '<b>4. 지인 만남 (일정만 관리)</b>\n' +
@@ -2384,7 +2402,9 @@ bot.hears(/^[\/!]상태확인(?:@\w+)?$/i, async (ctx) => {
     if (record.meeting_type === '교사') {
         typeText =
             `• <b>만남 유형</b>: 👨‍🏫 <b>교사 만남 진행 중</b>\n` +
-            `   - <b>누적 만남</b>: <b>${record.teacher_meeting_count ?? 0}회</b> (기록 보기: <code>/교사만남회차</code>)\n`;
+            `   - <b>누적 만남</b>: <b>${record.teacher_meeting_count ?? 0}회</b>${seopRoundText(
+                await getSeopRound(record)
+            )} (기록 보기: <code>/교사만남회차</code>)\n`;
     } else if (record.meeting_type === '지인') {
         typeText =
             '• <b>만남 유형</b>: 🤝 <b>지인 만남 진행 중</b> (일정만 관리)\n' +
@@ -2796,6 +2816,7 @@ bot.hears(/^(?:[\/!]?관리자\s+)(교사|교사만남|교사목록|교사건)$/
             return;
         }
 
+        const seopRounds = await getSeopRounds(teacherChats);
         const header =
             `👨‍🏫 <b>[교사 만남 진행건 목록] (총 ${teacherChats.length}건)</b>\n` +
             `기준시각: ${dayjs().tz('Asia/Seoul').format('YYYY-MM-DD HH:mm')}\n` +
@@ -2822,7 +2843,9 @@ bot.hears(/^(?:[\/!]?관리자\s+)(교사|교사만남|교사목록|교사건)$/
             return (
                 `<b>${idx}. ${studentName}</b>${stageBadge} [${escapeHtml(chat.room_title || '대화방')}]\n` +
                 `   • 다음만남일: <b>${dateDisplay}</b>\n` +
-                `   • 누적 만남: <b>${chat.teacher_meeting_count ?? 0}회</b>\n` +
+                `   • 누적 만남: <b>${chat.teacher_meeting_count ?? 0}회</b>${seopRoundText(
+                    seopRounds.get(String(chat.chat_id)) ?? null
+                )}\n` +
                 `   • 사전피드백: ${feedbackBadge} / 만남보고서: ${reportBadge}\n` +
                 `   • 담당인도자: ${escapeHtml(chat.guide_name || '-')} (${escapeHtml(
                     chat.guide_region || ''
@@ -3810,7 +3833,7 @@ async function sendWeeklySummaryIfMonday() {
 async function recordTeacherMeeting(
     ctx: any,
     chatId: number | string
-): Promise<{ round: number; added: boolean } | null> {
+): Promise<{ round: number; added: boolean; seop: SeopRound | null } | null> {
     try {
         const record = await getChatRecord(chatId);
         if (!record?.matched_member_id || record.meeting_type === '인터뷰' || record.meeting_type === '지인') return null;
@@ -3826,7 +3849,8 @@ async function recordTeacherMeeting(
                 `SELECT 1 FROM teacher_meetings WHERE chat_id = $1 AND student_id = $2 LIMIT 1`,
                 [id, studentId]
             );
-            if (prev.rows.length > 0) return { round: record.teacher_meeting_count ?? 0, added: false };
+            if (prev.rows.length > 0)
+                return { round: record.teacher_meeting_count ?? 0, added: false, seop: await getSeopRound(record) };
         }
         const meetingDate = isDate && registered <= todayStr ? registered : todayStr;
 
@@ -3836,13 +3860,109 @@ async function recordTeacherMeeting(
              ON CONFLICT DO NOTHING;`,
             [id, studentId, String(messageId), meetingDate]
         );
-        const round = (await getChatRecord(chatId))?.teacher_meeting_count ?? 0;
-        return { round, added: !!res.rowCount };
+        const updated = await getChatRecord(chatId);
+        return { round: updated?.teacher_meeting_count ?? 0, added: !!res.rowCount, seop: await getSeopRound(updated) };
     } catch (err: unknown) {
         console.error('[교사 만남 누적 실패]:', getErrorMessage(err));
         return null;
     }
 }
+
+// 섭등 후 회차: 섭등한 날의 만남을 1회차로 보고, 섭등일 이후 교사 만남마다 +1
+//   = 1 + 이전 진행분 보정 + (섭등일 다음 날부터 기록된 교사 만남 수)
+//   (섭등일 당일 보고서가 있어도 없어도 섭등일은 1회로만 셈)
+type SeopRound = { seopDate: string; round: number };
+
+async function getSeopRounds(
+    chats: Pick<ChatRecord, 'chat_id' | 'matched_member_id' | 'seop_meeting_base'>[]
+): Promise<Map<string, SeopRound>> {
+    const result = new Map<string, SeopRound>();
+    const studentIds = [...new Set(chats.filter((c) => c.matched_member_id).map((c) => String(c.matched_member_id)))];
+    if (studentIds.length === 0) return result;
+
+    const students = (await neonPool.query(`SELECT * FROM students WHERE id::text = ANY($1::text[])`, [studentIds])).rows;
+    const seopDateById = new Map<string, string>();
+    for (const st of students) {
+        const ymd = getStageRegYmd(st, '섭');
+        if (ymd) seopDateById.set(String(st.id), ymd);
+    }
+    if (seopDateById.size === 0) return result;
+
+    const logs = (
+        await neonPool.query(
+            `SELECT chat_id, student_id, meeting_date FROM teacher_meetings WHERE student_id = ANY($1::text[])`,
+            [[...seopDateById.keys()]]
+        )
+    ).rows;
+
+    for (const c of chats) {
+        const studentId = String(c.matched_member_id ?? '');
+        const seopDate = seopDateById.get(studentId);
+        if (!seopDate) continue;
+        const after = logs.filter(
+            (l) => l.chat_id === String(c.chat_id) && l.student_id === studentId && l.meeting_date > seopDate
+        ).length;
+        result.set(String(c.chat_id), { seopDate, round: 1 + Number(c.seop_meeting_base || 0) + after });
+    }
+    return result;
+}
+
+async function getSeopRound(chat: ChatRecord | undefined): Promise<SeopRound | null> {
+    if (!chat) return null;
+    return (await getSeopRounds([chat])).get(String(chat.chat_id)) ?? null;
+}
+
+function seopRoundText(seop: SeopRound | null): string {
+    return seop ? ` · 섭등 후 <b>${seop.round}회차</b>` : '';
+}
+
+// 섭등 후 회차 보정 (/섭등회차 n → 섭등일 포함 현재까지 총 n회로 보정)
+bot.hears(/^[\/!]섭등\s*(?:후\s*)?회차(?:@\w+)?(?:\s+(\d{1,3})\s*회?)?$/i, async (ctx) => {
+    try {
+        const record = await getChatRecord(ctx.chat.id);
+        const seop = await getSeopRound(record);
+        if (!record || !seop) {
+            await ctx.reply(
+                '⚠️ 섭등일을 찾을 수 없습니다. 행정(students)에 <b>섭 등록일</b>이 입력되어 있는지 확인해주세요. (<code>/행정확인</code>)',
+                { parse_mode: 'HTML' }
+            );
+            return;
+        }
+
+        const wanted = ctx.match[1];
+        const currentBase = Number(record.seop_meeting_base || 0);
+        const fromLogs = seop.round - currentBase; // 1(섭등일) + 봇 기록
+        if (wanted === undefined) {
+            await ctx.reply(
+                `🌱 <b>섭등 후 교사 만남</b>\n` +
+                    `• 섭등일: <b>${formatYmdWithDay(seop.seopDate)}</b>\n` +
+                    `• 섭등 후 <b>${seop.round}회차</b>` +
+                    (currentBase ? ` (이전 진행분 보정 ${currentBase}회 포함)` : '') +
+                    `\n\n<i>섭등한 날의 만남이 1회차이고, 이후 만남 보고서마다 +1 됩니다.\n` +
+                    `빠진 회차가 있으면 <code>/섭등회차 총횟수</code>로 보정하세요.</i>`,
+                { parse_mode: 'HTML' }
+            );
+            return;
+        }
+
+        const total = Number(wanted);
+        if (total < fromLogs) {
+            await ctx.reply(
+                `⚠️ 섭등일과 봇 기록으로 이미 <b>${fromLogs}회</b>입니다. ${fromLogs} 이상으로 입력해주세요.`,
+                { parse_mode: 'HTML' }
+            );
+            return;
+        }
+        await updateChat(ctx.chat.id, { seop_meeting_base: total - fromLogs });
+        await ctx.reply(
+            `✅ <b>섭등 후 ${total}회차</b>로 보정했습니다. 다음 만남 보고서부터 ${total + 1}회차로 이어집니다.`,
+            { parse_mode: 'HTML' }
+        );
+    } catch (err: unknown) {
+        console.error('[/섭등회차 에러]:', err);
+        await ctx.reply(`⚠️ 섭등 후 회차 처리 중 오류 발생: ${getErrorMessage(err)}`);
+    }
+});
 
 // 마지막 누적 1회 취소 (/회차취소) — 잘못 누적된 경우
 bot.hears(/^[\/!](?:교사\s*만남\s*)?회차\s*취소(?:@\w+)?$/i, async (ctx) => {
@@ -3913,13 +4033,24 @@ bot.hears(/^[\/!](?:교사\s*만남\s*회차|만남\s*회차|회차)(?:@\w+)?(?:
         }
 
         const base = Number(record.teacher_meeting_base || 0);
+        const seop = await getSeopRound(record);
         let msg =
             `👨‍🏫 <b>[교사 만남 누적] ${escapeHtml(record.matched_student_name || '')}</b>\n` +
             `• 총 <b>${base + logs.length}회</b>` +
             (base ? ` (이전 진행분 ${base}회 + 봇 기록 ${logs.length}회)` : '') +
-            `\n\n`;
+            `\n` +
+            (seop
+                ? `• 섭등일 <b>${formatYmdWithDay(seop.seopDate)}</b> · 섭등 후 <b>${seop.round}회차</b> (<code>/섭등회차</code>)\n`
+                : '') +
+            `\n`;
+        // 섭등 후 회차 = 1(섭등일) + 보정분 + 섭등일 다음 날부터의 기록 순번
+        let seopIdx = seop ? 1 + Number(record.seop_meeting_base || 0) : 0;
         logs.forEach((l, i) => {
-            msg += `${base + i + 1}회차 · ${l.meeting_date ? formatYmdWithDay(l.meeting_date) : '-'}\n`;
+            const afterSeop = seop && l.meeting_date > seop.seopDate;
+            msg +=
+                `${base + i + 1}회차 · ${l.meeting_date ? formatYmdWithDay(l.meeting_date) : '-'}` +
+                (afterSeop ? ` · 섭등 후 ${++seopIdx}회차` : seop && l.meeting_date === seop.seopDate ? ' · 🌱 섭등일' : '') +
+                `\n`;
         });
         msg +=
             `\n<i>만남 보고서가 반영되면 만남일당 1회씩 누적됩니다 (고쳐서 다시 올린 보고서는 수정본으로 처리).\n` +
@@ -4199,8 +4330,10 @@ async function handleIncomingText(ctx: any, rawText: string, source: 'text' | 'e
         const roundText = !meeting
             ? ''
             : meeting.added
-            ? `\n👨‍🏫 <b>교사 만남 ${meeting.round}회차</b>로 누적되었습니다.`
-            : `\n✏️ 직전 보고서의 수정본으로 반영했습니다. (교사 만남 <b>${meeting.round}회차</b> 유지)`;
+            ? `\n👨‍🏫 <b>교사 만남 ${meeting.round}회차</b>${seopRoundText(meeting.seop)}로 누적되었습니다.`
+            : `\n✏️ 직전 보고서의 수정본으로 반영했습니다. (교사 만남 <b>${meeting.round}회차</b>${seopRoundText(
+                  meeting.seop
+              )} 유지)`;
 
         const rawNextDate = extractNextMeetingRaw(text);
 
