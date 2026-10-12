@@ -1712,7 +1712,7 @@ bot.hears(/^[\/!](start|help|도움말)(?:@\w+)?$/i, async (ctx) => {
             '• <b>미등록 및 미정 방 조회</b>: <code>관리자 미등록</code>\n' +
             '• <b>만남일 경과 미갱신 방</b>: <code>관리자 미갱신</code> (타부서 교사 제외, 포함: <code>관리자 미갱신 타부서포함</code>)\n' +
             '   일괄 독촉: <code>관리자 미갱신 알림</code>, <code>관리자 미갱신 타부서포함 알림</code>\n' +
-            '• <b>합등 이상 봇 미초대 명단</b>: <code>관리자 미초대</code>\n' +
+            '• <b>찾등 이상 봇 미초대 명단</b>: <code>관리자 미초대</code>\n' +
             '• <b>만남 중단 방 목록</b>: <code>관리자 중단</code>\n' +
             '• <b>특수 구분 현황 (3가지 종합)</b>: <code>관리자 구분</code>\n' +
             '• <b>구분별 단독 조회</b>: <code>관리자 n월 섭등목표</code>, <code>관리자 n월 예정목표</code>, <code>관리자 n월 가능목표</code>, <code>관리자 n월 확정목표</code>\n' +
@@ -3216,7 +3216,7 @@ bot.hears(/^(?:[\/!]?관리자\s+)(미갱신\s*명단|미갱신|일정\s*미갱�
     }
 });
 
-// 합등 이상인데 봇이 초대(매칭)된 방이 없는 대상자 (관리자 미초대)
+// 찾등 이상(찾·합·섭)인데 봇이 초대(매칭)된 방이 없는 대상자 (관리자 미초대)
 bot.hears(/^(?:[\/!]?관리자\s+)(미초대|봇미초대|초대누락)$/i, async (ctx) => {
     try {
         const userId = String(ctx.from?.id);
@@ -3237,21 +3237,26 @@ bot.hears(/^(?:[\/!]?관리자\s+)(미초대|봇미초대|초대누락)$/i, asyn
             FROM students s
             LEFT JOIN members m ON s."인도자_고유번호" = m."고유번호"
             LEFT JOIN members t ON s."교사_고유번호" = t."고유번호"
-            WHERE LEFT(TRIM(COALESCE(s."단계"::text, '')), 1) IN ('합', '섭')
+            WHERE LEFT(TRIM(COALESCE(s."단계"::text, '')), 1) IN ('찾', '합', '섭')
               AND NOT EXISTS (
                   SELECT 1 FROM counseling_chats c
                   WHERE c.matched_member_id::text = s.id::text
               )
-            ORDER BY m."지역", m."구역", m."이름", s."이름";
+            ORDER BY
+                CASE LEFT(TRIM(s."단계"::text), 1) WHEN '섭' THEN 0 WHEN '합' THEN 1 ELSE 2 END,
+                m."지역", m."구역", m."이름", s."이름";
         `);
 
         if (res.rows.length === 0) {
-            await ctx.reply('✨ <b>합등 이상 대상자 중 봇이 초대되지 않은 건이 없습니다.</b>', { parse_mode: 'HTML' });
+            await ctx.reply('✨ <b>찾등 이상 대상자 중 봇이 초대되지 않은 건이 없습니다.</b>', { parse_mode: 'HTML' });
             return;
         }
 
+        const stageCount = (prefix: string) =>
+            res.rows.filter((s) => String(s['단계'] ?? '').trim().startsWith(prefix)).length;
         const header =
-            `📭 <b>[합등 이상 · 봇 미초대 명단] (총 ${res.rows.length}건)</b>\n` +
+            `📭 <b>[찾등 이상 · 봇 미초대 명단] (총 ${res.rows.length}건)</b>\n` +
+            `• 섭 ${stageCount('섭')}건 · 합 ${stageCount('합')}건 · 찾 ${stageCount('찾')}건\n` +
             `기준시각: ${dayjs().tz('Asia/Seoul').format('YYYY-MM-DD HH:mm')}\n` +
             `<i>(봇이 있어도 /최초등록 매칭이 안 된 방은 미초대로 집계됩니다)</i>\n` +
             `━━━━━━━━━━━━━━━━━━\n\n`;
@@ -3260,12 +3265,14 @@ bot.hears(/^(?:[\/!]?관리자\s+)(미초대|봇미초대|초대누락)$/i, asyn
             const guideInfo = s.guide_name
                 ? `${escapeHtml(s.guide_name)} (${escapeHtml(s.guide_region || '')} ${escapeHtml(s.guide_district || '')})`
                 : '미등록';
-            const hapDate = getStageRegDate(s, '합');
+            // 현재 단계의 등록일 표시 (찾 → 찾_등록일, 합 → 합_등록일, 섭 → 섭_등록일)
+            const stagePrefix = String(s['단계'] ?? '').trim().charAt(0);
+            const regDate = getStageRegDate(s, stagePrefix);
             return (
                 `<b>${idx}. ${escapeHtml(s['이름'] || '이름 없음')}</b> [${escapeHtml(s['단계'] || '-')}]\n` +
                 `   • 인도자: ${guideInfo}\n` +
                 `   • 교사: ${teacherText(s)}\n` +
-                `   • 합_등록일: ${hapDate ? escapeHtml(hapDate) : '미등록'}\n\n`
+                `   • ${escapeHtml(stagePrefix)}_등록일: ${regDate ? escapeHtml(regDate) : '미등록'}\n\n`
             );
         });
     } catch (err: unknown) {
