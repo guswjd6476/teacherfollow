@@ -856,15 +856,18 @@ bot.use(async (ctx, next) => {
         const status = await getUserAuthStatus(ctx.from?.id);
         if (status === 'approved') return next();
 
+        // 차단된 사용자는 어떤 메시지·버튼에도 응답하지 않음
+        if (status === 'rejected') return;
+
         const data = ctx.callbackQuery && 'data' in ctx.callbackQuery ? ctx.callbackQuery.data : '';
         if (data === 'auth_request') return handleAuthRequest(ctx);
         if (ctx.callbackQuery) return ctx.answerCbQuery('🔒 인증 후 사용할 수 있습니다.');
 
-        if (ctx.message) {
+        // 미인증 사용자는 /start 에만 안내하고, 그 외 메시지는 무시 (관련 없는 사람과 대화가 이어지지 않도록)
+        const text = ctx.message && 'text' in ctx.message ? ctx.message.text : '';
+        if (/^\/start(?:@\w+)?(?:\s|$)/i.test(text)) {
             if (status === 'pending') {
                 await ctx.reply('⏳ 인증 요청이 접수되어 관리자 승인을 기다리고 있습니다. 승인되면 알려드릴게요.');
-            } else if (status === 'rejected') {
-                await ctx.reply('⛔ 사용 권한이 없습니다. 필요하시면 관리자에게 문의해주세요.');
             } else {
                 await ctx.reply(
                     '🔒 <b>이 봇은 인증된 사용자만 사용할 수 있습니다.</b>\n\n' +
@@ -887,7 +890,11 @@ bot.use(async (ctx, next) => {
         await authorizeChat(chat.id, 'migration');
         return next();
     }
-    // 인증되지 않은 방의 메시지는 무시
+    // 인증되지 않은 방(그룹)이면 봇이 방에서 나감 — 채널 등은 그냥 무시
+    if (chat.type === 'group' || chat.type === 'supergroup') {
+        console.log(`[미인증 방 퇴장] Chat: ${chat.id}`);
+        await ctx.leaveChat().catch((err: unknown) => console.error('[미인증 방 퇴장 실패]:', getErrorMessage(err)));
+    }
 });
 
 async function handleAuthRequest(ctx: any) {
@@ -1733,6 +1740,56 @@ bot.hears(/^[\/!](start|help|도움말)(?:@\w+)?$/i, async (ctx) => {
     );
 });
 
+// 매칭 완료 안내 + 첫 만남 유형 버튼 (텔레그램 /최초등록, 웹 최초등록 공통)
+const MEETING_TYPE_KEYBOARD = {
+    inline_keyboard: [
+        [
+            { text: '🎙️ 인터뷰 만남', callback_data: 'type_interview' },
+            { text: '👨‍🏫 교사 만남', callback_data: 'type_teacher' },
+        ],
+        [{ text: '🤝 지인 만남', callback_data: 'type_acquaintance' }],
+    ],
+};
+
+function matchedPromptText(
+    m: { student_name: string; student_id: number | string; guide_name?: string | null; region?: string | null; district?: string | null },
+    viaWeb = false
+): string {
+    return (
+        `🎉 <b>대상자 매칭 완료!</b>${viaWeb ? ' <i>(웹에서 등록)</i>' : ''}\n\n` +
+        `• <b>섭외자(대상자)</b>: <b>${escapeHtml(m.student_name)}</b> (ID: ${m.student_id})\n` +
+        `• <b>인도자</b>: ${escapeHtml(m.guide_name || '미등록')} (${escapeHtml(m.region || '-')} / 구역: ${escapeHtml(
+            m.district || '-'
+        )})\n\n` +
+        `👇 <b>첫 만남의 유형을 선택해주세요:</b>`
+    );
+}
+
+// 웹에서 최초등록(방 ↔ 대상자 매칭)한 뒤 호출 — 상담방에 매칭 안내·유형 버튼, 인도자·교사 지역 담당방에 알림
+async function notifyWebRegistration(chatId: string): Promise<{ ok: boolean; error?: string }> {
+    const record = await getChatRecord(chatId);
+    if (!record) return { ok: false, error: '상담방을 찾을 수 없습니다.' };
+    if (!record.matched_member_id) return { ok: false, error: '매칭된 대상자가 없습니다.' };
+
+    await bot.telegram.sendMessage(
+        chatId,
+        matchedPromptText(
+            {
+                student_name: record.matched_student_name || '대상자',
+                student_id: record.matched_member_id,
+                guide_name: record.guide_name,
+                region: record.guide_region,
+                district: record.guide_district,
+            },
+            true
+        ),
+        { parse_mode: 'HTML', reply_markup: MEETING_TYPE_KEYBOARD }
+    );
+
+    await notifyRegionChats(record, `🆕 <b>[최초등록 - 웹]</b>\n` + regionRoomInfo(record));
+    return { ok: true };
+}
+
 // 섭외자 최초 등록 (/최초등록 섭외자/지역/팀/인도자)
 bot.hears(/^[\/!]최초등록(?:@\w+)?(?:\s+(.+))?$/i, async (ctx) => {
     const rawInput = ctx.match[1]?.trim();
@@ -1796,26 +1853,7 @@ bot.hears(/^[\/!]최초등록(?:@\w+)?(?:\s+(.+))?$/i, async (ctx) => {
         await ensureChatRecord(ctx.chat.id, title);
         await updateChat(ctx.chat.id, { matched_member_id: match.student_id });
 
-        await ctx.reply(
-            `🎉 <b>대상자 매칭 완료!</b>\n\n` +
-                `• <b>섭외자(대상자)</b>: <b>${escapeHtml(match.student_name)}</b> (ID: ${match.student_id})\n` +
-                `• <b>인도자</b>: ${escapeHtml(match.guide_name)} (${escapeHtml(match.region)} / 구역: ${escapeHtml(
-                    match.district
-                )})\n\n` +
-                `👇 <b>첫 만남의 유형을 선택해주세요:</b>`,
-            {
-                parse_mode: 'HTML',
-                reply_markup: {
-                    inline_keyboard: [
-                        [
-                            { text: '🎙️ 인터뷰 만남', callback_data: 'type_interview' },
-                            { text: '👨‍🏫 교사 만남', callback_data: 'type_teacher' },
-                        ],
-                        [{ text: '🤝 지인 만남', callback_data: 'type_acquaintance' }],
-                    ],
-                },
-            }
-        );
+        await ctx.reply(matchedPromptText(match), { parse_mode: 'HTML', reply_markup: MEETING_TYPE_KEYBOARD });
     } catch (err: unknown) {
         console.error('[최초등록 JOIN 매칭 에러]:', err);
         await ctx.reply(`⚠️ DB 매칭 조회 중 오류 발생: ${getErrorMessage(err)}`);
@@ -4615,6 +4653,38 @@ const server = http.createServer(async (req, res) => {
 
     if (req.method === 'POST' && url.pathname === '/webhook') {
         return webhookHandler(req, res);
+    }
+
+    // 웹 최초등록 알림 (POST /notify/registered, 헤더 x-notify-secret, 본문 { chat_id })
+    // BOT_NOTIFY_SECRET이 없으면 이 기능은 꺼짐 — 웹 서버에도 같은 값을 넣어야 함
+    if (req.method === 'POST' && url.pathname === '/notify/registered') {
+        const json = (status: number, body: object) => {
+            res.writeHead(status, { 'Content-Type': 'application/json; charset=utf-8' });
+            res.end(JSON.stringify(body));
+        };
+        const notifySecret = process.env.BOT_NOTIFY_SECRET;
+        const given = String(req.headers['x-notify-secret'] || '');
+        if (
+            !notifySecret ||
+            given.length !== notifySecret.length ||
+            !crypto.timingSafeEqual(Buffer.from(given), Buffer.from(notifySecret))
+        ) {
+            return json(403, { ok: false, error: 'Forbidden' });
+        }
+        try {
+            let raw = '';
+            for await (const chunk of req) {
+                raw += chunk;
+                if (raw.length > 10_000) return json(413, { ok: false, error: 'Too large' });
+            }
+            const chatId = String(JSON.parse(raw || '{}').chat_id ?? '').trim();
+            if (!/^-?\d+$/.test(chatId)) return json(400, { ok: false, error: 'chat_id가 필요합니다.' });
+            const result = await notifyWebRegistration(chatId);
+            return json(result.ok ? 200 : 404, result);
+        } catch (err: unknown) {
+            console.error('[웹 최초등록 알림 에러]:', getErrorMessage(err));
+            return json(500, { ok: false, error: getErrorMessage(err) });
+        }
     }
 
     // DB 오류 등으로 알림이 실패해도 서버가 죽지 않고 500으로 응답 (크론 쪽에서 실패 확인 가능)
