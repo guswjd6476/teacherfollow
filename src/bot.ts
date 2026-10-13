@@ -856,18 +856,15 @@ bot.use(async (ctx, next) => {
         const status = await getUserAuthStatus(ctx.from?.id);
         if (status === 'approved') return next();
 
-        // 차단된 사용자는 어떤 메시지·버튼에도 응답하지 않음
-        if (status === 'rejected') return;
-
         const data = ctx.callbackQuery && 'data' in ctx.callbackQuery ? ctx.callbackQuery.data : '';
         if (data === 'auth_request') return handleAuthRequest(ctx);
         if (ctx.callbackQuery) return ctx.answerCbQuery('🔒 인증 후 사용할 수 있습니다.');
 
-        // 미인증 사용자는 /start 에만 안내하고, 그 외 메시지는 무시 (관련 없는 사람과 대화가 이어지지 않도록)
-        const text = ctx.message && 'text' in ctx.message ? ctx.message.text : '';
-        if (/^\/start(?:@\w+)?(?:\s|$)/i.test(text)) {
+        if (ctx.message) {
             if (status === 'pending') {
                 await ctx.reply('⏳ 인증 요청이 접수되어 관리자 승인을 기다리고 있습니다. 승인되면 알려드릴게요.');
+            } else if (status === 'rejected') {
+                await ctx.reply('⛔ 사용 권한이 없습니다. 필요하시면 관리자에게 문의해주세요.');
             } else {
                 await ctx.reply(
                     '🔒 <b>이 봇은 인증된 사용자만 사용할 수 있습니다.</b>\n\n' +
@@ -890,11 +887,7 @@ bot.use(async (ctx, next) => {
         await authorizeChat(chat.id, 'migration');
         return next();
     }
-    // 인증되지 않은 방(그룹)이면 봇이 방에서 나감 — 채널 등은 그냥 무시
-    if (chat.type === 'group' || chat.type === 'supergroup') {
-        console.log(`[미인증 방 퇴장] Chat: ${chat.id}`);
-        await ctx.leaveChat().catch((err: unknown) => console.error('[미인증 방 퇴장 실패]:', getErrorMessage(err)));
-    }
+    // 인증되지 않은 방의 메시지는 무시
 });
 
 async function handleAuthRequest(ctx: any) {
