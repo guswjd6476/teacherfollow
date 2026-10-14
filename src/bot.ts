@@ -5023,6 +5023,44 @@ const server = http.createServer(async (req, res) => {
         }
     }
 
+    // 웹에서 지역 담당방으로 보내는 알림 (장기 미진행·주간 요약 등)
+    // POST /notify/region-message, 헤더 x-notify-secret, 본문 { chat_id, text } — 지역 담당방(region_chats)에만 보낸다
+    if (req.method === 'POST' && url.pathname === '/notify/region-message') {
+        const json = (status: number, body: object) => {
+            res.writeHead(status, { 'Content-Type': 'application/json; charset=utf-8' });
+            res.end(JSON.stringify(body));
+        };
+        const notifySecret = process.env.BOT_NOTIFY_SECRET;
+        const given = String(req.headers['x-notify-secret'] || '');
+        if (
+            !notifySecret ||
+            given.length !== notifySecret.length ||
+            !crypto.timingSafeEqual(Buffer.from(given), Buffer.from(notifySecret))
+        ) {
+            return json(403, { ok: false, error: 'Forbidden' });
+        }
+        try {
+            let raw = '';
+            for await (const chunk of req) {
+                raw += chunk;
+                if (raw.length > 20_000) return json(413, { ok: false, error: 'Too large' });
+            }
+            const body = JSON.parse(raw || '{}');
+            const chatId = String(body.chat_id ?? '').trim();
+            const text = String(body.text ?? '');
+            if (!/^-?\d+$/.test(chatId)) return json(400, { ok: false, error: 'chat_id가 필요합니다.' });
+            if (!text.trim() || text.length > 4000) return json(400, { ok: false, error: '내용은 1~4000자여야 합니다.' });
+            if (!(await isRegionChat(chatId))) {
+                return json(404, { ok: false, error: '상담 봇의 지역 담당방이 아닙니다. (/담당방등록 필요)' });
+            }
+            await bot.telegram.sendMessage(chatId, text, { parse_mode: 'HTML' });
+            return json(200, { ok: true });
+        } catch (err: unknown) {
+            console.error('[지역 담당방 웹 알림 에러]:', getErrorMessage(err));
+            return json(500, { ok: false, error: getErrorMessage(err) });
+        }
+    }
+
     // DB 오류 등으로 알림이 실패해도 서버가 죽지 않고 500으로 응답 (크론 쪽에서 실패 확인 가능)
     const cronJobs: Record<string, [() => Promise<void>, string]> = {
         '/cron-10am': [
