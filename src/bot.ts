@@ -147,7 +147,11 @@ async function initDb() {
             ADD COLUMN IF NOT EXISTS stage_reminder_date VARCHAR(10),
             ADD COLUMN IF NOT EXISTS stage_reminder_count INTEGER DEFAULT 0,
             ADD COLUMN IF NOT EXISTS drop_ack_at TIMESTAMPTZ,
-            ADD COLUMN IF NOT EXISTS stop_phase VARCHAR(30);
+            ADD COLUMN IF NOT EXISTS stop_phase VARCHAR(30),
+            -- 오전 10시 점검 때 계산한 지금 걸린 진행 멈춤 안내 (웹 상담 현황이 같은 기준으로 보여준다)
+            ADD COLUMN IF NOT EXISTS nudge_key VARCHAR(20),
+            ADD COLUMN IF NOT EXISTS nudge_label VARCHAR(40),
+            ADD COLUMN IF NOT EXISTS nudge_checked_on VARCHAR(10);
         `);
         // 중단 시점 기록 도입 전에 중단된 방 채우기 (여러 번 실행돼도 빈 것만 채움)
         await neonPool.query(`
@@ -464,6 +468,12 @@ async function getChatRecord(chatId: string | number): Promise<ChatRecord | unde
 async function ensureChatRecord(chatId: string | number, title: string) {
     const id = String(chatId);
     const safeTitle = title || '대화방';
+    // 기록이 없는 방 (웹에서 지웠거나 보관된 방): 보관해 둔 기록이 있으면 먼저 복원
+    const exists = await neonPool.query(`SELECT 1 FROM counseling_chats WHERE chat_id = $1`, [id]);
+    if (exists.rowCount === 0) {
+        if (await restoreArchivedChat(id)) console.log(`[보관 기록 복원] Chat: ${id}`);
+        else await adoptBasicGroupRecord(id, safeTitle);
+    }
 
     const query = `
         INSERT INTO counseling_chats (chat_id, room_title, updated_at, last_message_at)
@@ -649,10 +659,21 @@ function formatYmdWithDay(ymd: string): string {
 }
 
 // 진행 구분 예정일 (progress_note에 'YYYY-MM-DD'로 저장) — 날짜가 아니면 null
+// 예전·직접 입력으로 '10/16', '10.16', '10,09'처럼 월·일만 있으면 오늘에서 가장 가까운 해로 본다
 function getStageDate(note?: string | null): dayjs.Dayjs | null {
-    if (!note || !/^\d{4}-\d{2}-\d{2}$/.test(note.trim())) return null;
-    const d = dayjs(note.trim());
-    return d.isValid() ? d : null;
+    const v = (note ?? '').trim();
+    if (/^\d{4}-\d{2}-\d{2}$/.test(v)) {
+        const d = dayjs(v);
+        return d.isValid() ? d : null;
+    }
+    const m = v.match(/^(\d{1,2})\s*[/.,\-월]\s*(\d{1,2})일?$/);
+    if (!m) return null;
+    const month = Number(m[1]);
+    const day = Number(m[2]);
+    if (month < 1 || month > 12 || day < 1 || day > 31) return null;
+    const now = dayjs().tz('Asia/Seoul');
+    const candidates = [-1, 0, 1].map((dy) => dayjs(new Date(now.year() + dy, month - 1, day)));
+    return candidates.reduce((best, d) => (Math.abs(d.diff(now)) < Math.abs(best.diff(now)) ? d : best));
 }
 
 function formatStageDate(note?: string | null): string {
@@ -922,6 +943,20 @@ async function isVerifiedUser(userId?: number | string): Promise<boolean> {
 async function isAuthorizedChat(chatId: number | string): Promise<boolean> {
     const res = await neonPool.query(`SELECT 1 FROM authorized_chats WHERE chat_id = $1`, [String(chatId)]);
     return res.rows.length > 0;
+}
+
+// 슈퍼그룹(-100…) 방에 처음 기록이 생길 때, 전환 신호를 놓친 경우를 대비해 같은 제목의 옛 일반 그룹 기록을 이어받는다
+// (같은 제목의 -100이 아닌 방이 딱 하나이고, 그 방이 더 먼저 생겼을 때만. 일반 그룹 ID로는 전환 뒤 메시지가 오지 않는다)
+async function adoptBasicGroupRecord(newChatId: string, title: string) {
+    if (!newChatId.startsWith('-100') || !title || title === '대화방') return;
+    const res = await neonPool.query(
+        `SELECT chat_id FROM counseling_chats WHERE room_title = $1 AND chat_id NOT LIKE '-100%' AND chat_id LIKE '-%'`,
+        [title]
+    );
+    if (res.rows.length !== 1) return;
+    const oldId = String(res.rows[0].chat_id);
+    console.log(`[슈퍼그룹 전환 추정] 같은 제목의 옛 방 ${oldId} -> ${newChatId}`);
+    await mergeMigratedChat(oldId, newChatId);
 }
 
 // 일반 그룹이 슈퍼그룹으로 바뀌면 텔레그램이 방 ID를 새로 준다 (-100으로 시작).
@@ -2434,6 +2469,15 @@ async function sendNudgeEscalations(items: NudgeEscalation[], regionChats: Regio
 
 async function sendRoomNudge(c: ChatRecord, today: dayjs.Dayjs, todayStr: string, escalations: NudgeEscalation[]) {
     const nudge = getRoomNudge(c, today, todayStr);
+    // 지금 걸린 안내를 방마다 저장 (안내를 보내지 않는 날·횟수를 다 채운 방도). 웹 상담 현황이 이 값을 그대로 보여준다
+    await neonPool
+        .query(`UPDATE counseling_chats SET nudge_key = $2, nudge_label = $3, nudge_checked_on = $4 WHERE chat_id = $1`, [
+            c.chat_id,
+            nudge?.key ?? null,
+            nudge?.label ?? null,
+            todayStr,
+        ])
+        .catch((err) => console.error(`[진행 멈춤 상태 저장 실패] Chat: ${c.chat_id}`, getErrorMessage(err)));
     if (!nudge || c.stage_reminder_date === todayStr) return;
     // 단계가 바뀌면 횟수를 새로 셈
     const sent = c.stage_reminder_key === nudge.key ? c.stage_reminder_count ?? 0 : 0;
