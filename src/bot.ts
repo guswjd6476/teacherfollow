@@ -2637,6 +2637,53 @@ bot.hears(/^[\/!]최초등록(?:@\w+)?(?:\s+(.+))?$/i, async (ctx) => {
     }
 });
 
+// 첫 만남 유형을 정했을 때 방에 보내는 안내 (유형 버튼, 웹에서 고른 경우 공통)
+const TYPE_SELECTED_MESSAGE: Record<'인터뷰' | '교사' | '지인', string> = {
+    인터뷰:
+        `🎙️ <b>첫 만남이 [인터뷰 만남]으로 지정되었습니다.</b>\n\n` +
+        `채팅방에 <b>[인터뷰 사전 보고서]</b>를 올려주시면 인터뷰어/타이퍼/예정일이 자동 등록됩니다.\n\n` +
+        `💡 양식이 필요하시면 <code>/인터뷰사전양식</code>을 입력하세요.`,
+    교사:
+        `👨‍🏫 <b>첫 만남이 [교사 만남]으로 지정되었습니다.</b>\n\n` +
+        `이어서 만남 일정을 지정해주세요:\n` +
+        `• <code>/만남일 MM-DD</code> 또는 <code>/만남일 미정</code>`,
+    지인:
+        `🤝 <b>첫 만남이 [지인 만남]으로 지정되었습니다.</b>\n\n` +
+        `지인 만남은 <b>일정만 관리</b>합니다 (보고서 제출·미제출 알림 없음).\n` +
+        `• 일정 등록: <code>/만남일 MM-DD</code> 또는 <code>/만남일 미정</code>\n` +
+        `• 교사 만남으로 넘어가면: <code>/교사전환</code>`,
+};
+
+// 웹(관리 화면)에서 상담방을 고쳤을 때 그 방에 보내는 알림. actions로 상담 봇이 같은 일을 했을 때의 안내를 덧붙인다
+// actions: type:인터뷰|type:교사|type:지인 (첫 만남 유형), pre_report (인터뷰 사전 보고서), stop (중단), resume (중단 해제)
+function webEditMessage(record: ChatRecord, changes: string[], actions: Set<string>): string {
+    let msg =
+        `✏️ <b>[관리 화면에서 수정되었습니다]</b>` +
+        (record.matched_student_name ? ` (👤 ${escapeHtml(record.matched_student_name)})` : '') +
+        `\n` +
+        changes.map((c) => `• ${escapeHtml(c)}`).join('\n');
+    for (const type of ['인터뷰', '교사', '지인'] as const) {
+        if (actions.has(`type:${type}`)) msg += `\n\n${TYPE_SELECTED_MESSAGE[type]}`;
+    }
+    if (actions.has('pre_report')) {
+        const date = record.interview_date || '미정';
+        msg +=
+            `\n\n🎙️ <b>[인터뷰 사전 보고서]</b>\n` +
+            `• <b>인터뷰어</b>: ${escapeHtml(record.interviewer_info || record.interviewer_name || '미지정')}\n` +
+            `• <b>타이퍼</b>: ${escapeHtml(record.typer_info || record.typer_name || '미지정')}\n` +
+            `• <b>인터뷰 예정일</b>: <b>${
+                date === '미정' ? '미정' : formatMeetingWhen(formatYmdWithDay(date), record.meeting_time)
+            }</b>\n` +
+            `• <b>D-1 알림 (10:00)</b>: 인터뷰 안내 알림\n` +
+            `• <b>당일 알림 (22:00)</b>: 결과 보고서 등록 알림`;
+    }
+    if (actions.has('stop')) msg += `\n\n💡 만남이 재개되면 <code>/만남일 MM-DD</code>를 입력하여 새 일정을 등록해주세요.`;
+    if (actions.has('resume') && (!record.meeting_date || record.meeting_date === '미정')) {
+        msg += `\n\n💡 다음 만남 일정을 <code>/만남일 MM-DD</code>로 등록해주세요.`;
+    }
+    return msg;
+}
+
 // 버튼 콜백: 만남 유형 선택
 bot.action('type_interview', async (ctx) => {
     try {
@@ -2644,12 +2691,7 @@ bot.action('type_interview', async (ctx) => {
         await updateChat(ctx.chat!.id, { meeting_type: '인터뷰', type_selected_at: new Date().toISOString() });
         await recordMeetingEvent(ctx.chat!.id, '인터뷰매칭', '최초등록');
 
-        await ctx.reply(
-            `🎙️ <b>첫 만남이 [인터뷰 만남]으로 지정되었습니다.</b>\n\n` +
-                `채팅방에 <b>[인터뷰 사전 보고서]</b>를 올려주시면 인터뷰어/타이퍼/예정일이 자동 등록됩니다.\n\n` +
-                `💡 양식이 필요하시면 <code>/인터뷰사전양식</code>을 입력하세요.`,
-            { parse_mode: 'HTML' }
-        );
+        await ctx.reply(TYPE_SELECTED_MESSAGE['인터뷰'], { parse_mode: 'HTML' });
     } catch (err: unknown) {
         console.error('[type_interview 에러]:', err);
     }
@@ -2661,12 +2703,7 @@ bot.action('type_teacher', async (ctx) => {
         await updateChat(ctx.chat!.id, { meeting_type: '교사', type_selected_at: new Date().toISOString() });
         await recordMeetingEvent(ctx.chat!.id, '교사매칭', '최초등록');
 
-        await ctx.reply(
-            `👨‍🏫 <b>첫 만남이 [교사 만남]으로 지정되었습니다.</b>\n\n` +
-                `이어서 만남 일정을 지정해주세요:\n` +
-                `• <code>/만남일 MM-DD</code> 또는 <code>/만남일 미정</code>`,
-            { parse_mode: 'HTML' }
-        );
+        await ctx.reply(TYPE_SELECTED_MESSAGE['교사'], { parse_mode: 'HTML' });
     } catch (err: unknown) {
         console.error('[type_teacher 에러]:', err);
     }
@@ -2678,13 +2715,7 @@ bot.action('type_acquaintance', async (ctx) => {
         await updateChat(ctx.chat!.id, { meeting_type: '지인', type_selected_at: new Date().toISOString() });
         await recordMeetingEvent(ctx.chat!.id, '지인매칭', '최초등록');
 
-        await ctx.reply(
-            `🤝 <b>첫 만남이 [지인 만남]으로 지정되었습니다.</b>\n\n` +
-                `지인 만남은 <b>일정만 관리</b>합니다 (보고서 제출·미제출 알림 없음).\n` +
-                `• 일정 등록: <code>/만남일 MM-DD</code> 또는 <code>/만남일 미정</code>\n` +
-                `• 교사 만남으로 넘어가면: <code>/교사전환</code>`,
-            { parse_mode: 'HTML' }
-        );
+        await ctx.reply(TYPE_SELECTED_MESSAGE['지인'], { parse_mode: 'HTML' });
     } catch (err: unknown) {
         console.error('[type_acquaintance 에러]:', err);
     }
@@ -5646,9 +5677,10 @@ const server = http.createServer(async (req, res) => {
         }
     }
 
-    // 웹에서 지역 담당방으로 보내는 알림 (장기 미진행·주간 요약 등)
-    // POST /notify/region-message, 헤더 x-notify-secret, 본문 { chat_id, text } — 지역 담당방(region_chats)에만 보낸다
-    if (req.method === 'POST' && url.pathname === '/notify/region-message') {
+    // 웹에서 보내는 알림 (헤더 x-notify-secret = BOT_NOTIFY_SECRET, 본문 JSON)
+    // - /notify/region-message { chat_id, text }: 지역 담당방(region_chats)에 글 그대로 (장기 미진행·주간 요약·웹 수정 알림 등)
+    // - /notify/web-edit { chat_id, changes, actions }: 웹에서 고친 상담방에 상담 봇 문구로 알림
+    if (req.method === 'POST' && (url.pathname === '/notify/region-message' || url.pathname === '/notify/web-edit')) {
         const json = (status: number, body: object) => {
             res.writeHead(status, { 'Content-Type': 'application/json; charset=utf-8' });
             res.end(JSON.stringify(body));
@@ -5670,16 +5702,30 @@ const server = http.createServer(async (req, res) => {
             }
             const body = JSON.parse(raw || '{}');
             const chatId = String(body.chat_id ?? '').trim();
-            const text = String(body.text ?? '');
             if (!/^-?\d+$/.test(chatId)) return json(400, { ok: false, error: 'chat_id가 필요합니다.' });
-            if (!text.trim() || text.length > 4000) return json(400, { ok: false, error: '내용은 1~4000자여야 합니다.' });
-            if (!(await isRegionChat(chatId))) {
-                return json(404, { ok: false, error: '상담 봇의 지역 담당방이 아닙니다. (/담당방등록 필요)' });
+
+            if (url.pathname === '/notify/region-message') {
+                const text = String(body.text ?? '');
+                if (!text.trim() || text.length > 4000) return json(400, { ok: false, error: '내용은 1~4000자여야 합니다.' });
+                if (!(await isRegionChat(chatId))) {
+                    return json(404, { ok: false, error: '상담 봇의 지역 담당방이 아닙니다. (/담당방등록 필요)' });
+                }
+                await bot.telegram.sendMessage(chatId, text, { parse_mode: 'HTML' });
+                return json(200, { ok: true });
             }
-            await bot.telegram.sendMessage(chatId, text, { parse_mode: 'HTML' });
+
+            // /notify/web-edit: 인증된 상담방에만
+            const record = await getChatRecord(chatId);
+            if (!record || !(await isAuthorizedChat(chatId))) {
+                return json(404, { ok: false, error: '상담 봇이 관리하는 상담방이 아닙니다.' });
+            }
+            const changes = (Array.isArray(body.changes) ? body.changes : []).map(String).slice(0, 20);
+            const actions = new Set<string>((Array.isArray(body.actions) ? body.actions : []).map(String));
+            if (changes.length === 0) return json(400, { ok: false, error: '바뀐 내용이 없습니다.' });
+            await bot.telegram.sendMessage(chatId, webEditMessage(record, changes, actions), { parse_mode: 'HTML' });
             return json(200, { ok: true });
         } catch (err: unknown) {
-            console.error('[지역 담당방 웹 알림 에러]:', getErrorMessage(err));
+            console.error('[웹 알림 에러]:', getErrorMessage(err));
             return json(500, { ok: false, error: getErrorMessage(err) });
         }
     }
