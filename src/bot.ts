@@ -805,6 +805,7 @@ async function replyLong(ctx: any, html: string, lastMessageExtra: Record<string
  * 🤖 텔레그램 봇 핸들러
  * ===================================================== */
 const bot = new Telegraf(BOT_TOKEN);
+const BOT_STARTED_AT = dayjs();
 
 bot.catch((err: unknown, ctx) => {
     console.error(`[Telegraf 처리 에러] Chat ID: ${ctx.chat?.id}`, err);
@@ -842,6 +843,8 @@ function displayName(user: { first_name?: string; last_name?: string; username?:
     const name = [user.first_name, user.last_name].filter(Boolean).join(' ') || '이름 없음';
     return user.username ? `${name} (@${user.username})` : name;
 }
+
+const CHAT_ID_COMMAND = /^[\/!](?:방|채팅방|대화방|내)\s*(?:ID|아이디)(?:@\w+)?$|^[\/!](?:chat_?id|id)(?:@\w+)?$/i;
 
 const AUTH_REQUEST_KEYBOARD = {
     reply_markup: { inline_keyboard: [[{ text: '🔐 인증 요청하기', callback_data: 'auth_request' }]] },
@@ -887,7 +890,9 @@ bot.use(async (ctx, next) => {
         await authorizeChat(chat.id, 'migration');
         return next();
     }
-    // 인증되지 않은 방의 메시지는 무시
+    // 인증되지 않은 방의 메시지는 무시 — 단, 관리자의 /방ID 는 허용
+    const text = typeof message?.text === 'string' ? message.text : '';
+    if (CHAT_ID_COMMAND.test(text) && isAdmin(ctx.from?.id)) return next();
 });
 
 async function handleAuthRequest(ctx: any) {
@@ -1678,7 +1683,8 @@ bot.hears(/^[\/!](start|help|도움말)(?:@\w+)?$/i, async (ctx) => {
             '• <b>대상자 최초 등록</b>: <code>/최초등록 섭외자/지역/팀/인도자</code>\n' +
             '• <b>현재 방 상태 확인</b>: <code>/상태확인</code>\n' +
             '• <b>행정 등록 확인</b>: <code>/행정확인</code>\n' +
-            '• <b>목표월 수정</b>: <code>/목표월수정 n월</code>\n\n' +
+            '• <b>목표월 수정</b>: <code>/목표월수정 n월</code>\n' +
+            '• <b>채팅방 ID 확인</b>: <code>/방ID</code>\n\n' +
             '<b>2. 인터뷰 만남 단계</b>\n' +
             '• <b>사전 보고서 등록</b>: 채팅방에 <code>[인터뷰 사전 보고서]</code> 양식 전송\n' +
             '• <b>사전 보고서 양식</b>: <code>/인터뷰사전양식</code>\n' +
@@ -1728,9 +1734,94 @@ bot.hears(/^[\/!](start|help|도움말)(?:@\w+)?$/i, async (ctx) => {
             '   <i>(보고서 지연·만남 중단·매일 오전 10시/밤 10시 지역 요약이 담당방으로 자동 발송)</i>\n' +
             '• <b>신규 만남 발생</b>: <code>관리자 신규</code> (기간: <code>오늘</code>, <code>어제</code>, <code>이번주</code>, <code>지난주</code>, <code>10월</code>)\n' +
             '   <i>(상담 이하 = 인터뷰 매칭 / 지인 만남 / 상담 1회차 = 교사 매칭, 밤 10시 지역 요약에도 포함)</i>\n' +
-            '• <b>담당방 공지</b>: <code>/담당방공지 내용</code> (특정 지역만: <code>/담당방공지 [강북,강남] 내용</code>)',
+            '• <b>담당방 공지</b>: <code>/담당방공지 내용</code> (특정 지역만: <code>/담당방공지 [강북,강남] 내용</code>)\n' +
+            '• <b>봇 상태 점검</b>: <code>관리자 봇상태</code> (설정·DB·웹훅 오류 확인)',
         { parse_mode: 'HTML' }
     );
+});
+
+// 채팅방·내 텔레그램 ID 확인 (/방ID, /내ID, /chatid)
+bot.hears(CHAT_ID_COMMAND, async (ctx) => {
+    const chat = ctx.chat;
+    const from = ctx.from;
+    const typeLabel: Record<string, string> = { private: '개인 대화', group: '그룹', supergroup: '슈퍼그룹', channel: '채널' };
+    const title = 'title' in chat ? chat.title : '';
+    let msg =
+        `🆔 <b>[채팅방 ID]</b>\n\n` +
+        (title ? `• <b>방 이름</b>: ${escapeHtml(title)}\n` : '') +
+        `• <b>방 종류</b>: ${typeLabel[chat.type] || chat.type}\n` +
+        `• <b>채팅방 ID</b>: <code>${chat.id}</code>\n`;
+    if (from) msg += `• <b>내 텔레그램 ID</b>: <code>${from.id}</code>\n`;
+    if (chat.type !== 'private') {
+        const [registered, regions] = await Promise.all([
+            getChatRecord(chat.id).catch(() => undefined),
+            neonPool
+                .query(`SELECT region FROM region_chats WHERE chat_id = $1 ORDER BY region`, [String(chat.id)])
+                .then((r) => r.rows.map((row) => row.region as string))
+                .catch(() => [] as string[]),
+        ]);
+        if (regions.length) msg += `• <b>지역 담당방</b>: ${escapeHtml(regions.join(', '))}\n`;
+        else if (registered?.matched_student_name) msg += `• <b>매칭 대상자</b>: ${escapeHtml(registered.matched_student_name)}\n`;
+        else msg += `• <b>매칭 대상자</b>: 미매칭\n`;
+    }
+    msg += `\n<i>(ID를 길게 눌러 복사할 수 있습니다)</i>`;
+    await ctx.reply(msg, { parse_mode: 'HTML' });
+});
+
+// 관리자: 봇 상태 점검 (관리자 봇상태) — 설정값은 '있음/없음'만 표시하고 값 자체는 보여주지 않음
+bot.hears(/^(?:[\/!]?관리자\s+)(봇\s*상태|상태\s*점검|설정\s*점검)$/i, async (ctx) => {
+    if (!isAdmin(ctx.from?.id)) {
+        await ctx.reply('⛔ 접근 권한이 없습니다.');
+        return;
+    }
+    const yesNo = (v?: string) => (v ? '✅ 설정됨' : '❌ 없음');
+    let msg = `🩺 <b>[봇 상태 점검]</b>\n\n`;
+
+    msg += `<b>⚙️ 설정</b>\n`;
+    msg += `• 관리자: ${ADMIN_IDS.length}명\n`;
+    msg += `• BOT_NOTIFY_SECRET (웹 최초등록 알림): ${yesNo(process.env.BOT_NOTIFY_SECRET)}\n`;
+    msg += `• CRON_SECRET (알림 주소 보호): ${yesNo(process.env.CRON_SECRET)}\n`;
+    msg += `• WEBHOOK_SECRET: ${process.env.WEBHOOK_SECRET ? '✅ 직접 설정' : '✅ 자동 (봇 토큰에서 생성)'}\n`;
+    msg += `• WEEKLY_REPORT_CHAT_ID (주간 요약 받는 곳): ${
+        process.env.WEEKLY_REPORT_CHAT_ID ? '✅ 설정됨' : 'ℹ️ 없음 (관리자에게 발송)'
+    }\n\n`;
+
+    msg += `<b>🗄 DB</b>\n`;
+    try {
+        const r = await neonPool.query(`
+            SELECT
+                (SELECT COUNT(*) FROM counseling_chats) AS chats,
+                (SELECT COUNT(*) FROM counseling_chats WHERE matched_member_id IS NOT NULL) AS matched,
+                (SELECT COUNT(*) FROM authorized_chats) AS authorized,
+                (SELECT COUNT(DISTINCT chat_id) FROM region_chats) AS region_chats,
+                (SELECT COUNT(*) FROM verified_users WHERE status = 'approved') AS approved,
+                (SELECT COUNT(*) FROM verified_users WHERE status = 'pending') AS pending
+        `);
+        const c = r.rows[0];
+        msg += `• 연결: ✅ 정상\n`;
+        msg += `• 상담방: ${c.chats}개 (매칭 ${c.matched}개) · 인증된 방 ${c.authorized}개 · 지역 담당방 ${c.region_chats}개\n`;
+        msg += `• 인증 사용자: ${c.approved}명${Number(c.pending) ? ` (⏳ 승인 대기 ${c.pending}명)` : ''}\n\n`;
+    } catch (err: unknown) {
+        msg += `• 연결: ❌ 오류 — ${escapeHtml(getErrorMessage(err))}\n\n`;
+    }
+
+    msg += `<b>📡 텔레그램 웹훅</b>\n`;
+    try {
+        const info = await ctx.telegram.getWebhookInfo();
+        msg += `• 주소: ${info.url ? escapeHtml(info.url) : '❌ 미등록'}\n`;
+        msg += `• 처리 대기 중인 메시지: ${info.pending_update_count}건\n`;
+        if (info.last_error_date) {
+            const when = dayjs.unix(info.last_error_date).tz('Asia/Seoul').format('M/D HH:mm');
+            msg += `• 최근 오류: ${when} — ${escapeHtml(info.last_error_message || '')}\n`;
+        } else {
+            msg += `• 최근 오류: 없음\n`;
+        }
+    } catch (err: unknown) {
+        msg += `• 조회 실패: ${escapeHtml(getErrorMessage(err))}\n`;
+    }
+
+    msg += `\n<i>봇 시작: ${BOT_STARTED_AT.tz('Asia/Seoul').format('M/D HH:mm')}</i>`;
+    await ctx.reply(msg, { parse_mode: 'HTML' });
 });
 
 // 매칭 완료 안내 + 첫 만남 유형 버튼 (텔레그램 /최초등록, 웹 최초등록 공통)
@@ -4247,18 +4338,18 @@ async function handleIncomingText(ctx: any, rawText: string, source: 'text' | 'c
     }
 
     // B. [인터뷰 결과 보고서] 감지
+    // '인터뷰 결과'만 있는 경우는 후속신청 항목도 있어야 인정 (만남 보고서 본문의 '인터뷰 결과 공유' 등 오인 방지)
     const isInterviewReport =
-        text.includes('인터뷰 결과 보고서') ||
-        text.includes('인터뷰 결과') ||
-        text.includes('인터뷰보고서') ||
-        text.includes('인터뷰 보고서');
+        /인터뷰\s*결과\s*보고서|인터뷰\s*보고서/.test(text) || (text.includes('인터뷰 결과') && /후속\s*신청/.test(text));
 
     if (isInterviewReport) {
         const followUpMatch = text.match(/후속[ \t]*신청[ \t]*[:：\-]?[ \t]*([^\n\r]+)/i);
         const followUpRaw = followUpMatch ? followUpMatch[1].trim() : '';
 
-        const isNotApplied = /미신청|안함|거절|취소|보류|불가|X|x/i.test(followUpRaw);
-        const isApplied = /신청|완료|진행|O|o/i.test(followUpRaw) && !isNotApplied;
+        // X·O 표기는 단독으로 쓴 경우만 인정 (예전엔 'next' 같은 글자 속 x도 미신청으로 오인)
+        const isNotApplied = /미신청|안함|거절|취소|보류|불가/.test(followUpRaw) || /^[Xx✕×❌](?![A-Za-z])/.test(followUpRaw);
+        const isApplied =
+            (/신청|완료|진행/.test(followUpRaw) || /^(?:[Oo○⭕]|ok)(?![A-Za-z])/i.test(followUpRaw)) && !isNotApplied;
 
         if (isNotApplied) {
             const reasonMatch = text.match(/미신청[ \t]*사유[ \t]*[:：\-]?[ \t]*([^\n\r]+)/i);
