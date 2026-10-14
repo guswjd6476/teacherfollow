@@ -1655,8 +1655,10 @@ function meetingEventLine(e: MeetingEvent, withDate = true): string {
     const guideWhere = [e.guide_region, e.guide_district].filter(Boolean).join(' ');
     return (
         `• ${withDate ? `${dayjs(e.occurred_at).tz('Asia/Seoul').format('MM/DD')} ` : ''}` +
-        `<b>${escapeHtml(e.matched_student_name || '이름 없음')}</b>` +
-        (e.room_title ? ` (${escapeHtml(e.room_title)})` : '') +
+        // 실명이 있으면 실명만 (방 제목은 이름을 가려 둔 경우가 많음), 없으면 방 제목
+        (e.matched_student_name
+            ? `<b>${escapeHtml(e.matched_student_name)}</b>`
+            : `${escapeHtml(e.room_title || '이름 없음')} <i>(미매칭)</i>`) +
         ` · 인도자 ${escapeHtml(e.guide_name || '-')}${guideWhere ? `(${escapeHtml(guideWhere)})` : ''}` +
         (e.category === '교사매칭' ? ` · 교사 ${teacherText(e)}` : '') +
         (e.source === '인터뷰후속' ? ' · <i>인터뷰 후속</i>' : e.source === '지인후속' ? ' · <i>지인 후속</i>' : '') +
@@ -1726,9 +1728,24 @@ bot.hears(/^(?:[\/!]?관리자\s+)신규(?:\s*만남)?(?:\s+(오늘|어제|이�
     }
 });
 
+// 인터뷰 후 교사 만남 미배정: 결과 보고서로 후속 [신청]까지 했는데, 인터뷰일로부터 3일이 지나도록
+// 교사 만남 기록이 없고 앞으로 잡힌 교사 만남일도 없는 방 → 인터뷰일로부터 지난 일수 (해당 없으면 null)
+const WAITING_TEACHER_DAYS = 3;
+function waitingTeacherDays(c: ChatRecord, today: dayjs.Dayjs, todayStr: string): number | null {
+    if (c.meeting_date === '중단' || !c.interview_report_submitted || c.follow_up_applied !== '신청') return null;
+    if (!isYmd(c.interview_date) || (c.teacher_meeting_count ?? 0) > 0) return null;
+    if (isYmd(c.meeting_date) && c.meeting_date >= todayStr) return null; // 교사 만남일이 잡혀 있음
+    const days = today.diff(dayjs(c.interview_date).startOf('day'), 'day');
+    return days >= WAITING_TEACHER_DAYS ? days : null;
+}
+
+// 요약에 넣을 '확인 필요' 항목 (진행 멈춤 안내와 같은 기준) — 보고서 미제출은 요약의 미제출 항목과 겹쳐서 제외
+const SUMMARY_SKIP_NUDGES = new Set(['no_post', 'report_late']);
+
 // 크론에서 호출: 지역 담당방마다 하루 요약 (오전 10시 'morning' / 밤 10시 'night', 각각 하루 한 번)
-// - 오전: 오늘 만남 · 보고서 미제출
-// - 밤: 오늘 만남 중 보고서 미제출 · 이전 만남 미제출 · 내일 만남
+// - 오전: 오늘 만남 · 보고서 미제출 · 교사 만남 미배정 · 확인 필요
+// - 밤: 오늘 만남 중 보고서 미제출 · 이전 만남 미제출 · 교사 만남 미배정 · 확인 필요 · 내일 만남
+// - 이름은 방 제목(가린 이름) 대신 매칭된 대상자 실명으로 표시
 //   (보고서가 제출되면 만남일이 다음 만남일로 바뀌므로, 밤에 만남일이 오늘인 방 = 아직 보고서가 안 올라온 방)
 async function sendRegionDailySummaries(mode: 'morning' | 'night') {
     const today = dayjs().tz('Asia/Seoul').startOf('day');
@@ -1747,9 +1764,11 @@ async function sendRegionDailySummaries(mode: 'morning' | 'night') {
     for (const rc of regionChats) regionsByChat.set(rc.chat_id, [...(regionsByChat.get(rc.chat_id) || []), rc.region]);
 
     const line = (c: ChatRecord) =>
-        `• ${escapeHtml(c.room_title || '대화방')}` +
-        (c.matched_student_name ? ` (👤 ${escapeHtml(c.matched_student_name)})` : '') +
+        `• ${c.matched_student_name ? `<b>${escapeHtml(c.matched_student_name)}</b>` : `${escapeHtml(c.room_title || '대화방')} <i>(미매칭)</i>`}` +
         ` · 인도자 ${escapeHtml(c.guide_name || '-')} · 교사 ${escapeHtml(c.teacher_name || '-')}`;
+    const MAX_LINES = 20;
+    const listText = (lines: string[]) =>
+        lines.slice(0, MAX_LINES).join('') + (lines.length > MAX_LINES ? `…외 ${lines.length - MAX_LINES}건\n` : '');
     const meetingLine = (c: ChatRecord) =>
         `${line(c)}${c.meeting_type ? ` [${c.meeting_type}]` : ''}${c.meeting_time ? ` ${escapeHtml(c.meeting_time)}` : ''}\n`;
     const dayLabel = (d: dayjs.Dayjs) => `${d.format('MM/DD')} (${'일월화수목금토'[d.day()]})`;
@@ -1765,19 +1784,45 @@ async function sendRegionDailySummaries(mode: 'morning' | 'night') {
 
         let overdueText = '';
         for (const c of overdue) {
-            overdueText += `${line(c)} · 만남일 ${dayjs(c.meeting_date).format('MM/DD')} (${today.diff(
+            overdueText += `${line(c)} · ${c.meeting_type === '인터뷰' ? '인터뷰일' : '만남일'} ${dayjs(c.meeting_date).format('MM/DD')} (${today.diff(
                 dayjs(c.meeting_date),
                 'day'
             )}일 경과)\n`;
         }
 
+        // 인터뷰 후 교사 만남 미배정
+        const waiting = mine
+            .map((c) => ({ c, days: waitingTeacherDays(c, today, todayStr) }))
+            .filter((w): w is { c: ChatRecord; days: number } => w.days !== null)
+            .sort((a, b) => b.days - a.days);
+        const waitingText =
+            waiting.length === 0
+                ? ''
+                : `\n🧑‍🏫 <b>인터뷰 후 교사 만남 미배정 (${WAITING_TEACHER_DAYS}일 이상): ${waiting.length}건</b>\n` +
+                  listText(waiting.map(({ c, days }) => `${line(c)} · 인터뷰 ${dayjs(c.interview_date).format('MM/DD')} (${days}일째)\n`));
+
+        // 확인 필요 (진행 멈춤 안내 기준, 항목별)
+        const needs = new Map<string, string[]>();
+        for (const c of mine) {
+            const nudge = getRoomNudge(c, today, todayStr);
+            if (!nudge || SUMMARY_SKIP_NUDGES.has(nudge.key)) continue;
+            needs.set(nudge.label, [...(needs.get(nudge.label) || []), `${line(c)}\n`]);
+        }
+        const needsCount = [...needs.values()].reduce((n, l) => n + l.length, 0);
+        const needsText =
+            needsCount === 0
+                ? ''
+                : `\n⏸ <b>확인 필요: ${needsCount}건</b>\n` +
+                  [...needs.entries()].map(([label, lines]) => `<u>${escapeHtml(label)} ${lines.length}건</u>\n` + listText(lines)).join('');
+
         const regionName = escapeHtml(regions.join(', '));
         let msg: string;
         if (mode === 'morning') {
-            if (todayMeetings.length === 0 && overdue.length === 0) continue;
+            if (todayMeetings.length === 0 && overdue.length === 0 && waiting.length === 0 && needsCount === 0) continue;
             msg = `☀️ <b>[${regionName} 지역 오늘의 요약] ${dayLabel(today)}</b>\n━━━━━━━━━━━━━━━━━━\n\n`;
             msg += `🗓 <b>오늘 만남: ${todayMeetings.length}건</b>\n` + todayMeetings.map(meetingLine).join('');
             msg += `\n⚠️ <b>보고서 미제출: ${overdue.length}건</b>\n` + overdueText;
+            msg += waitingText + needsText;
         } else {
             const todayUnreported = todayMeetings.filter((c) => !c.report_submitted && needsReport(c));
             const tomorrowMeetings = mine.filter((c) => c.meeting_date === tomorrowStr);
@@ -1788,7 +1833,9 @@ async function sendRegionDailySummaries(mode: 'morning' | 'night') {
                 todayUnreported.length === 0 &&
                 overdue.length === 0 &&
                 tomorrowMeetings.length === 0 &&
-                newEvents.length === 0
+                newEvents.length === 0 &&
+                waiting.length === 0 &&
+                needsCount === 0
             )
                 continue;
             msg = `🌙 <b>[${regionName} 지역 오늘 마감 요약] ${dayLabel(today)}</b>\n━━━━━━━━━━━━━━━━━━\n\n`;
@@ -1799,6 +1846,7 @@ async function sendRegionDailySummaries(mode: 'morning' | 'night') {
                 `📋 <b>오늘 만남 중 보고서 미제출: ${todayUnreported.length}건</b>\n` +
                 todayUnreported.map(meetingLine).join('');
             msg += `\n⚠️ <b>이전 만남 보고서 미제출: ${overdue.length}건</b>\n` + overdueText;
+            msg += waitingText + needsText;
             msg +=
                 `\n🗓 <b>내일 만남: ${tomorrowMeetings.length}건</b>\n` + tomorrowMeetings.map(meetingLine).join('');
         }
