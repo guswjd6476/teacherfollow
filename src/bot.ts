@@ -142,8 +142,11 @@ async function initDb() {
             ADD COLUMN IF NOT EXISTS meeting_time VARCHAR(20),
             ADD COLUMN IF NOT EXISTS last_message_at TIMESTAMPTZ,
             ADD COLUMN IF NOT EXISTS matched_at TIMESTAMPTZ,
-            ADD COLUMN IF NOT EXISTS type_reminder_date VARCHAR(10),
-            ADD COLUMN IF NOT EXISTS type_reminder_count INTEGER DEFAULT 0;
+            ADD COLUMN IF NOT EXISTS type_selected_at TIMESTAMPTZ,
+            ADD COLUMN IF NOT EXISTS stage_reminder_key VARCHAR(20),
+            ADD COLUMN IF NOT EXISTS stage_reminder_date VARCHAR(10),
+            ADD COLUMN IF NOT EXISTS stage_reminder_count INTEGER DEFAULT 0,
+            ADD COLUMN IF NOT EXISTS drop_ack_at TIMESTAMPTZ;
         `);
         // 봇이 방에서 나가면 방 기록을 여기로 옮겨 두었다가, 다시 초대되면 복원
         await neonPool.query(`
@@ -295,8 +298,12 @@ interface ChatRecord {
     meeting_time?: string | null;
     last_message_at?: string | null;
     matched_at?: string | null;
-    type_reminder_date?: string | null;
-    type_reminder_count?: number | null;
+    type_selected_at?: string | null;
+    stage_reminder_key?: string | null;
+    stage_reminder_date?: string | null;
+    stage_reminder_count?: number | null;
+    drop_ack_at?: string | null;
+    student_dropped_at?: string | null;
     teacher_meeting_base?: number | null;
     seop_meeting_base?: number | null;
     teacher_meeting_count?: number;
@@ -372,6 +379,7 @@ async function getAllChats(): Promise<ChatRecord[]> {
             s."이름" AS matched_student_name,
             s.target AS student_target,
             s."단계" AS student_stage,
+            s."탈락" AS student_dropped_at,
             m."이름" AS guide_name,
             m."지역" AS guide_region,
             m."구역" AS guide_district,
@@ -399,6 +407,8 @@ async function getChatRecord(chatId: string | number): Promise<ChatRecord | unde
         SELECT 
             c.*,
             s."이름" AS matched_student_name,
+            s."단계" AS student_stage,
+            s."탈락" AS student_dropped_at,
             m."이름" AS guide_name,
             m."지역" AS guide_region,
             m."구역" AS guide_district,
@@ -435,7 +445,7 @@ async function ensureChatRecord(chatId: string | number, title: string) {
     await neonPool.query(query, [id, safeTitle]);
 }
 
-// 만남일 등록/변경
+// 만남일 등록/변경 (새 일정이면 알림 상태·인터뷰 단계 안내 횟수도 초기화)
 async function upsertMeetingDate(chatId: string | number, title: string, meetingDate: string, meetingTime = '') {
     const id = String(chatId);
     const safeTitle = title || '대화방';
@@ -463,6 +473,7 @@ async function upsertMeetingDate(chatId: string | number, title: string, meeting
             d_day_22_notified = 0,
             overdue_1_notified = 0,
             overdue_2_notified = 0,
+            stage_reminder_count = 0,
             updated_at = NOW();
     `;
     await neonPool.query(query, [id, safeTitle, meetingDate, meetingTime || null]);
@@ -471,7 +482,7 @@ async function upsertMeetingDate(chatId: string | number, title: string, meeting
 // 방 정보 동적 업데이트
 async function updateChat(chatId: string | number, patch: Partial<ChatRecord>) {
     const id = String(chatId);
-    const ignoredKeys = ['chat_id', 'matched_student_name', 'student_target', 'student_stage', 'guide_name', 'guide_region', 'guide_district', 'teacher_name', 'teacher_region', 'teacher_district', 'teacher_code', 'teacher_meeting_count'];
+    const ignoredKeys = ['chat_id', 'matched_student_name', 'student_target', 'student_stage', 'student_dropped_at', 'guide_name', 'guide_region', 'guide_district', 'teacher_name', 'teacher_region', 'teacher_district', 'teacher_code', 'teacher_meeting_count'];
     const keys = Object.keys(patch).filter((k) => !ignoredKeys.includes(k));
     if (keys.length === 0) return;
 
@@ -1307,9 +1318,21 @@ function regionRoomInfo(c: ChatRecord): string {
 }
 
 // 상담방 하나에 대한 알림을 해당 지역 담당방들에 발송 (실패해도 상담방 처리는 계속)
+// 담당방이 없는 지역(또는 미매칭 방)이면 관리자 개인 대화로 대신 보냄 — 알림이 사라지지 않도록
 async function notifyRegionChats(chat: ChatRecord, message: string, regionChats?: RegionChat[]) {
     try {
         const targets = regionChatIdsFor(chat, regionChats ?? (await getRegionChats()));
+        if (targets.length === 0) {
+            const regions = [...new Set([chat.guide_region, chat.teacher_region].filter(Boolean))].join(', ') || '지역 미확인';
+            for (const adminId of ADMIN_IDS) {
+                await bot.telegram
+                    .sendMessage(adminId, `<i>(담당방 없음: ${escapeHtml(regions)} → 관리자에게 대신 전달)</i>\n` + message, {
+                        parse_mode: 'HTML',
+                    })
+                    .catch((err) => console.error(`[담당방 대체 알림 실패] ${adminId}:`, getErrorMessage(err)));
+            }
+            return;
+        }
         for (const target of targets) {
             await bot.telegram
                 .sendMessage(target, message, { parse_mode: 'HTML' })
@@ -1921,7 +1944,8 @@ bot.hears(/^[\/!](start|help|도움말)(?:@\w+)?$/i, async (ctx) => {
             '   - 타이퍼: <code>/타이퍼 강북 1팀 김공주</code> (해제: <code>/타이퍼 없음</code>)\n' +
             '   - 예정일: <code>/인터뷰일 MM-DD</code>\n' +
             '• <b>결과 보고서 양식</b>: <code>/인터뷰사후양식</code>\n' +
-            '   <i>(결과 보고서에서 [신청] 시 교사 만남으로 자동 전환)</i>\n\n' +
+            '   <i>(결과 보고서에서 [신청] 시 교사 만남으로 자동 전환)</i>\n' +
+            '\n' +
             '<b>3. 교사 만남 및 일정 관리</b>\n' +
             '• <b>만남일 설정</b>: <code>/만남일 MM-DD</code> 또는 <code>/만남일 미정</code>\n' +
             '• <b>만남 중단 처리</b>: <code>/만남중단 [상세 사유]</code> → 사유 버튼 선택\n' +
@@ -1929,6 +1953,7 @@ bot.hears(/^[\/!](start|help|도움말)(?:@\w+)?$/i, async (ctx) => {
             '• <b>만남 보고서 양식</b>: <code>/만남보고서양식</code> 또는 <code>/교사만남양식</code>\n' +
             '• <b>교사 만남 누적 회차</b>: <code>/교사만남회차</code> (보정: <code>/교사만남회차 총횟수</code>, 마지막 1회 취소: <code>/회차취소</code>)\n' +
             '• <b>섭등 후 회차</b>: <code>/섭등회차</code> (섭등일 만남 = 1회차, 보정: <code>/섭등회차 총횟수</code>)\n' +
+            '   <i>(섭등 후 3회차부터 복등 전이면 보고서 반영 때 복등 안내, 3회차 때 지역 담당방에도 알림)</i>\n' +
             '• <b>만남 보고서 제출</b>: 양식 내 <code>다음만남일: MM-DD</code> 포함\n' +
             '   <i>(사진 설명글로 올려도 인식됩니다. 이미 보낸 메시지를 편집하면 반영되지 않으니 다시 올려 주세요)</i>\n\n' +
             '<b>4. 지인 만남 (일정만 관리)</b>\n' +
@@ -1937,6 +1962,8 @@ bot.hears(/^[\/!](start|help|도움말)(?:@\w+)?$/i, async (ctx) => {
             '<b>5. 방 진행 단계 (특수 구분)</b>\n' +
             '• <b>단계 설정</b>: <code>/섭등목표 MM-DD</code>, <code>/예정목표 MM-DD</code>, <code>/가능목표 MM-DD</code>, <code>/확정목표 MM-DD</code> (날짜만 입력)\n' +
             '• <b>단계 해제</b>: <code>/구분해제</code> (일반 상태로 복귀)\n\n' +
+            '⏸ <b>진행이 멈춘 방 안내</b>: 최초등록·유형 선택·사전/사후 보고서·만남일·다음 일정이 비어 있거나 행정 탈락이면 오전 10시에 방으로 안내\n' +
+            '   <i>(방마다 하루 하나, 상황별 최대 3번 → 그래도 그대로면 지역 담당방에 요약)</i>\n\n' +
             '📅 <b>날짜 입력 형식</b>: <code>10-08</code>, <code>10/8</code>, <code>10.8(목)</code>, <code>10월 8일</code>, <code>2026.10.8</code>, <code>내일</code>\n' +
             '   시간도 함께 적으면 저장됩니다: <code>/만남일 10.8(목) 오후 7시</code>, <code>10/8 19:30</code>\n' +
             '   <i>(요일이 실제와 다르거나 지난 날짜면 안내해 드립니다)</i>\n\n' +
@@ -2081,7 +2108,19 @@ bot.hears(/^(?:[\/!]?관리자\s+)(봇\s*상태|상태\s*점검|설정\s*점검)
         const c = r.rows[0];
         msg += `• 연결: ✅ 정상\n`;
         msg += `• 상담방: ${c.chats}개 (매칭 ${c.matched}개) · 인증된 방 ${c.authorized}개 · 지역 담당방 ${c.region_chats}개\n`;
-        msg += `• 인증 사용자: ${c.approved}명${Number(c.pending) ? ` (⏳ 승인 대기 ${c.pending}명)` : ''}\n\n`;
+        msg += `• 인증 사용자: ${c.approved}명${Number(c.pending) ? ` (⏳ 승인 대기 ${c.pending}명)` : ''}\n`;
+        // 진행 중인 방의 인도자·교사 지역 중 담당방이 없는 곳 (그 지역 알림은 관리자에게 대신 감)
+        const regionChats = await getRegionChats();
+        const missing = new Set<string>();
+        for (const chat of await getAllChats()) {
+            if (!chat.matched_member_id || chat.meeting_date === '중단') continue;
+            for (const region of [chat.guide_region, chat.teacher_region]) {
+                if (region && !regionChats.some((rc) => regionMatches(rc.region, region))) missing.add(region);
+            }
+        }
+        msg += `• 담당방 없는 지역: ${
+            missing.size ? `⚠️ ${escapeHtml([...missing].join(', '))} <i>(알림은 관리자에게 대신 전달)</i>` : '없음'
+        }\n\n`;
     } catch (err: unknown) {
         msg += `• 연결: ❌ 오류 — ${escapeHtml(getErrorMessage(err))}\n\n`;
     }
@@ -2105,8 +2144,279 @@ bot.hears(/^(?:[\/!]?관리자\s+)(봇\s*상태|상태\s*점검|설정\s*점검)
     await ctx.reply(msg, { parse_mode: 'HTML' });
 });
 
+// 인터뷰 만남이 멈춰 있는 단계 — 오전 10시에 해당 방으로 안내 (단계마다 하루 한 번, 최대 STAGE_REMINDER_MAX번)
+//   no_pre  : 인터뷰 만남으로 골랐는데 사전 보고서가 없음 (고른 다음 날부터)
+//   no_date : 사전 보고서는 올렸는데 인터뷰 예정일이 미정
+//   no_post : 인터뷰일이 3일 이상 지났는데 사후(결과) 보고서가 없음 (당일·D+1·D+2 알림 다음 단계)
+const STAGE_REMINDER_MAX = 3;
+
+function interviewPendingStage(
+    c: ChatRecord,
+    today: dayjs.Dayjs
+): { key: 'no_pre' | 'no_date' | 'no_post'; text: string } | null {
+    if (c.meeting_type !== '인터뷰' || c.interview_report_submitted || c.meeting_date === '중단') return null;
+    const who = c.matched_student_name ? ` (👤 ${escapeHtml(c.matched_student_name)})` : '';
+
+    if (!c.interviewer_name) {
+        if (c.type_selected_at && !dayjs(c.type_selected_at).isBefore(today)) return null;
+        return {
+            key: 'no_pre',
+            text:
+                `📝 <b>[인터뷰 사전 보고서 미등록 안내]</b>${who}\n` +
+                `인터뷰 만남으로 지정되었지만 <b>[인터뷰 사전 보고서]</b>가 아직 올라오지 않았습니다.\n` +
+                `사전 보고서를 올리면 인터뷰어·타이퍼·예정일이 등록되고 일정 알림이 시작됩니다.\n\n` +
+                `💡 양식: <code>/인터뷰사전양식</code>`,
+        };
+    }
+    if (!c.meeting_date || c.meeting_date === '미정') {
+        return {
+            key: 'no_date',
+            text:
+                `📅 <b>[인터뷰 예정일 미정 안내]</b>${who}\n` +
+                `사전 보고서는 등록되었지만 <b>인터뷰 예정일</b>이 아직 미정입니다.\n` +
+                `날짜가 정해지면 <code>/인터뷰일 MM-DD</code>로 등록해 주세요.`,
+        };
+    }
+    const mDate = dayjs(c.meeting_date).startOf('day');
+    const overdue = mDate.isValid() ? today.diff(mDate, 'day') : 0;
+    if (overdue >= 3) {
+        return {
+            key: 'no_post',
+            text:
+                `📋 <b>[인터뷰 사후 보고서 미제출 안내]</b>${who}\n` +
+                `인터뷰일(${mDate.format('MM/DD')})로부터 <b>${overdue}일</b>이 지났지만 <b>사후(결과) 보고서</b>가 아직 없습니다.\n` +
+                `인터뷰를 마쳤다면 결과 보고서를 올려 주세요. 일정이 바뀌었다면 <code>/인터뷰일 MM-DD</code>로 다시 등록해 주세요.\n\n` +
+                `💡 양식: <code>/인터뷰사후양식</code>`,
+        };
+    }
+    return null;
+}
+
+/* =====================================================
+ * ⏸ 진행이 멈춘 방 안내 (오전 10시)
+ * - 방마다 하루에 하나만: 아래 순서에서 가장 앞 단계의 안내 하나만 보냄
+ * - 단계마다 최대 STAGE_REMINDER_MAX번, 마지막 안내 때 지역 담당방(없으면 관리자)에 한 번 알림
+ * - 중단된 방은 안내하지 않고, 탈락 대상자 방은 확인 전까지 다른 알림도 멈춤
+ * ===================================================== */
+type RoomNudge = { key: string; label: string; text: string; keyboard?: { inline_keyboard: any[][] } };
+
+// 행정에서 탈락 처리된 대상자인데 방에서 아직 확인(중단 또는 계속 진행)하지 않음
+function isDroppedActive(c: ChatRecord): boolean {
+    if (!c.matched_member_id || c.meeting_date === '중단' || c.drop_ack_at) return false;
+    return !!c.student_dropped_at || String(c.student_stage ?? '').includes('탈락');
+}
+
+function isYmd(v?: string | null): v is string {
+    return /^\d{4}-\d{2}-\d{2}$/.test(v || '');
+}
+
+// 탈락 확인 버튼: 중단 사유 버튼(취소 제외) + 계속 진행
+function droppedKeyboard() {
+    const rows = buildStopCategoryKeyboard('stop').inline_keyboard.filter((row) => row[0]?.callback_data !== 'stop:cancel');
+    return { inline_keyboard: [...rows, [{ text: '▶️ 계속 진행 (탈락 아님)', callback_data: 'dropkeep' }]] };
+}
+
+function getRoomNudge(c: ChatRecord, today: dayjs.Dayjs, todayStr: string): RoomNudge | null {
+    if (c.meeting_date === '중단') return null;
+    const who = c.matched_student_name ? ` (👤 ${escapeHtml(c.matched_student_name)})` : '';
+    const before = (t?: string | null) => !t || dayjs(t).isBefore(today); // 기록이 없으면(예전 방) 지난 것으로 봄
+
+    // A. 탈락 대상자
+    if (isDroppedActive(c)) {
+        return {
+            key: 'dropped',
+            label: '탈락 대상자 진행 중',
+            text:
+                `⚠️ <b>[탈락 처리된 대상자 확인]</b>${who}\n` +
+                `행정에서 이 대상자가 <b>탈락</b>으로 처리되어 있습니다.\n` +
+                `만남을 중단하려면 사유를, 탈락이 아니라면 [계속 진행]을 눌러주세요.\n` +
+                `<i>(확인 전까지 이 방의 일정·보고서 알림은 멈춥니다)</i>\n` +
+                `• ${STOP_DETAIL_LABEL}행정 탈락 처리`,
+            keyboard: droppedKeyboard(),
+        };
+    }
+    // B. 봇은 초대됐는데 최초등록 안 함
+    if (!c.matched_member_id) {
+        if (!before(c.created_at)) return null;
+        return {
+            key: 'no_match',
+            label: '최초등록 안 함',
+            text:
+                `📌 <b>[최초등록 안내]</b>\n` +
+                `봇이 초대되었지만 아직 <b>대상자 최초등록</b>이 되지 않았습니다.\n` +
+                `등록해야 일정·보고서 알림이 시작됩니다.\n\n` +
+                `<code>/최초등록 섭외자/지역/팀/인도자</code>\n` +
+                `<i>(예: <code>/최초등록 홍길동/강북/1/강현정</code>)</i>`,
+        };
+    }
+    // 유형 미선택
+    if (!c.meeting_type && !c.meeting_date) {
+        if (!before(c.matched_at)) return null;
+        return {
+            key: 'no_type',
+            label: '첫 만남 유형 미선택',
+            text:
+                `⏰ <b>[첫 만남 유형 선택 안내]</b>${who}\n` +
+                `대상자 매칭은 되었지만 <b>첫 만남 유형</b>이 아직 선택되지 않았습니다.\n` +
+                `유형을 골라야 일정 알림이 시작됩니다. 👇`,
+            keyboard: MEETING_TYPE_KEYBOARD,
+        };
+    }
+    // 인터뷰 단계 (사전 보고서 없음 / 예정일 미정 / 사후 보고서 없음)
+    const interview = interviewPendingStage(c, today);
+    if (interview) {
+        const labels = { no_pre: '인터뷰 사전 보고서 미등록', no_date: '인터뷰 예정일 미정', no_post: '인터뷰 사후 보고서 미제출' };
+        return { key: interview.key, label: labels[interview.key], text: interview.text };
+    }
+    if (c.meeting_type === '인터뷰') return null;
+
+    // C. 교사·지인을 골랐는데 만남일 없음
+    if (!c.meeting_date) {
+        if (!before(c.type_selected_at)) return null;
+        return {
+            key: 'no_schedule',
+            label: '만남일 미등록',
+            text:
+                `🗓 <b>[만남일 등록 안내]</b>${who}\n` +
+                `${c.meeting_type ? `<b>${escapeHtml(c.meeting_type)} 만남</b>으로 지정되었지만 ` : ''}만남일이 아직 등록되지 않았습니다.\n` +
+                `<code>/만남일 MM-DD</code> 또는 <code>/만남일 미정</code>으로 등록해 주세요.`,
+        };
+    }
+    if (isYmd(c.meeting_date) && c.meeting_date < todayStr) {
+        const date = dayjs(c.meeting_date).format('MM/DD');
+        const days = today.diff(dayjs(c.meeting_date).startOf('day'), 'day');
+        // E. 보고서는 냈는데(또는 보고서가 필요 없는 지인 만남) 다음 만남일이 없음
+        if (!needsReport(c) || c.report_submitted) {
+            return {
+                key: 'no_next',
+                label: '다음 만남일 미등록',
+                text:
+                    `🗓 <b>[다음 만남일 등록 안내]</b>${who}\n` +
+                    `지난 만남일(${date}) 이후 <b>다음 일정</b>이 등록되지 않았습니다.\n` +
+                    `<code>/만남일 MM-DD</code> 또는 <code>/만남일 미정</code>으로 등록해 주세요.`,
+            };
+        }
+        // G. 보고서 미제출 D+3 이후 (당일·D+1·D+2 알림 다음 단계)
+        if (days >= 3) {
+            return {
+                key: 'report_late',
+                label: '만남 보고서 장기 미제출',
+                text:
+                    `📋 <b>[만남 보고서 미제출 안내]</b>${who}\n` +
+                    `만남일(${date})로부터 <b>${days}일</b>이 지났지만 만남 보고서가 아직 없습니다.\n` +
+                    `만남을 하지 못했다면 <code>/만남일 MM-DD</code>로 일정을 다시 등록해 주세요.\n\n` +
+                    `💡 양식: <code>/만남보고서양식</code>`,
+            };
+        }
+        return null;
+    }
+    // F. '미정'으로 14일 넘게 지남
+    if (c.meeting_date === '미정' && c.updated_at && today.diff(dayjs(c.updated_at), 'day') >= 14) {
+        return {
+            key: 'long_undecided',
+            label: '만남일 장기 미정',
+            text:
+                `⏳ <b>[만남일 미정 안내]</b>${who}\n` +
+                `다음 만남일이 <b>${today.diff(dayjs(c.updated_at), 'day')}일째 미정</b>입니다.\n` +
+                `일정이 잡혔다면 <code>/만남일 MM-DD</code>로, 만남을 이어가지 않는다면 <code>/만남중단</code>으로 알려주세요.`,
+        };
+    }
+    return null;
+}
+
+type NudgeEscalation = { chat: ChatRecord; label: string };
+
+// 마지막 안내까지 보낸 방들을 담당방(없으면 관리자)마다 한 통으로 묶어 발송
+async function sendNudgeEscalations(items: NudgeEscalation[], regionChats: RegionChat[]) {
+    const byTarget = new Map<string, string[]>();
+    const add = (target: string, line: string) => byTarget.set(target, [...(byTarget.get(target) || []), line]);
+    for (const { chat, label } of items) {
+        const line = `<b>[${escapeHtml(label)}]</b>\n` + regionRoomInfo(chat);
+        const targets = regionChatIdsFor(chat, regionChats);
+        if (targets.length) targets.forEach((t) => add(t, line));
+        else ADMIN_IDS.forEach((id) => add(id, line + `<i>(담당방 없음 → 관리자에게 전달)</i>\n`));
+    }
+    for (const [target, lines] of byTarget) {
+        const msg =
+            `⏸ <b>[진행 멈춤 방 ${lines.length}곳]</b>\n` +
+            `<i>방에 ${STAGE_REMINDER_MAX}번 안내했지만 아직 그대로입니다. 확인해 주세요.</i>\n\n` +
+            lines.join('\n');
+        for (const part of splitLongMessage(msg)) {
+            await bot.telegram
+                .sendMessage(target, part, { parse_mode: 'HTML' })
+                .catch((err) => console.error(`[진행 멈춤 요약 발송 실패] ${target}:`, getErrorMessage(err)));
+        }
+    }
+}
+
+async function sendRoomNudge(c: ChatRecord, today: dayjs.Dayjs, todayStr: string, escalations: NudgeEscalation[]) {
+    const nudge = getRoomNudge(c, today, todayStr);
+    if (!nudge || c.stage_reminder_date === todayStr) return;
+    // 단계가 바뀌면 횟수를 새로 셈
+    const sent = c.stage_reminder_key === nudge.key ? c.stage_reminder_count ?? 0 : 0;
+    if (sent >= STAGE_REMINDER_MAX) return;
+    const isLast = sent + 1 >= STAGE_REMINDER_MAX;
+    try {
+        await bot.telegram.sendMessage(c.chat_id, nudge.text + (isLast ? `\n<i>(마지막 안내입니다)</i>` : ''), {
+            parse_mode: 'HTML',
+            ...(nudge.keyboard ? { reply_markup: nudge.keyboard } : {}),
+        });
+        // updated_at은 건드리지 않음 (일정·상태 변경 시각으로 쓰이므로)
+        await neonPool.query(
+            `UPDATE counseling_chats SET stage_reminder_key = $2, stage_reminder_date = $3, stage_reminder_count = $4 WHERE chat_id = $1`,
+            [c.chat_id, nudge.key, todayStr, sent + 1]
+        );
+        if (isLast) escalations.push({ chat: c, label: nudge.label });
+    } catch (err: unknown) {
+        console.error(`[진행 멈춤 안내 실패] Chat: ${c.chat_id}`, getErrorMessage(err));
+        await handleRoomSendFailure(c.chat_id, err);
+    }
+}
+
+// 방으로 보내기 실패 처리 — 슈퍼그룹 전환이면 기록을 새 방 ID로 옮기고, 봇이 없거나 방이 사라졌으면 보관 처리
+async function handleRoomSendFailure(chatId: string | number, err: unknown) {
+    const e = err as { description?: string; message?: string; response?: { parameters?: { migrate_to_chat_id?: number } } };
+    const newId = e?.response?.parameters?.migrate_to_chat_id;
+    try {
+        if (newId) {
+            await mergeMigratedChat(chatId, newId);
+            return;
+        }
+        const desc = `${e?.description || ''} ${e?.message || ''}`;
+        if (!/chat not found|bot was kicked|bot is not a member|group chat was deleted|bot was blocked|user is deactivated/i.test(desc)) return;
+        const record = await getChatRecord(chatId);
+        await archiveChat(String(chatId));
+        await neonPool.query(`DELETE FROM counseling_chats WHERE chat_id = $1;`, [String(chatId)]);
+        await neonPool.query(`DELETE FROM authorized_chats WHERE chat_id = $1;`, [String(chatId)]);
+        console.log(`[봇 없는 방 정리] Chat: ${chatId} (${desc.trim()})`);
+        await alertAdmins(
+            `${record?.room_title || '대화방'} (${chatId})`,
+            '봇이 없는 방이라 기록을 보관 처리했습니다 (다시 초대하면 복원)',
+            desc.trim()
+        );
+    } catch (cleanupErr: unknown) {
+        console.error(`[방 전송 실패 처리 에러] Chat: ${chatId}`, getErrorMessage(cleanupErr));
+    }
+}
+
+// 같은 대상자가 이미 매칭된 다른 방 (회차·알림이 두 번 셀 수 있어 경고용)
+async function otherRoomsOfStudent(studentId: number | string, chatId: number | string): Promise<string[]> {
+    const res = await neonPool.query(
+        `SELECT COALESCE(room_title, chat_id) AS title FROM counseling_chats
+         WHERE matched_member_id::text = $1 AND chat_id <> $2 ORDER BY title`,
+        [String(studentId), String(chatId)]
+    );
+    return res.rows.map((r) => r.title);
+}
+
+function duplicateWarning(rooms: string[]): string {
+    return rooms.length
+        ? `\n\n⚠️ <b>이 대상자는 다른 방에도 매칭되어 있습니다:</b> ${escapeHtml(rooms.join(', '))}\n` +
+              `<i>회차·알림이 두 번 셀 수 있으니, 잘못된 방이면 그 방에서 <code>/매칭해제</code> 해주세요.</i>`
+        : '';
+}
+
 // 매칭 완료 안내 + 첫 만남 유형 버튼 (텔레그램 /최초등록, 웹 최초등록 공통)
-const TYPE_REMINDER_MAX = 3; // 유형 미선택 방 재안내 최대 횟수
 const MEETING_TYPE_KEYBOARD = {
     inline_keyboard: [
         [
@@ -2138,7 +2448,7 @@ async function notifyWebRegistration(chatId: string): Promise<{ ok: boolean; err
     if (!record.matched_member_id) return { ok: false, error: '매칭된 대상자가 없습니다.' };
     // 유형 미선택 리마인드 기준 시각 (웹은 matched_at을 따로 기록하지 않으므로 여기서 기록)
     await neonPool.query(
-        `UPDATE counseling_chats SET matched_at = NOW(), type_reminder_date = NULL, type_reminder_count = 0 WHERE chat_id = $1`,
+        `UPDATE counseling_chats SET matched_at = NOW(), stage_reminder_count = 0, drop_ack_at = NULL WHERE chat_id = $1`,
         [chatId]
     );
 
@@ -2153,7 +2463,7 @@ async function notifyWebRegistration(chatId: string): Promise<{ ok: boolean; err
                 district: record.guide_district,
             },
             true
-        ),
+        ) + duplicateWarning(await otherRoomsOfStudent(record.matched_member_id, chatId)),
         { parse_mode: 'HTML', reply_markup: MEETING_TYPE_KEYBOARD }
     );
 
@@ -2225,11 +2535,15 @@ bot.hears(/^[\/!]최초등록(?:@\w+)?(?:\s+(.+))?$/i, async (ctx) => {
         await updateChat(ctx.chat.id, {
             matched_member_id: match.student_id,
             matched_at: new Date().toISOString(),
-            type_reminder_date: null,
-            type_reminder_count: 0,
+            stage_reminder_count: 0,
+            drop_ack_at: null,
         });
 
-        await ctx.reply(matchedPromptText(match), { parse_mode: 'HTML', reply_markup: MEETING_TYPE_KEYBOARD });
+        const dupRooms = await otherRoomsOfStudent(match.student_id, ctx.chat.id);
+        await ctx.reply(matchedPromptText(match) + duplicateWarning(dupRooms), {
+            parse_mode: 'HTML',
+            reply_markup: MEETING_TYPE_KEYBOARD,
+        });
 
         // 인도자·교사 지역 담당방에도 알림 (웹 최초등록과 동일)
         const record = await getChatRecord(ctx.chat.id);
@@ -2244,7 +2558,7 @@ bot.hears(/^[\/!]최초등록(?:@\w+)?(?:\s+(.+))?$/i, async (ctx) => {
 bot.action('type_interview', async (ctx) => {
     try {
         await ctx.answerCbQuery();
-        await updateChat(ctx.chat!.id, { meeting_type: '인터뷰' });
+        await updateChat(ctx.chat!.id, { meeting_type: '인터뷰', type_selected_at: new Date().toISOString() });
         await recordMeetingEvent(ctx.chat!.id, '인터뷰매칭', '최초등록');
 
         await ctx.reply(
@@ -2261,7 +2575,7 @@ bot.action('type_interview', async (ctx) => {
 bot.action('type_teacher', async (ctx) => {
     try {
         await ctx.answerCbQuery();
-        await updateChat(ctx.chat!.id, { meeting_type: '교사' });
+        await updateChat(ctx.chat!.id, { meeting_type: '교사', type_selected_at: new Date().toISOString() });
         await recordMeetingEvent(ctx.chat!.id, '교사매칭', '최초등록');
 
         await ctx.reply(
@@ -2278,7 +2592,7 @@ bot.action('type_teacher', async (ctx) => {
 bot.action('type_acquaintance', async (ctx) => {
     try {
         await ctx.answerCbQuery();
-        await updateChat(ctx.chat!.id, { meeting_type: '지인' });
+        await updateChat(ctx.chat!.id, { meeting_type: '지인', type_selected_at: new Date().toISOString() });
         await recordMeetingEvent(ctx.chat!.id, '지인매칭', '최초등록');
 
         await ctx.reply(
@@ -2993,6 +3307,23 @@ bot.action(/^stop:(\w+)$/, async (ctx) => {
         }
     } catch (err: unknown) {
         console.error('[만남 중단 사유 선택 에러]:', getErrorMessage(err));
+        await ctx.answerCbQuery('처리 중 오류가 발생했습니다.').catch(() => {});
+    }
+});
+
+// 버튼 콜백: 탈락 대상자 확인 → 계속 진행 (탈락 아님) — 이후 일반 알림 재개
+bot.action('dropkeep', async (ctx) => {
+    try {
+        if (!ctx.chat) return;
+        await updateChat(ctx.chat.id, { drop_ack_at: new Date().toISOString() });
+        await ctx.answerCbQuery('계속 진행으로 확인했습니다.');
+        await ctx.editMessageText(
+            `▶️ <b>계속 진행으로 확인했습니다.</b>\n일정·보고서 알림을 다시 보냅니다.\n` +
+                `<i>(행정의 탈락 처리가 잘못된 경우 행정 쪽 수정도 요청해 주세요)</i>`,
+            { parse_mode: 'HTML' }
+        );
+    } catch (err: unknown) {
+        console.error('[탈락 확인 계속 진행 에러]:', getErrorMessage(err));
         await ctx.answerCbQuery('처리 중 오류가 발생했습니다.').catch(() => {});
     }
 });
@@ -4004,7 +4335,37 @@ bot.hears(/^(?:[\/!]?관리자\s+)(점검|현황|종합\s*점검|전체\s*점검
         msg += `• 🚨 <b>보고서 미제출</b>: ${overdue.length}개 방 (조회: <code>관리자 미제출</code>)\n`;
         msg += `• ⌛ <b>만남일 경과 미갱신</b>: ${expired.length}개 방 (조회: <code>관리자 미갱신</code>)\n`;
 
-        await ctx.reply(msg, { parse_mode: 'HTML' });
+        // 주의가 필요한 방
+        const dropped = allChats.filter(isDroppedActive);
+        const byStudent = new Map<string, ChatRecord[]>();
+        for (const c of allChats) {
+            if (!c.matched_member_id) continue;
+            const key = String(c.matched_member_id);
+            byStudent.set(key, [...(byStudent.get(key) || []), c]);
+        }
+        const duplicates = [...byStudent.values()].filter((list) => list.length > 1);
+        if (dropped.length || duplicates.length) {
+            msg += `\n⚠️ <b>[확인 필요]</b>\n`;
+            if (dropped.length) {
+                msg += `• <b>탈락 대상자인데 진행 중</b>: ${dropped.length}개 방 <i>(방에서 확인 전까지 알림 정지)</i>\n`;
+                msg += dropped.slice(0, 10).map((c) => `   - ${escapeHtml(c.room_title)}`).join('\n') + '\n';
+            }
+            if (duplicates.length) {
+                msg += `• <b>한 대상자가 여러 방에 매칭</b>: ${duplicates.length}명\n`;
+                msg +=
+                    duplicates
+                        .slice(0, 10)
+                        .map(
+                            (list) =>
+                                `   - ${escapeHtml(list[0].matched_student_name || '대상자')}: ${list
+                                    .map((c) => escapeHtml(c.room_title))
+                                    .join(' / ')}`
+                        )
+                        .join('\n') + '\n';
+            }
+        }
+
+        await replyLong(ctx, msg);
     } catch (err: unknown) {
         console.error('[종합 점검 에러]:', err);
     }
@@ -4022,7 +4383,7 @@ function isPastMeetingDate(c: ChatRecord, todayStr: string): boolean {
 // 독촉 대상: 미제출 = 지난 만남(오늘 제외)의 보고서 미제출 / 미갱신 = 지난 만남일 이후 다음 일정 미등록
 async function getBulkTargets(kind: BulkKind): Promise<ChatRecord[]> {
     const todayStr = dayjs().tz('Asia/Seoul').format('YYYY-MM-DD');
-    const chats = await getAllChats();
+    const chats = (await getAllChats()).filter((c) => !isDroppedActive(c));
     if (kind === 'overdue') return chats.filter((c) => isPastMeetingDate(c, todayStr) && !c.report_submitted && needsReport(c));
     return chats.filter(
         (c) => isPastMeetingDate(c, todayStr) && (kind === 'expiredall' || !isOtherDeptTeacher(c))
@@ -4342,6 +4703,43 @@ async function getSeopRound(chat: ChatRecord | undefined): Promise<SeopRound | n
 
 function seopRoundText(seop: SeopRound | null): string {
     return seop ? ` · 섭등 후 <b>${seop.round}회차</b>` : '';
+}
+
+// 복등 안내: 섭등 후 3회차부터 복등(복_완료일)이 아직 없으면 안내
+const BOK_REMIND_ROUND = 3;
+
+// 복등 안내 대상인지 — 복등 이후 단계(복·예정·센확 완료일)가 이미 있거나 탈락이면 제외
+async function needsBokReminder(studentId: number | string): Promise<boolean> {
+    const st = (await neonPool.query(`SELECT * FROM students WHERE id::text = $1`, [String(studentId)])).rows[0];
+    if (!st || String(st['단계'] ?? '').includes('탈락') || st['탈락']) return false;
+    return !['복', '예정', '센확'].some((prefix) => getStageRegYmd(st, prefix));
+}
+
+// 만남 보고서로 섭등 후 회차가 새로 쌓였을 때 호출 — 상담방에 복등 안내, 딱 3회차가 된 때는 지역 담당방에도 알림
+async function sendBokReminder(chatId: number | string, seop: SeopRound) {
+    try {
+        const record = await getChatRecord(chatId);
+        if (!record?.matched_member_id || !(await needsBokReminder(record.matched_member_id))) return;
+
+        await bot.telegram.sendMessage(
+            chatId,
+            `📣 <b>[복등 안내]</b>` +
+                (record.matched_student_name ? ` (👤 ${escapeHtml(record.matched_student_name)})` : '') +
+                `\n섭등 후 <b>${seop.round}회차</b> 만남입니다.\n` +
+                `아직 <b>복등</b>이 되지 않았습니다. 복등을 진행해 주세요!`,
+            { parse_mode: 'HTML' }
+        );
+        if (seop.round === BOK_REMIND_ROUND) {
+            await notifyRegionChats(
+                record,
+                `📣 <b>[복등 대상 - 섭등 후 ${seop.round}회차]</b>\n` +
+                    regionRoomInfo(record) +
+                    `• 섭등일: ${escapeHtml(seop.seopDate)} · 복등 미등록`
+            );
+        }
+    } catch (err: unknown) {
+        console.error(`[복등 안내 실패] Chat: ${chatId}`, getErrorMessage(err));
+    }
 }
 
 // 섭등 후 회차 보정 (/섭등회차 n → 섭등일 포함 현재까지 총 n회로 보정)
@@ -4755,6 +5153,12 @@ async function handleIncomingText(ctx: any, rawText: string, source: 'text' | 'c
 
         // 만남일이 다음 일정으로 바뀌기 전에 이번 만남을 누적
         const meeting = await recordTeacherMeeting(ctx, chatId);
+        // 보고서 반영 안내를 먼저 보낸 뒤 복등 안내 (새로 누적된 만남이 섭등 후 3회차 이상일 때)
+        const afterReport = async () => {
+            if (meeting?.added && meeting.seop && meeting.seop.round >= BOK_REMIND_ROUND) {
+                await sendBokReminder(chatId, meeting.seop);
+            }
+        };
         const roundText = !meeting
             ? ''
             : meeting.added
@@ -4776,6 +5180,7 @@ async function handleIncomingText(ctx: any, rawText: string, source: 'text' | 'c
                     roundText,
                 { parse_mode: 'HTML' }
             );
+            await afterReport();
             return;
         }
 
@@ -4790,6 +5195,7 @@ async function handleIncomingText(ctx: any, rawText: string, source: 'text' | 'c
                     roundText,
                 { parse_mode: 'HTML' }
             );
+            await afterReport();
             return;
         }
 
@@ -4805,6 +5211,7 @@ async function handleIncomingText(ctx: any, rawText: string, source: 'text' | 'c
                 roundText,
             { parse_mode: 'HTML' }
         );
+        await afterReport();
         return;
     }
 
@@ -4845,10 +5252,17 @@ async function triggerMorningReminder() {
     const chats = await getAllChats();
     const regionChats = await getRegionChats();
 
+    const escalations: NudgeEscalation[] = [];
+
     for (const chat of chats) {
+        const todayStr = today.format('YYYY-MM-DD');
+        // 진행이 멈춘 방 안내 (방마다 하루 하나)
+        await sendRoomNudge(chat, today, todayStr, escalations);
+        // 탈락 대상자 방은 확인(중단·계속 진행) 전까지 다른 알림을 보내지 않음
+        if (isDroppedActive(chat)) continue;
+
         // 진행 구분 날짜(섭등목표 / 예정목표 / 가능목표 / 확정목표) 당일 안내 — 같은 날짜로는 한 번만
         const stageDate = getStageDate(chat.progress_note);
-        const todayStr = today.format('YYYY-MM-DD');
         if (
             chat.progress_stage &&
             chat.meeting_date !== '중단' &&
@@ -4869,36 +5283,7 @@ async function triggerMorningReminder() {
                 await updateChat(chat.chat_id, { stage_notified_date: todayStr });
             } catch (err: unknown) {
                 console.error(`[구분 예정일 알림 실패] Chat: ${chat.chat_id}`, getErrorMessage(err));
-            }
-        }
-
-        // 매칭은 됐는데 첫 만남 유형을 고르지 않은 방 — 등록 다음 날부터 하루 한 번, 최대 3번 다시 안내
-        if (
-            chat.matched_member_id &&
-            !chat.meeting_type &&
-            !chat.meeting_date &&
-            (!chat.matched_at || dayjs(chat.matched_at).isBefore(today)) &&
-            chat.type_reminder_date !== todayStr &&
-            (chat.type_reminder_count ?? 0) < TYPE_REMINDER_MAX
-        ) {
-            try {
-                const count = (chat.type_reminder_count ?? 0) + 1;
-                await bot.telegram.sendMessage(
-                    chat.chat_id,
-                    `⏰ <b>[첫 만남 유형 선택 안내]</b>` +
-                        (chat.matched_student_name ? ` (👤 ${escapeHtml(chat.matched_student_name)})` : '') +
-                        `\n대상자 매칭은 되었지만 <b>첫 만남 유형</b>이 아직 선택되지 않았습니다.\n` +
-                        `유형을 골라야 일정 알림이 시작됩니다. 👇` +
-                        (count >= TYPE_REMINDER_MAX ? `\n<i>(마지막 안내입니다)</i>` : ''),
-                    { parse_mode: 'HTML', reply_markup: MEETING_TYPE_KEYBOARD }
-                );
-                // updated_at은 건드리지 않음 (일정·상태 변경 시각으로 쓰이므로)
-                await neonPool.query(
-                    `UPDATE counseling_chats SET type_reminder_date = $2, type_reminder_count = $3 WHERE chat_id = $1`,
-                    [chat.chat_id, todayStr, count]
-                );
-            } catch (err: unknown) {
-                console.error(`[유형 미선택 안내 실패] Chat: ${chat.chat_id}`, getErrorMessage(err));
+                await handleRoomSendFailure(chat.chat_id, err);
             }
         }
 
@@ -4942,6 +5327,7 @@ async function triggerMorningReminder() {
                 await updateChat(chat.chat_id, { d_minus_1_notified: 1 });
             } catch (err: unknown) {
                 console.error(`[오전 알림 실패] Chat: ${chat.chat_id}`, getErrorMessage(err));
+                await handleRoomSendFailure(chat.chat_id, err);
             }
         }
 
@@ -4963,6 +5349,7 @@ async function triggerMorningReminder() {
                 await updateChat(chat.chat_id, { overdue_1_notified: 1 });
             } catch (err: unknown) {
                 console.error(`[D+1 지연 알림 실패] Chat: ${chat.chat_id}`, getErrorMessage(err));
+                await handleRoomSendFailure(chat.chat_id, err);
             }
         }
 
@@ -4993,9 +5380,12 @@ async function triggerMorningReminder() {
                 );
             } catch (err: unknown) {
                 console.error(`[D+2 경고 알림 실패] Chat: ${chat.chat_id}`, getErrorMessage(err));
+                await handleRoomSendFailure(chat.chat_id, err);
             }
         }
     }
+
+    if (escalations.length) await sendNudgeEscalations(escalations, regionChats);
     } finally {
         isMorningReminderRunning = false;
     }
@@ -5017,7 +5407,7 @@ async function triggerNightReminder() {
     for (const chat of chats) {
         if (!chat.meeting_date || chat.meeting_date === '미정' || chat.meeting_date === '중단' || chat.report_submitted)
             continue;
-        if (!needsReport(chat)) continue;
+        if (!needsReport(chat) || isDroppedActive(chat)) continue;
 
         const mDate = dayjs(chat.meeting_date).startOf('day');
         if (!mDate.isValid()) continue;
@@ -5045,6 +5435,7 @@ async function triggerNightReminder() {
                 await updateChat(chat.chat_id, { d_day_22_notified: 1 });
             } catch (err: unknown) {
                 console.error(`[22시 알림 실패] Chat: ${chat.chat_id}`, getErrorMessage(err));
+                await handleRoomSendFailure(chat.chat_id, err);
             }
         }
     }
