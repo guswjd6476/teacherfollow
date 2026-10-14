@@ -140,7 +140,18 @@ async function initDb() {
             ADD COLUMN IF NOT EXISTS stop_category VARCHAR(30),
             ADD COLUMN IF NOT EXISTS stage_notified_date VARCHAR(10),
             ADD COLUMN IF NOT EXISTS meeting_time VARCHAR(20),
-            ADD COLUMN IF NOT EXISTS last_message_at TIMESTAMPTZ;
+            ADD COLUMN IF NOT EXISTS last_message_at TIMESTAMPTZ,
+            ADD COLUMN IF NOT EXISTS matched_at TIMESTAMPTZ,
+            ADD COLUMN IF NOT EXISTS type_reminder_date VARCHAR(10),
+            ADD COLUMN IF NOT EXISTS type_reminder_count INTEGER DEFAULT 0;
+        `);
+        // 봇이 방에서 나가면 방 기록을 여기로 옮겨 두었다가, 다시 초대되면 복원
+        await neonPool.query(`
+            CREATE TABLE IF NOT EXISTS counseling_chats_left (
+                chat_id TEXT PRIMARY KEY,
+                data JSONB NOT NULL,
+                left_at TIMESTAMPTZ DEFAULT NOW()
+            );
         `);
         console.log('✅ [DB 점검] counseling_chats 테이블 신규 컬럼 점검 완료');
 
@@ -283,6 +294,9 @@ interface ChatRecord {
     overdue_2_notified: number;
     meeting_time?: string | null;
     last_message_at?: string | null;
+    matched_at?: string | null;
+    type_reminder_date?: string | null;
+    type_reminder_count?: number | null;
     teacher_meeting_base?: number | null;
     seop_meeting_base?: number | null;
     teacher_meeting_count?: number;
@@ -807,8 +821,44 @@ async function replyLong(ctx: any, html: string, lastMessageExtra: Record<string
 const bot = new Telegraf(BOT_TOKEN);
 const BOT_STARTED_AT = dayjs();
 
+// 오류를 관리자 개인 대화로 전달 — 같은 방·같은 작업 오류는 10분에 한 번만
+const recentErrorAlerts = new Map<string, number>();
+async function alertAdmins(where: string, label: string, err: unknown) {
+    const key = `${where}:${label}`;
+    const now = Date.now();
+    if (now - (recentErrorAlerts.get(key) ?? 0) < 10 * 60 * 1000) return;
+    recentErrorAlerts.set(key, now);
+    const text =
+        `🚨 <b>[봇 오류]</b> ${escapeHtml(label)}\n` +
+        `• 위치: ${escapeHtml(where)}\n` +
+        `• 내용: <code>${escapeHtml(getErrorMessage(err).slice(0, 500))}</code>`;
+    for (const adminId of ADMIN_IDS) {
+        await bot.telegram.sendMessage(adminId, text, { parse_mode: 'HTML' }).catch(() => {});
+    }
+}
+
+function chatLabel(ctx: any): string {
+    const chat = ctx.chat;
+    if (!chat) return '알 수 없음';
+    const title = 'title' in chat ? chat.title : `개인 대화 (${chat.first_name || ''})`;
+    return `${title} (${chat.id})`;
+}
+
+// 처리 중 오류 응답 — 관리자에게는 오류 내용을 그대로, 그 외에는 DB 내용이 드러나지 않게 일반 문구로 답하고 관리자에게 전달
+async function replyError(ctx: any, label: string, err: unknown) {
+    if (isAdmin(ctx.from?.id)) {
+        await ctx.reply(`⚠️ ${label} 중 오류 발생: ${getErrorMessage(err)}`).catch(() => {});
+        return;
+    }
+    await ctx
+        .reply(`⚠️ ${label} 중 오류가 발생했습니다. 관리자에게 자동으로 전달했으니 잠시 후 다시 시도해주세요.`)
+        .catch(() => {});
+    await alertAdmins(chatLabel(ctx), label, err);
+}
+
 bot.catch((err: unknown, ctx) => {
     console.error(`[Telegraf 처리 에러] Chat ID: ${ctx.chat?.id}`, err);
+    alertAdmins(chatLabel(ctx), '처리되지 않은 오류', err).catch(() => {});
 });
 
 /* =====================================================
@@ -1032,7 +1082,7 @@ bot.hears(/^(?:[\/!]?관리자\s+)(인증\s*목록|인증\s*현황|인증)$/i, a
         );
     } catch (err: unknown) {
         console.error('[인증 목록 조회 에러]:', err);
-        await ctx.reply(`⚠️ 인증 목록 조회 중 오류 발생: ${getErrorMessage(err)}`);
+        await replyError(ctx, '인증 목록 조회', err);
     }
 });
 
@@ -1057,15 +1107,80 @@ bot.hears(/^(?:[\/!]?관리자\s+)인증\s*(해제|승인)\s+(\d+)$/i, async (ct
         }
 
         const name = escapeHtml(displayName({ first_name: res.rows[0].name, username: res.rows[0].username }));
+        if (approve) {
+            await ctx.reply(`✅ <b>${name}</b> 님을 승인했습니다.`, { parse_mode: 'HTML' });
+            return;
+        }
+
+        // 이 사람이 초대해서 쓰고 있는 방
+        const rooms = await getChatsAuthorizedBy(userId);
+        let msg = `⛔ <b>${name}</b> 님의 인증을 해제했습니다.\n`;
+        if (rooms.length === 0) {
+            msg += `<i>(이 사람이 초대한 방은 없습니다)</i>`;
+            await ctx.reply(msg, { parse_mode: 'HTML' });
+            return;
+        }
+        msg +=
+            `\n이 사람이 초대한 방 <b>${rooms.length}개</b>는 계속 사용됩니다:\n` +
+            rooms.map((r, i) => `${i + 1}. ${escapeHtml(r.title)}`).join('\n') +
+            `\n\n<i>막으려면 아래 버튼으로 이 방들에서 봇을 내보낼 수 있습니다. (방 기록은 보관되어 다시 초대하면 복원됩니다)</i>`;
+        await replyLong(ctx, msg, {
+            reply_markup: {
+                inline_keyboard: [[{ text: `🚪 ${rooms.length}개 방에서 봇 내보내기`, callback_data: `authleave:${userId}` }]],
+            },
+        });
+    } catch (err: unknown) {
+        console.error('[인증 변경 에러]:', err);
+        await replyError(ctx, '인증 변경', err);
+    }
+});
+
+// 특정 사용자가 초대해서 인증된 상담방 목록 (방 이름이 기록에 없으면 ID)
+async function getChatsAuthorizedBy(userId: string): Promise<{ chat_id: string; title: string }[]> {
+    const res = await neonPool.query(
+        `SELECT a.chat_id, COALESCE(c.room_title, a.chat_id) AS title
+         FROM authorized_chats a
+         LEFT JOIN counseling_chats c ON c.chat_id = a.chat_id
+         WHERE a.authorized_by = $1
+           AND NOT EXISTS (SELECT 1 FROM region_chats r WHERE r.chat_id = a.chat_id) -- 지역 담당방은 관리자가 관리하므로 제외
+         ORDER BY title;`,
+        [userId]
+    );
+    return res.rows;
+}
+
+// 관리자: 인증 해제한 사람이 초대한 방에서 봇 내보내기
+bot.action(/^authleave:(\d+)$/, async (ctx) => {
+    if (!isAdmin(ctx.from?.id)) {
+        await ctx.answerCbQuery('⛔ 관리자만 처리할 수 있습니다.');
+        return;
+    }
+    await ctx.answerCbQuery('처리 중입니다…');
+    await ctx.editMessageReplyMarkup(undefined).catch(() => {});
+    try {
+        const rooms = await getChatsAuthorizedBy(ctx.match[1]);
+        let left = 0;
+        const failed: string[] = [];
+        for (const r of rooms) {
+            try {
+                await bot.telegram.leaveChat(r.chat_id);
+                left++;
+            } catch (err: unknown) {
+                // 이미 봇이 없는 방이면 인증 기록만 정리
+                await neonPool.query(`DELETE FROM authorized_chats WHERE chat_id = $1`, [r.chat_id]).catch(() => {});
+                failed.push(`${r.title} (${getErrorMessage(err)})`);
+            }
+        }
         await ctx.reply(
-            approve
-                ? `✅ <b>${name}</b> 님을 승인했습니다.`
-                : `⛔ <b>${name}</b> 님의 인증을 해제했습니다.\n<i>(이미 초대한 방은 그대로 사용됩니다. 막으려면 해당 방에서 봇을 내보내주세요)</i>`,
+            `🚪 <b>${left}개 방에서 봇을 내보냈습니다.</b>` +
+                (failed.length
+                    ? `\n\n⚠️ 내보내지 못한 방 ${failed.length}개 (인증 기록은 정리함):\n` + failed.map((f) => `• ${escapeHtml(f)}`).join('\n')
+                    : ''),
             { parse_mode: 'HTML' }
         );
     } catch (err: unknown) {
-        console.error('[인증 변경 에러]:', err);
-        await ctx.reply(`⚠️ 인증 변경 중 오류 발생: ${getErrorMessage(err)}`);
+        console.error('[인증 해제 방 내보내기 에러]:', err);
+        await replyError(ctx, '봇 내보내기', err);
     }
 });
 
@@ -1195,7 +1310,7 @@ bot.hears(/^[\/!]담당방\s*등록(?:@\w+)?(?:\s+(.+))?$/i, async (ctx) => {
         );
     } catch (err: unknown) {
         console.error('[담당방 등록 에러]:', err);
-        await ctx.reply(`⚠️ 담당방 등록 중 오류 발생: ${getErrorMessage(err)}`);
+        await replyError(ctx, '담당방 등록', err);
     }
 });
 
@@ -1233,7 +1348,7 @@ bot.hears(/^[\/!]담당방\s*해제(?:@\w+)?(?:\s+(.+))?$/i, async (ctx) => {
         );
     } catch (err: unknown) {
         console.error('[담당방 해제 에러]:', err);
-        await ctx.reply(`⚠️ 담당방 해제 중 오류 발생: ${getErrorMessage(err)}`);
+        await replyError(ctx, '담당방 해제', err);
     }
 });
 
@@ -1267,7 +1382,7 @@ bot.hears(/^(?:[\/!]?관리자\s+)(담당방|담당방\s*목록|지역\s*담당�
         await replyLong(ctx, msg);
     } catch (err: unknown) {
         console.error('[담당방 목록 에러]:', err);
-        await ctx.reply(`⚠️ 담당방 목록 조회 중 오류 발생: ${getErrorMessage(err)}`);
+        await replyError(ctx, '담당방 목록 조회', err);
     }
 });
 
@@ -1340,7 +1455,7 @@ bot.hears(/^[\/!]담당방\s*공지(?:@\w+)?(?:\s+([\s\S]+))?$/i, async (ctx) =>
         );
     } catch (err: unknown) {
         console.error('[담당방 공지 에러]:', err);
-        await ctx.reply(`⚠️ 담당방 공지 준비 중 오류 발생: ${getErrorMessage(err)}`);
+        await replyError(ctx, '담당방 공지 준비', err);
     }
 });
 
@@ -1510,7 +1625,7 @@ bot.hears(/^(?:[\/!]?관리자\s+)신규(?:\s*만남)?(?:\s+(오늘|어제|이�
         await replyLong(ctx, header + formatMeetingEvents(events));
     } catch (err: unknown) {
         console.error('[신규 만남 조회 에러]:', err);
-        await ctx.reply(`⚠️ 신규 만남 조회 중 오류 발생: ${getErrorMessage(err)}`);
+        await replyError(ctx, '신규 만남 조회', err);
     }
 });
 
@@ -1625,6 +1740,30 @@ bot.on('new_chat_title', async (ctx) => {
     }
 });
 
+// 봇이 방에서 나갈 때 방 기록을 보관 (실수로 내보냈다가 다시 초대하면 매칭·회차 보정값 등을 그대로 복원)
+async function archiveChat(chatId: string) {
+    await neonPool.query(
+        `INSERT INTO counseling_chats_left (chat_id, data, left_at)
+         SELECT c.chat_id, to_jsonb(c), NOW() FROM counseling_chats c WHERE c.chat_id = $1
+         ON CONFLICT (chat_id) DO UPDATE SET data = EXCLUDED.data, left_at = NOW();`,
+        [chatId]
+    );
+}
+
+// 보관해 둔 방 기록 복원 — 복원했으면 true
+async function restoreArchivedChat(chatId: string): Promise<boolean> {
+    const res = await neonPool.query(
+        `INSERT INTO counseling_chats
+         SELECT (jsonb_populate_record(NULL::counseling_chats, l.data)).*
+         FROM counseling_chats_left l WHERE l.chat_id = $1
+         ON CONFLICT (chat_id) DO NOTHING
+         RETURNING chat_id;`,
+        [chatId]
+    );
+    await neonPool.query(`DELETE FROM counseling_chats_left WHERE chat_id = $1;`, [chatId]);
+    return (res.rowCount ?? 0) > 0;
+}
+
 // 봇이 방에 추가되거나 퇴장당했을 때
 bot.on('my_chat_member', async (ctx) => {
     const status = ctx.myChatMember.new_chat_member.status;
@@ -1652,7 +1791,22 @@ bot.on('my_chat_member', async (ctx) => {
                 await authorizeChat(chatId, inviter.id);
             }
 
+            const restored = ctx.chat.type !== 'private' && (await restoreArchivedChat(String(chatId)));
             await ensureChatRecord(chatId, title);
+
+            if (restored) {
+                const record = await getChatRecord(chatId);
+                if (record?.matched_member_id) {
+                    await ctx.reply(
+                        '♻️ <b>다시 초대되어 이전 기록을 복원했습니다.</b>\n\n' +
+                            `• 대상자: <b>${escapeHtml(record.matched_student_name || '대상자')}</b>\n` +
+                            `• 다음 만남일: ${escapeHtml(record.meeting_date || '미정')}\n` +
+                            '<i>(현재 상태는 /상태확인 으로 볼 수 있습니다)</i>',
+                        { parse_mode: 'HTML' }
+                    );
+                    return;
+                }
+            }
 
             await ctx.reply(
                 '👋 <b>상담/복음방 일정 관리 봇이 등록되었습니다.</b>\n\n' +
@@ -1666,6 +1820,7 @@ bot.on('my_chat_member', async (ctx) => {
         }
     } else if (status === 'left' || status === 'kicked') {
         try {
+            await archiveChat(String(chatId));
             await neonPool.query(`DELETE FROM counseling_chats WHERE chat_id = $1;`, [String(chatId)]);
             await neonPool.query(`DELETE FROM authorized_chats WHERE chat_id = $1;`, [String(chatId)]);
             await neonPool.query(`DELETE FROM region_chats WHERE chat_id = $1;`, [String(chatId)]);
@@ -1683,8 +1838,7 @@ bot.hears(/^[\/!](start|help|도움말)(?:@\w+)?$/i, async (ctx) => {
             '• <b>대상자 최초 등록</b>: <code>/최초등록 섭외자/지역/팀/인도자</code>\n' +
             '• <b>현재 방 상태 확인</b>: <code>/상태확인</code>\n' +
             '• <b>행정 등록 확인</b>: <code>/행정확인</code>\n' +
-            '• <b>목표월 수정</b>: <code>/목표월수정 n월</code>\n' +
-            '• <b>채팅방 ID 확인</b>: <code>/방ID</code>\n\n' +
+            '• <b>목표월 수정</b>: <code>/목표월수정 n월</code>\n\n' +
             '<b>2. 인터뷰 만남 단계</b>\n' +
             '• <b>사전 보고서 등록</b>: 채팅방에 <code>[인터뷰 사전 보고서]</code> 양식 전송\n' +
             '• <b>사전 보고서 양식</b>: <code>/인터뷰사전양식</code>\n' +
@@ -1735,13 +1889,19 @@ bot.hears(/^[\/!](start|help|도움말)(?:@\w+)?$/i, async (ctx) => {
             '• <b>신규 만남 발생</b>: <code>관리자 신규</code> (기간: <code>오늘</code>, <code>어제</code>, <code>이번주</code>, <code>지난주</code>, <code>10월</code>)\n' +
             '   <i>(상담 이하 = 인터뷰 매칭 / 지인 만남 / 상담 1회차 = 교사 매칭, 밤 10시 지역 요약에도 포함)</i>\n' +
             '• <b>담당방 공지</b>: <code>/담당방공지 내용</code> (특정 지역만: <code>/담당방공지 [강북,강남] 내용</code>)\n' +
-            '• <b>봇 상태 점검</b>: <code>관리자 봇상태</code> (설정·DB·웹훅 오류 확인)',
+            '• <b>봇 상태 점검</b>: <code>관리자 봇상태</code> (설정·DB·웹훅 오류 확인)\n' +
+            '• <b>채팅방 ID 확인</b>: <code>/방ID</code>\n' +
+            '• <b>상담방 찾기</b>: <code>관리자 찾기 이름</code> (대상자·인도자·교사 이름, 방 이름, 방 ID)',
         { parse_mode: 'HTML' }
     );
 });
 
-// 채팅방·내 텔레그램 ID 확인 (/방ID, /내ID, /chatid)
+// 관리자: 채팅방·내 텔레그램 ID 확인 (/방ID, /내ID, /chatid)
 bot.hears(CHAT_ID_COMMAND, async (ctx) => {
+    if (!isAdmin(ctx.from?.id)) {
+        await ctx.reply('⛔ 접근 권한이 없습니다.');
+        return;
+    }
     const chat = ctx.chat;
     const from = ctx.from;
     const typeLabel: Record<string, string> = { private: '개인 대화', group: '그룹', supergroup: '슈퍼그룹', channel: '채널' };
@@ -1766,6 +1926,53 @@ bot.hears(CHAT_ID_COMMAND, async (ctx) => {
     }
     msg += `\n<i>(ID를 길게 눌러 복사할 수 있습니다)</i>`;
     await ctx.reply(msg, { parse_mode: 'HTML' });
+});
+
+// 관리자: 상담방 찾기 (관리자 찾기 이름) — 대상자·인도자·교사 이름, 방 이름, 방 ID로 검색
+bot.hears(/^(?:[\/!]?관리자\s+)(?:찾기|검색|방\s*찾기)\s+(.+)$/i, async (ctx) => {
+    try {
+        if (!isAdmin(ctx.from?.id)) {
+            await ctx.reply('⛔ 접근 권한이 없습니다.');
+            return;
+        }
+        const keyword = ctx.match[1].replace(/\s/g, '');
+        if (keyword.length < 2 && !/^-?\d+$/.test(keyword)) {
+            await ctx.reply('⚠️ 두 글자 이상 입력해주세요. 예: <code>관리자 찾기 홍길동</code>', { parse_mode: 'HTML' });
+            return;
+        }
+        const norm = (v?: string | null) => (v || '').replace(/\s/g, '');
+        const found = (await getAllChats()).filter((c) =>
+            [c.room_title, c.matched_student_name, c.guide_name, c.teacher_name, c.chat_id].some((v) => norm(v).includes(keyword))
+        );
+        if (found.length === 0) {
+            await ctx.reply(`🔍 <b>${escapeHtml(keyword)}</b>(으)로 찾은 상담방이 없습니다.`, { parse_mode: 'HTML' });
+            return;
+        }
+
+        const shown = found.slice(0, 15);
+        const typeText = (c: ChatRecord) => (c.meeting_type ? `${c.meeting_type} 만남` : '⚠️ 유형 미선택');
+        const whenText = (c: ChatRecord) =>
+            !c.meeting_date
+                ? '미등록'
+                : c.meeting_date === '중단'
+                ? `🛑 중단${c.stop_category ? ` (${escapeHtml(c.stop_category)})` : ''}`
+                : c.meeting_date === '미정'
+                ? '미정'
+                : formatMeetingWhen(formatYmdWithDay(c.meeting_date), c.meeting_time);
+        let msg = `🔍 <b>[상담방 찾기: ${escapeHtml(keyword)}]</b> ${found.length}건${found.length > shown.length ? ` (앞 ${shown.length}건만 표시)` : ''}\n\n`;
+        shown.forEach((c, i) => {
+            msg +=
+                `<b>${i + 1}.</b> ` +
+                regionRoomInfo(c) +
+                `• 유형: ${typeText(c)} · 다음 만남: <b>${whenText(c)}</b>` +
+                (c.meeting_type === '교사' ? ` · ${c.teacher_meeting_count ?? 0}회차` : '') +
+                `\n• 방 ID: <code>${escapeHtml(c.chat_id)}</code>\n\n`;
+        });
+        await replyLong(ctx, msg.trimEnd());
+    } catch (err: unknown) {
+        console.error('[관리자 찾기 에러]:', err);
+        await replyError(ctx, '상담방 찾기', err);
+    }
 });
 
 // 관리자: 봇 상태 점검 (관리자 봇상태) — 설정값은 '있음/없음'만 표시하고 값 자체는 보여주지 않음
@@ -1825,6 +2032,7 @@ bot.hears(/^(?:[\/!]?관리자\s+)(봇\s*상태|상태\s*점검|설정\s*점검)
 });
 
 // 매칭 완료 안내 + 첫 만남 유형 버튼 (텔레그램 /최초등록, 웹 최초등록 공통)
+const TYPE_REMINDER_MAX = 3; // 유형 미선택 방 재안내 최대 횟수
 const MEETING_TYPE_KEYBOARD = {
     inline_keyboard: [
         [
@@ -1854,6 +2062,11 @@ async function notifyWebRegistration(chatId: string): Promise<{ ok: boolean; err
     const record = await getChatRecord(chatId);
     if (!record) return { ok: false, error: '상담방을 찾을 수 없습니다.' };
     if (!record.matched_member_id) return { ok: false, error: '매칭된 대상자가 없습니다.' };
+    // 유형 미선택 리마인드 기준 시각 (웹은 matched_at을 따로 기록하지 않으므로 여기서 기록)
+    await neonPool.query(
+        `UPDATE counseling_chats SET matched_at = NOW(), type_reminder_date = NULL, type_reminder_count = 0 WHERE chat_id = $1`,
+        [chatId]
+    );
 
     await bot.telegram.sendMessage(
         chatId,
@@ -1935,12 +2148,21 @@ bot.hears(/^[\/!]최초등록(?:@\w+)?(?:\s+(.+))?$/i, async (ctx) => {
         const title = 'title' in ctx.chat ? ctx.chat.title : ctx.chat.first_name || '대화방';
 
         await ensureChatRecord(ctx.chat.id, title);
-        await updateChat(ctx.chat.id, { matched_member_id: match.student_id });
+        await updateChat(ctx.chat.id, {
+            matched_member_id: match.student_id,
+            matched_at: new Date().toISOString(),
+            type_reminder_date: null,
+            type_reminder_count: 0,
+        });
 
         await ctx.reply(matchedPromptText(match), { parse_mode: 'HTML', reply_markup: MEETING_TYPE_KEYBOARD });
+
+        // 인도자·교사 지역 담당방에도 알림 (웹 최초등록과 동일)
+        const record = await getChatRecord(ctx.chat.id);
+        if (record) await notifyRegionChats(record, `🆕 <b>[최초등록]</b>\n` + regionRoomInfo(record));
     } catch (err: unknown) {
         console.error('[최초등록 JOIN 매칭 에러]:', err);
-        await ctx.reply(`⚠️ DB 매칭 조회 중 오류 발생: ${getErrorMessage(err)}`);
+        await replyError(ctx, 'DB 매칭 조회', err);
     }
 });
 
@@ -2037,7 +2259,7 @@ bot.hears(/^[\/!]교사\s*전환(?:@\w+)?$/i, async (ctx) => {
         );
     } catch (err: unknown) {
         console.error('[/교사전환 에러]:', err);
-        await ctx.reply(`⚠️ 교사 전환 중 오류 발생: ${getErrorMessage(err)}`);
+        await replyError(ctx, '교사 전환', err);
     }
 });
 
@@ -2206,7 +2428,7 @@ bot.hears(/^[\/!](인터뷰어|인터뷰어수정|인터뷰어변경)(?:@\w+)?(?
         );
     } catch (err: unknown) {
         console.error('[/인터뷰어 개별 수정 에러]:', err);
-        await ctx.reply(`⚠ 인터뷰어 수정 중 오류 발생: ${getErrorMessage(err)}`);
+        await replyError(ctx, '인터뷰어 수정', err);
     }
 });
 
@@ -2233,7 +2455,7 @@ bot.hears(/^[\/!](타이퍼|타이퍼수정|타이퍼변경)(?:@\w+)?(?:\s+(.+))
             await ctx.reply('⌨️ <b>타이퍼가 [미지정]으로 해제되었습니다.</b>', { parse_mode: 'HTML' });
         } catch (err: unknown) {
             console.error('[/타이퍼 해제 에러]:', getErrorMessage(err));
-            await ctx.reply(`⚠️ 타이퍼 해제 중 오류 발생: ${getErrorMessage(err)}`);
+            await replyError(ctx, '타이퍼 해제', err);
         }
         return;
     }
@@ -2272,7 +2494,7 @@ bot.hears(/^[\/!](타이퍼|타이퍼수정|타이퍼변경)(?:@\w+)?(?:\s+(.+))
         );
     } catch (err: unknown) {
         console.error('[/타이퍼 개별 수정 에러]:', err);
-        await ctx.reply(`⚠️ 타이퍼 수정 중 오류 발생: ${getErrorMessage(err)}`);
+        await replyError(ctx, '타이퍼 수정', err);
     }
 });
 
@@ -2317,7 +2539,7 @@ bot.hears(/^[\/!](인터뷰일|인터뷰일자|인터뷰일정)(?:@\w+)?(?:(?:\s
         );
     } catch (err: unknown) {
         console.error('[/인터뷰일 수정 에러]:', getErrorMessage(err));
-        await ctx.reply(`⚠️ 인터뷰 일정 수정 중 오류 발생: ${getErrorMessage(err)}`);
+        await replyError(ctx, '인터뷰 일정 수정', err);
     }
 });
 
@@ -2342,7 +2564,7 @@ bot.hears(/^[\/!]매칭해제(?:@\w+)?$/i, async (ctx) => {
         await ctx.reply('✅ 대상자 매칭 및 인터뷰 설정이 모두 초기화되었습니다.');
     } catch (err: unknown) {
         console.error('[/매칭해제 에러]:', getErrorMessage(err));
-        await ctx.reply(`⚠️ 매칭 해제 중 오류 발생: ${getErrorMessage(err)}`);
+        await replyError(ctx, '매칭 해제', err);
     }
 });
 
@@ -2427,7 +2649,7 @@ bot.hears(/^[\/!]행정확인(?:@\w+)?$/i, async (ctx) => {
         await ctx.reply(msg, { parse_mode: 'HTML' });
     } catch (err: unknown) {
         console.error('[/행정확인 에러]:', err);
-        await ctx.reply(`⚠️ 행정 확인 중 오류 발생: ${getErrorMessage(err)}`);
+        await replyError(ctx, '행정 확인', err);
     }
 });
 
@@ -2498,7 +2720,7 @@ bot.hears(/^[\/!]목표월(?:\s*(?:수정|변경|설정))?(?:@\w+)?(?:\s+(.+))?$
         );
     } catch (err: unknown) {
         console.error('[/목표월수정 에러]:', err);
-        await ctx.reply(`⚠️ 목표월 수정 중 오류 발생: ${getErrorMessage(err)}`);
+        await replyError(ctx, '목표월 수정', err);
     }
 });
 
@@ -2616,7 +2838,7 @@ bot.hears(/^[\/!]상태확인(?:@\w+)?$/i, async (ctx) => {
     );
     } catch (err: unknown) {
         console.error('[/상태확인 에러]:', getErrorMessage(err));
-        await ctx.reply(`⚠️ 상태 확인 중 오류 발생: ${getErrorMessage(err)}`);
+        await replyError(ctx, '상태 확인', err);
     }
 });
 
@@ -2636,7 +2858,7 @@ bot.hears(/^[\/!]만남중단(?:@\w+)?(?:\s+(.+))?$/i, async (ctx) => {
         );
     } catch (err: unknown) {
         console.error('[/만남중단 에러]:', getErrorMessage(err));
-        await ctx.reply(`⚠️ 만남 중단 처리 중 오류 발생: ${getErrorMessage(err)}`);
+        await replyError(ctx, '만남 중단 처리', err);
     }
 });
 
@@ -2791,7 +3013,7 @@ bot.hears(/^[\/!]만남일(?:@\w+)?(?:(?:\s+|(?=\d))([\s\S]+))?$/i, async (ctx) 
         );
     } catch (err: unknown) {
         console.error('[/만남일 설정 에러]:', getErrorMessage(err));
-        await ctx.reply(`⚠️ 만남일 설정 중 오류 발생: ${getErrorMessage(err)}`);
+        await replyError(ctx, '만남일 설정', err);
     }
 });
 
@@ -2828,7 +3050,7 @@ bot.hears(new RegExp(`^[\\/!](${STAGE_COMMAND_ALT})(?:@\\w+)?(?:(?:\\s+|(?=\\d))
         await ctx.reply(replyMsg, { parse_mode: 'HTML' });
     } catch (err: unknown) {
         console.error('[방 구분 설정 에러]:', getErrorMessage(err));
-        await ctx.reply(`⚠️ 구분 설정 중 오류 발생: ${getErrorMessage(err)}`);
+        await replyError(ctx, '구분 설정', err);
     }
 });
 
@@ -2846,7 +3068,7 @@ bot.hears(/^[\/!](구분해제|일반)(?:@\w+)?$/i, async (ctx) => {
         await ctx.reply('✅ <b>특수 구분이 해제되어 [일반] 상태로 전환되었습니다.</b>', { parse_mode: 'HTML' });
     } catch (err: unknown) {
         console.error('[구분 해제 에러]:', getErrorMessage(err));
-        await ctx.reply(`⚠️ 구분 해제 중 오류 발생: ${getErrorMessage(err)}`);
+        await replyError(ctx, '구분 해제', err);
     }
 });
 
@@ -3254,7 +3476,7 @@ bot.hears(
             await replyLong(ctx, message);
         } catch (err: unknown) {
             console.error('[미등록/미정 조회 에러]:', err);
-            await ctx.reply(`⚠️ 조회 중 오류 발생: ${getErrorMessage(err)}`);
+            await replyError(ctx, '조회', err);
         }
     }
 );
@@ -3402,7 +3624,7 @@ bot.hears(/^(?:[\/!]?관리자\s+)(미초대|봇미초대|초대누락)$/i, asyn
         });
     } catch (err: unknown) {
         console.error('[미초대 명단 조회 에러]:', err);
-        await ctx.reply(`⚠️ 미초대 명단 조회 중 오류 발생: ${getErrorMessage(err)}`);
+        await replyError(ctx, '미초대 명단 조회', err);
     }
 });
 
@@ -3486,7 +3708,7 @@ bot.hears(/^(?:[\/!]?관리자\s+)(구분|단계|특수|진행구분)$/i, async 
         await replyLong(ctx, msg);
     } catch (err: unknown) {
         console.error('[관리자 구분 조회 에러]:', err);
-        await ctx.reply(`⚠️ 조회 중 오류 발생: ${getErrorMessage(err)}`);
+        await replyError(ctx, '조회', err);
     }
 });
 
@@ -3803,7 +4025,7 @@ bot.hears(/^(?:[\/!]?관리자\s+)(미제출|미갱신)\s*(타부서\s*포함)?\
         );
     } catch (err: unknown) {
         console.error('[일괄 알림 준비 에러]:', err);
-        await ctx.reply(`⚠️ 일괄 알림 준비 중 오류 발생: ${getErrorMessage(err)}`);
+        await replyError(ctx, '일괄 알림 준비', err);
     }
 });
 
@@ -3847,7 +4069,7 @@ bot.action(/^bulk:(overdue|expired|expiredall|cancel)$/, async (ctx) => {
         );
     } catch (err: unknown) {
         console.error('[일괄 알림 발송 에러]:', err);
-        await ctx.reply(`⚠️ 일괄 알림 발송 중 오류 발생: ${getErrorMessage(err)}`);
+        await replyError(ctx, '일괄 알림 발송', err);
     }
 });
 
@@ -3924,7 +4146,7 @@ bot.hears(/^(?:[\/!]?관리자\s+)(주간\s*요약|주간\s*리포트|주간)$/i
         await replyLong(ctx, await buildWeeklySummary());
     } catch (err: unknown) {
         console.error('[주간 요약 에러]:', err);
-        await ctx.reply(`⚠️ 주간 요약 생성 중 오류 발생: ${getErrorMessage(err)}`);
+        await replyError(ctx, '주간 요약 생성', err);
     }
 });
 
@@ -4092,7 +4314,7 @@ bot.hears(/^[\/!]섭등\s*(?:후\s*)?회차(?:@\w+)?(?:\s+(\d{1,3})\s*회?)?$/i,
         );
     } catch (err: unknown) {
         console.error('[/섭등회차 에러]:', err);
-        await ctx.reply(`⚠️ 섭등 후 회차 처리 중 오류 발생: ${getErrorMessage(err)}`);
+        await replyError(ctx, '섭등 후 회차 처리', err);
     }
 });
 
@@ -4125,7 +4347,7 @@ bot.hears(/^[\/!](?:교사\s*만남\s*)?회차\s*취소(?:@\w+)?$/i, async (ctx)
         );
     } catch (err: unknown) {
         console.error('[/회차취소 에러]:', err);
-        await ctx.reply(`⚠️ 회차 취소 중 오류 발생: ${getErrorMessage(err)}`);
+        await replyError(ctx, '회차 취소', err);
     }
 });
 
@@ -4190,7 +4412,7 @@ bot.hears(/^[\/!](?:교사\s*만남\s*회차|만남\s*회차|회차)(?:@\w+)?(?:
         await replyLong(ctx, msg);
     } catch (err: unknown) {
         console.error('[/교사만남회차 에러]:', err);
-        await ctx.reply(`⚠️ 교사 만남 회차 조회 중 오류 발생: ${getErrorMessage(err)}`);
+        await replyError(ctx, '교사 만남 회차 조회', err);
     }
 });
 
@@ -4332,7 +4554,7 @@ async function handleIncomingText(ctx: any, rawText: string, source: 'text' | 'c
             return;
         } catch (err: unknown) {
             console.error('[사전 보고서 처리 에러]:', err);
-            await ctx.reply(`⚠️ 사전 보고서 처리 중 오류가 발생했습니다: ${getErrorMessage(err)}`);
+            await replyError(ctx, '사전 보고서 처리', err);
             return;
         }
     }
@@ -4519,7 +4741,7 @@ async function handleIncomingText(ctx: any, rawText: string, source: 'text' | 'c
     }
     } catch (err: unknown) {
         console.error(`[텍스트 메시지 처리 에러] (${source}):`, getErrorMessage(err));
-        await ctx.reply(`⚠️ 메시지 처리 중 오류가 발생했습니다: ${getErrorMessage(err)}`);
+        await replyError(ctx, '메시지 처리', err);
     }
 }
 
@@ -4573,6 +4795,36 @@ async function triggerMorningReminder() {
                 await updateChat(chat.chat_id, { stage_notified_date: todayStr });
             } catch (err: unknown) {
                 console.error(`[구분 예정일 알림 실패] Chat: ${chat.chat_id}`, getErrorMessage(err));
+            }
+        }
+
+        // 매칭은 됐는데 첫 만남 유형을 고르지 않은 방 — 등록 다음 날부터 하루 한 번, 최대 3번 다시 안내
+        if (
+            chat.matched_member_id &&
+            !chat.meeting_type &&
+            !chat.meeting_date &&
+            (!chat.matched_at || dayjs(chat.matched_at).isBefore(today)) &&
+            chat.type_reminder_date !== todayStr &&
+            (chat.type_reminder_count ?? 0) < TYPE_REMINDER_MAX
+        ) {
+            try {
+                const count = (chat.type_reminder_count ?? 0) + 1;
+                await bot.telegram.sendMessage(
+                    chat.chat_id,
+                    `⏰ <b>[첫 만남 유형 선택 안내]</b>` +
+                        (chat.matched_student_name ? ` (👤 ${escapeHtml(chat.matched_student_name)})` : '') +
+                        `\n대상자 매칭은 되었지만 <b>첫 만남 유형</b>이 아직 선택되지 않았습니다.\n` +
+                        `유형을 골라야 일정 알림이 시작됩니다. 👇` +
+                        (count >= TYPE_REMINDER_MAX ? `\n<i>(마지막 안내입니다)</i>` : ''),
+                    { parse_mode: 'HTML', reply_markup: MEETING_TYPE_KEYBOARD }
+                );
+                // updated_at은 건드리지 않음 (일정·상태 변경 시각으로 쓰이므로)
+                await neonPool.query(
+                    `UPDATE counseling_chats SET type_reminder_date = $2, type_reminder_count = $3 WHERE chat_id = $1`,
+                    [chat.chat_id, todayStr, count]
+                );
+            } catch (err: unknown) {
+                console.error(`[유형 미선택 안내 실패] Chat: ${chat.chat_id}`, getErrorMessage(err));
             }
         }
 
@@ -4803,8 +5055,9 @@ const server = http.createServer(async (req, res) => {
             return res.end(cron[1]);
         } catch (err: unknown) {
             console.error(`[${url.pathname} 실행 에러]:`, getErrorMessage(err));
+            await alertAdmins(url.pathname, '정기 알림 실행 실패', err);
             res.writeHead(500, { 'Content-Type': 'text/plain; charset=utf-8' });
-            return res.end(`Reminder failed: ${getErrorMessage(err)}`);
+            return res.end('Reminder failed');
         }
     }
 
