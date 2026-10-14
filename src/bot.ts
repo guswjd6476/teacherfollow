@@ -884,7 +884,7 @@ async function isAuthorizedChat(chatId: number | string): Promise<boolean> {
 
 // 일반 그룹이 슈퍼그룹으로 바뀌면 텔레그램이 방 ID를 새로 준다 (-100으로 시작).
 // 새 ID로 빈 상담방 기록이 생기므로, 옛 ID의 기록(매칭·일정·회차·만남 기록·담당방 등록)을 새 ID로 합친다.
-// 같은 칸은 새 방 값을 쓰고, 새 방이 비어 있으면 옛 방 값을 쓴다. 여러 번 불려도 결과가 같다
+// 최초 등록(학생 연결)이 된 쪽 값을 기준으로 하고 빈 칸만 다른 쪽 값으로 채운다. 여러 번 불려도 결과가 같다
 async function mergeMigratedChat(oldChatId: number | string, newChatId: number | string) {
     const oldId = String(oldChatId);
     const newId = String(newChatId);
@@ -900,11 +900,14 @@ async function mergeMigratedChat(oldChatId: number | string, newChatId: number |
         if (oldRow && !newRow) {
             await client.query(`UPDATE counseling_chats SET chat_id = $2 WHERE chat_id = $1`, [oldId, newId]);
         } else if (oldRow && newRow) {
+            // 최초 등록(학생 연결)이 된 방을 기준으로 (둘 다 됐거나 둘 다 안 됐으면 새 방 기준), 기준 방에서 빈 칸만 다른 방 값으로
             const empty = (v: unknown) => v === null || v === undefined || v === '' || v === 0 || v === false;
+            const [base, other] = !newRow.matched_member_id && oldRow.matched_member_id ? [oldRow, newRow] : [newRow, oldRow];
             const cols = Object.keys(newRow).filter((c) => c !== 'chat_id');
             const merged = cols.map((c) => {
                 if (c === 'created_at') return oldRow.created_at < newRow.created_at ? oldRow.created_at : newRow.created_at;
-                return empty(newRow[c]) ? oldRow[c] : newRow[c];
+                if (c === 'room_title') return newRow.room_title || oldRow.room_title; // 방 제목은 지금 것
+                return empty(base[c]) ? other[c] : base[c];
             });
             await client.query(
                 `UPDATE counseling_chats SET ${cols.map((c, i) => `"${c}" = $${i + 2}`).join(', ')} WHERE chat_id = $1`,
