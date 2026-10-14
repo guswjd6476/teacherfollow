@@ -882,6 +882,73 @@ async function isAuthorizedChat(chatId: number | string): Promise<boolean> {
     return res.rows.length > 0;
 }
 
+// 일반 그룹이 슈퍼그룹으로 바뀌면 텔레그램이 방 ID를 새로 준다 (-100으로 시작).
+// 새 ID로 빈 상담방 기록이 생기므로, 옛 ID의 기록(매칭·일정·회차·만남 기록·담당방 등록)을 새 ID로 합친다.
+// 같은 칸은 새 방 값을 쓰고, 새 방이 비어 있으면 옛 방 값을 쓴다. 여러 번 불려도 결과가 같다
+async function mergeMigratedChat(oldChatId: number | string, newChatId: number | string) {
+    const oldId = String(oldChatId);
+    const newId = String(newChatId);
+    if (oldId === newId) return;
+    const client = await neonPool.connect();
+    try {
+        await client.query('BEGIN');
+        const rows = (
+            await client.query(`SELECT * FROM counseling_chats WHERE chat_id = ANY($1::text[]) FOR UPDATE`, [[oldId, newId]])
+        ).rows;
+        const oldRow = rows.find((r) => r.chat_id === oldId);
+        const newRow = rows.find((r) => r.chat_id === newId);
+        if (oldRow && !newRow) {
+            await client.query(`UPDATE counseling_chats SET chat_id = $2 WHERE chat_id = $1`, [oldId, newId]);
+        } else if (oldRow && newRow) {
+            const empty = (v: unknown) => v === null || v === undefined || v === '' || v === 0 || v === false;
+            const cols = Object.keys(newRow).filter((c) => c !== 'chat_id');
+            const merged = cols.map((c) => {
+                if (c === 'created_at') return oldRow.created_at < newRow.created_at ? oldRow.created_at : newRow.created_at;
+                return empty(newRow[c]) ? oldRow[c] : newRow[c];
+            });
+            await client.query(
+                `UPDATE counseling_chats SET ${cols.map((c, i) => `"${c}" = $${i + 2}`).join(', ')} WHERE chat_id = $1`,
+                [newId, ...merged]
+            );
+            await client.query(`DELETE FROM counseling_chats WHERE chat_id = $1`, [oldId]);
+        }
+        // 회차·만남 기록 (새 방에 같은 기록이 이미 있으면 옛 것은 버림)
+        await client.query(
+            `UPDATE teacher_meetings t SET chat_id = $2 WHERE t.chat_id = $1 AND NOT EXISTS (
+                 SELECT 1 FROM teacher_meetings x WHERE x.chat_id = $2
+                   AND (x.message_id = t.message_id OR (x.student_id = t.student_id AND x.meeting_date = t.meeting_date)))`,
+            [oldId, newId]
+        );
+        await client.query(`DELETE FROM teacher_meetings WHERE chat_id = $1`, [oldId]);
+        await client.query(
+            `UPDATE meeting_events e SET chat_id = $2 WHERE e.chat_id = $1 AND NOT EXISTS (
+                 SELECT 1 FROM meeting_events x WHERE x.chat_id = $2 AND x.student_id = e.student_id AND x.source = e.source)`,
+            [oldId, newId]
+        );
+        await client.query(`DELETE FROM meeting_events WHERE chat_id = $1`, [oldId]);
+        await client.query(`UPDATE counseling_meeting_log SET chat_id = $2 WHERE chat_id = $1`, [oldId, newId]);
+        // 지역 담당방이 바뀐 경우
+        await client.query(
+            `INSERT INTO region_chats (chat_id, region, registered_by, registered_at)
+             SELECT $2, region, registered_by, registered_at FROM region_chats WHERE chat_id = $1
+             ON CONFLICT (chat_id, region) DO NOTHING`,
+            [oldId, newId]
+        );
+        await client.query(`DELETE FROM region_chats WHERE chat_id = $1`, [oldId]);
+        await client.query(
+            `INSERT INTO authorized_chats (chat_id, authorized_by) VALUES ($1, 'migration') ON CONFLICT (chat_id) DO NOTHING`,
+            [newId]
+        );
+        await client.query('COMMIT');
+        console.log(`[슈퍼그룹 전환 기록 합침] ${oldId} -> ${newId}`);
+    } catch (err: unknown) {
+        await client.query('ROLLBACK').catch(() => {});
+        console.error('[슈퍼그룹 전환 기록 합치기 실패]:', getErrorMessage(err));
+    } finally {
+        client.release();
+    }
+}
+
 async function authorizeChat(chatId: number | string, byUserId: number | string) {
     await neonPool.query(
         `INSERT INTO authorized_chats (chat_id, authorized_by) VALUES ($1, $2) ON CONFLICT (chat_id) DO NOTHING;`,
@@ -931,15 +998,19 @@ bot.use(async (ctx, next) => {
     }
 
     const message = ctx.message as Record<string, any> | undefined;
-    if (await isAuthorizedChat(chat.id)) {
-        // 일반 그룹이 슈퍼그룹으로 바뀌면 방 ID가 바뀌므로 인증을 새 ID로 이어받음
-        if (message?.migrate_to_chat_id) await authorizeChat(message.migrate_to_chat_id, 'migration');
-        return next();
+    // 일반 그룹이 슈퍼그룹으로 바뀌면 방 ID가 바뀐다. 옛 방에는 migrate_to_chat_id, 새 방에는 migrate_from_chat_id가 온다.
+    // 새 방은 '봇이 추가됨'(my_chat_member)으로 먼저 인증·빈 기록이 생길 수 있으므로, 인증 여부와 관계없이 먼저 기록을 합친다
+    if (message?.migrate_to_chat_id && (await isAuthorizedChat(chat.id))) {
+        await authorizeChat(message.migrate_to_chat_id, 'migration');
+        await mergeMigratedChat(chat.id, message.migrate_to_chat_id);
+        return;
     }
     if (message?.migrate_from_chat_id && (await isAuthorizedChat(message.migrate_from_chat_id))) {
         await authorizeChat(chat.id, 'migration');
-        return next();
+        await mergeMigratedChat(message.migrate_from_chat_id, chat.id);
+        return;
     }
+    if (await isAuthorizedChat(chat.id)) return next();
     // 인증되지 않은 방의 메시지는 무시 — 단, 관리자의 /방ID 는 허용
     const text = typeof message?.text === 'string' ? message.text : '';
     if (CHAT_ID_COMMAND.test(text) && isAdmin(ctx.from?.id)) return next();
