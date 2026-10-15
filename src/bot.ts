@@ -151,7 +151,11 @@ async function initDb() {
             -- 오전 10시 점검 때 계산한 지금 걸린 진행 멈춤 안내 (웹 상담 현황이 같은 기준으로 보여준다)
             ADD COLUMN IF NOT EXISTS nudge_key VARCHAR(20),
             ADD COLUMN IF NOT EXISTS nudge_label VARCHAR(40),
-            ADD COLUMN IF NOT EXISTS nudge_checked_on VARCHAR(10);
+            ADD COLUMN IF NOT EXISTS nudge_checked_on VARCHAR(10),
+            -- 중단한 시각 (주간 결산의 중단 건수용, 봇에서 중단할 때 기록 — 없으면 updated_at으로 봄)
+            ADD COLUMN IF NOT EXISTS stopped_at TIMESTAMPTZ,
+            -- 인터뷰 D-1 대상자 연락 확인 ('인터뷰일:ok' / '인터뷰일:fail')
+            ADD COLUMN IF NOT EXISTS interview_contact VARCHAR(30);
         `);
         // 중단 시점 기록 도입 전에 중단된 방 채우기 (여러 번 실행돼도 빈 것만 채움)
         await neonPool.query(`
@@ -320,7 +324,12 @@ interface ChatRecord {
     stage_reminder_count?: number | null;
     drop_ack_at?: string | null;
     stop_phase?: string | null;
+    stopped_at?: string | null;
+    interview_contact?: string | null;
     student_dropped_at?: string | null;
+    student_hab_date?: string | null; // 행정 단계 완료일 (YYYY-MM-DD)
+    student_seop_date?: string | null;
+    student_bok_date?: string | null;
     teacher_meeting_base?: number | null;
     seop_meeting_base?: number | null;
     teacher_meeting_count?: number;
@@ -414,6 +423,9 @@ async function getAllChats(): Promise<ChatRecord[]> {
             s.target AS student_target,
             s."단계" AS student_stage,
             s."탈락" AS student_dropped_at,
+            to_char(s."합_완료일", 'YYYY-MM-DD') AS student_hab_date,
+            to_char(s."섭_완료일", 'YYYY-MM-DD') AS student_seop_date,
+            to_char(s."복_완료일", 'YYYY-MM-DD') AS student_bok_date,
             m."이름" AS guide_name,
             m."지역" AS guide_region,
             m."구역" AS guide_district,
@@ -443,12 +455,16 @@ async function getChatRecord(chatId: string | number): Promise<ChatRecord | unde
             s."이름" AS matched_student_name,
             s."단계" AS student_stage,
             s."탈락" AS student_dropped_at,
+            to_char(s."합_완료일", 'YYYY-MM-DD') AS student_hab_date,
+            to_char(s."섭_완료일", 'YYYY-MM-DD') AS student_seop_date,
+            to_char(s."복_완료일", 'YYYY-MM-DD') AS student_bok_date,
             m."이름" AS guide_name,
             m."지역" AS guide_region,
             m."구역" AS guide_district,
             t."이름" AS teacher_name,
             t."지역" AS teacher_region,
             t."구역" AS teacher_district,
+            s."교사_고유번호"::text AS teacher_code,
             COALESCE(c.teacher_meeting_base, 0) + (
                 SELECT COUNT(*) FROM teacher_meetings tm
                 WHERE tm.chat_id = c.chat_id AND tm.student_id = c.matched_member_id::text
@@ -523,7 +539,7 @@ async function upsertMeetingDate(chatId: string | number, title: string, meeting
 // 방 정보 동적 업데이트
 async function updateChat(chatId: string | number, patch: Partial<ChatRecord>) {
     const id = String(chatId);
-    const ignoredKeys = ['chat_id', 'matched_student_name', 'student_target', 'student_stage', 'student_dropped_at', 'guide_name', 'guide_region', 'guide_district', 'teacher_name', 'teacher_region', 'teacher_district', 'teacher_code', 'teacher_meeting_count'];
+    const ignoredKeys = ['chat_id', 'matched_student_name', 'student_target', 'student_stage', 'student_dropped_at', 'guide_name', 'guide_region', 'guide_district', 'teacher_name', 'teacher_region', 'teacher_district', 'teacher_code', 'teacher_meeting_count', 'student_hab_date', 'student_seop_date', 'student_bok_date'];
     const keys = Object.keys(patch).filter((k) => !ignoredKeys.includes(k));
     if (keys.length === 0) return;
 
@@ -535,6 +551,14 @@ async function updateChat(chatId: string | number, patch: Partial<ChatRecord>) {
         values.push((patch as any)[key]);
     });
 
+    // 중단 시각: 새로 중단될 때 기록, 중단이 풀리면 지움 (SET의 오른쪽은 바뀌기 전 값)
+    if ('meeting_date' in patch && !keys.includes('stopped_at')) {
+        setClauses.push(
+            patch.meeting_date === '중단'
+                ? `stopped_at = CASE WHEN meeting_date = '중단' AND stopped_at IS NOT NULL THEN stopped_at ELSE NOW() END`
+                : 'stopped_at = NULL'
+        );
+    }
     setClauses.push('updated_at = NOW()');
 
     const query = `
@@ -1467,7 +1491,9 @@ bot.hears(/^[\/!]담당방\s*등록(?:@\w+)?(?:\s+(.+))?$/i, async (ctx) => {
                 `• 🚨 보고서 제출 지연 (만남일 2일 경과)\n` +
                 `• 🛑 만남 중단 발생\n` +
                 `• ☀️ 매일 오전 10시 지역 요약 (오늘 만남 · 보고서 미제출)\n` +
-                `• 🌙 매일 밤 10시 마감 요약 (이번 주 행정 결과/주간 목표 · 오늘 신규 만남 · 오늘 보고서 미제출 · 내일 만남)\n\n` +
+                `• 📵 인터뷰 전날 대상자 연락 안 됨\n` +
+                `• 🌙 매일 밤 10시 마감 요약 (이번 주 행정 결과/주간 목표·팀별 · 오늘 신규 만남 · 오늘 보고서 미제출 · 행정 탈락 처리 확인 · 내일 만남)\n` +
+                `• 📅 매주 월요일 오전 10시 지난주 결산 (행정 결과/주간 목표 · 신규 만남 · 중단 · 확인할 것)\n\n` +
                 `<i>해제: <code>/담당방해제</code> (특정 지역만: <code>/담당방해제 강북</code>)</i>`,
             { parse_mode: 'HTML' }
         );
@@ -1889,15 +1915,34 @@ function teamWeeklyGoals(teamGoal: number, weekCount: number): Record<GoalStep, 
     return result;
 }
 
+// 팀 표기를 팀 번호로 맞춘다: "1-3" / "1팀" / "team1" → "1", "사랑-2" → "사랑" (웹 normalizeTeam과 같은 규칙)
+function normalizeTeam(raw: string | null | undefined): string {
+    let t = (raw ?? '').trim().replace(/[–—]/g, '-').replace(/^team/i, '');
+    if (!t) return '';
+    if (t.includes('사랑')) return '사랑';
+    if (t.includes('-')) t = t.split('-')[0].trim();
+    t = t.replace(/팀$/, '').trim();
+    const m = t.match(/(\d+)/);
+    return m ? m[1] : t;
+}
+const teamLabel = (team: string) => (team ? `${team}팀` : '팀 미상');
+const teamOrder = (team: string) => (/^\d+$/.test(team) ? Number(team) : team === '사랑' ? 100 : 200);
+
 interface WeeklyAdminData {
     monday: dayjs.Dayjs;
-    days: string[]; // 월요일 ~ 오늘 (YYYY-MM-DD)
+    days: string[]; // 월요일 ~ 마지막 날 (YYYY-MM-DD)
     campaigns: string[]; // 진행 중인 개강 (예: '10월 개강 7/9주')
-    goalByRegion: Map<string, Record<GoalStep, number>>; // 지역 → 이번 주 단계별 목표
-    rows: { dates: Partial<Record<AdminStage, string>>; leaderRegion: string | null; teacherRegion: string | null }[];
+    goalByTeam: Map<string, Map<string, Record<GoalStep, number>>>; // 지역 → 팀 번호 → 이번 주 단계별 목표
+    rows: {
+        dates: Partial<Record<AdminStage, string>>;
+        leaderRegion: string | null;
+        leaderTeam: string;
+        teacherRegion: string | null;
+        teacherTeam: string;
+    }[];
 }
 
-// 이번 주 행정 결과와 주간 목표를 한 번에 읽는다 (지역 담당방마다 나눠서 쓴다)
+// 한 주(월요일 ~ today)의 행정 결과와 주간 목표를 한 번에 읽는다 (지역 담당방마다 나눠서 쓴다)
 async function loadWeeklyAdminData(today: dayjs.Dayjs): Promise<WeeklyAdminData> {
     const monday = today.subtract((today.day() + 6) % 7, 'day');
     const days = Array.from({ length: today.diff(monday, 'day') + 1 }, (_, i) => monday.add(i, 'day').format('YYYY-MM-DD'));
@@ -1909,7 +1954,7 @@ async function loadWeeklyAdminData(today: dayjs.Dayjs): Promise<WeeklyAdminData>
          FROM month_settings WHERE (year, month) IN (${months.map((_, i) => `($${i * 2 + 1}::int, $${i * 2 + 2}::int)`).join(', ')})`,
         months.flatMap((m) => [m.year(), m.month() + 1])
     );
-    const goalByRegion = new Map<string, Record<GoalStep, number>>();
+    const goalByTeam = new Map<string, Map<string, Record<GoalStep, number>>>();
     const campaigns: string[] = [];
     for (const m of months) {
         const year = m.year();
@@ -1928,18 +1973,21 @@ async function loadWeeklyAdminData(today: dayjs.Dayjs): Promise<WeeklyAdminData>
         const regionGoals = defaultRegionGoals(month);
         for (const r of overrides.rows) if (r.region in regionGoals) regionGoals[r.region] = r.예정_goals || {};
         for (const [region, teams] of Object.entries(regionGoals)) {
-            const sum = goalByRegion.get(region) ?? (Object.fromEntries(GOAL_STEPS.map((s) => [s, 0])) as Record<GoalStep, number>);
-            for (const goal of Object.values(teams)) {
+            const byTeam = goalByTeam.get(region) ?? new Map<string, Record<GoalStep, number>>();
+            for (const [teamKey, goal] of Object.entries(teams)) {
+                const team = normalizeTeam(teamKey);
+                const sum = byTeam.get(team) ?? (Object.fromEntries(GOAL_STEPS.map((s) => [s, 0])) as Record<GoalStep, number>);
                 const week = teamWeeklyGoals(Math.max(0, Number(goal) || 0), weekCount)[weekIdx];
                 for (const s of GOAL_STEPS) sum[s] = round1(sum[s] + week[s]);
+                byTeam.set(team, sum);
             }
-            goalByRegion.set(region, sum);
+            goalByTeam.set(region, byTeam);
         }
     }
 
     const res = await neonPool.query(
         `SELECT ${ADMIN_STAGES.map((st) => `to_char(s.${st}_완료일, 'YYYY-MM-DD') AS "${st}"`).join(', ')},
-                m1.지역 AS leader_region, m2.지역 AS teacher_region
+                m1.지역 AS leader_region, m1.구역 AS leader_team, m2.지역 AS teacher_region, m2.구역 AS teacher_team
          FROM students s
          LEFT JOIN members m1 ON s.인도자_고유번호 = m1.고유번호
          LEFT JOIN members m2 ON s.교사_고유번호 = m2.고유번호
@@ -1949,62 +1997,219 @@ async function loadWeeklyAdminData(today: dayjs.Dayjs): Promise<WeeklyAdminData>
     const rows = res.rows.map((r) => ({
         dates: Object.fromEntries(ADMIN_STAGES.map((st) => [st, r[st]])) as Partial<Record<AdminStage, string>>,
         leaderRegion: r.leader_region as string | null,
+        leaderTeam: normalizeTeam(r.leader_team),
         teacherRegion: r.teacher_region as string | null,
+        teacherTeam: normalizeTeam(r.teacher_team),
     }));
-    return { monday, days, campaigns, goalByRegion, rows };
+    return { monday, days, campaigns, goalByTeam, rows };
 }
 
-// 담당 지역(들)의 이번 주 행정 결과 블록 — 요일마다 월요일부터의 누적 / 주간 목표
-function formatWeeklyAdmin(data: WeeklyAdminData, regions: string[]): string {
-    const inRegions = (r: string | null) => regions.some((reg) => regionMatches(reg, r));
-    // 날짜 · 단계별 점수
-    const scoreByDay = new Map<string, Record<AdminStage, number>>(
-        data.days.map((d) => [d, Object.fromEntries(ADMIN_STAGES.map((s) => [s, 0])) as Record<AdminStage, number>])
-    );
+// 담당 지역(들)의 한 주 행정 결과 블록
+// - night(마감 요약): 오늘 등록 + 요일마다 월요일부터의 누적 / 주간 목표 + 팀별(여러 지역이면 지역별) 누적
+// - recap(월요일 지난주 결산): 한 주 합계 / 주간 목표 + 팀별(지역별)
+function formatWeeklyAdmin(data: WeeklyAdminData, regions: string[], mode: 'night' | 'recap' = 'night'): string {
+    const regionOf = (r: string | null) => regions.find((reg) => regionMatches(reg, r));
+    const byRegion = regions.length > 1; // 여러 지역 방(관리자 포함)은 팀 대신 지역별로 나눈다
+    const zero = () => Object.fromEntries(ADMIN_STAGES.map((s) => [s, 0])) as Record<AdminStage, number>;
+    const scoreByDay = new Map<string, Record<AdminStage, number>>(data.days.map((d) => [d, zero()]));
+    const groupTotal = new Map<string, Record<AdminStage, number>>(); // 팀(또는 지역) → 한 주 누적
+    const addGroup = (group: string, st: AdminStage, score: number) => {
+        const g = groupTotal.get(group) ?? zero();
+        g[st] = round1(g[st] + score);
+        groupTotal.set(group, g);
+    };
     for (const row of data.rows) {
-        const leader = inRegions(row.leaderRegion);
-        const teacher = inRegions(row.teacherRegion);
+        const leaderRegion = regionOf(row.leaderRegion);
+        const teacherRegion = regionOf(row.teacherRegion);
         for (const st of ADMIN_STAGES) {
             const day = row.dates[st] ? scoreByDay.get(row.dates[st]!) : undefined;
             if (!day) continue;
-            const score = SPLIT_SCORE_STAGES.has(st) ? (leader ? 0.5 : 0) + (teacher ? 0.5 : 0) : leader ? 1 : 0;
-            day[st] = round1(day[st] + score);
+            const split = SPLIT_SCORE_STAGES.has(st);
+            const parts: [string, number][] = [];
+            if (leaderRegion) parts.push([byRegion ? leaderRegion : row.leaderTeam, split ? 0.5 : 1]);
+            if (split && teacherRegion) parts.push([byRegion ? teacherRegion : row.teacherTeam, 0.5]);
+            for (const [group, score] of parts) {
+                day[st] = round1(day[st] + score);
+                addGroup(group, st, score);
+            }
         }
     }
-    const goal = Object.fromEntries(GOAL_STEPS.map((s) => [s, 0])) as Record<GoalStep, number>;
-    for (const [region, g] of data.goalByRegion) {
-        if (!regions.some((reg) => regionMatches(reg, region))) continue;
-        for (const s of GOAL_STEPS) goal[s] = round1(goal[s] + g[s]);
+    const goalZero = () => Object.fromEntries(GOAL_STEPS.map((s) => [s, 0])) as Record<GoalStep, number>;
+    const goal = goalZero();
+    const groupGoal = new Map<string, Record<GoalStep, number>>();
+    for (const [region, teams] of data.goalByTeam) {
+        const reg = regions.find((r) => regionMatches(r, region));
+        if (!reg) continue;
+        for (const [team, g] of teams) {
+            const key = byRegion ? reg : team;
+            const sum = groupGoal.get(key) ?? goalZero();
+            for (const s of GOAL_STEPS) {
+                goal[s] = round1(goal[s] + g[s]);
+                sum[s] = round1(sum[s] + g[s]);
+            }
+            groupGoal.set(key, sum);
+        }
     }
-    const goalOf = (st: AdminStage) => (st === '센확' ? 0 : goal[st]);
-    const weekTotal = (st: AdminStage) => round1(data.days.reduce((n, d) => n + scoreByDay.get(d)![st], 0));
+    const goalOf = (st: AdminStage, g: Record<GoalStep, number> = goal) => (st === '센확' ? 0 : g[st]);
+    const weekTotal = zero();
+    for (const d of data.days) for (const st of ADMIN_STAGES) weekTotal[st] = round1(weekTotal[st] + scoreByDay.get(d)![st]);
     // 이번 주 목표가 있거나 결과가 있는 단계만
-    const shown = ADMIN_STAGES.filter((st) => goalOf(st) > 0 || weekTotal(st) > 0);
+    const shown = ADMIN_STAGES.filter((st) => goalOf(st) > 0 || weekTotal[st] > 0);
     if (shown.length === 0) return '';
 
-    const todayStr = data.days[data.days.length - 1];
+    const pct = (a: number, g: number) => ` (${Math.round((a / g) * 100)}%)`;
+    const cell = (st: AdminStage, actual: number, g: number, withPct: boolean) =>
+        g > 0 ? `${st} ${fmtScore(actual)}/${fmtScore(g)}${withPct ? pct(actual, g) : ''}` : `${st} ${fmtScore(actual)}`;
+    const lastDay = data.days[data.days.length - 1];
     const weekday = (d: string) => '일월화수목금토'[dayjs(d).day()];
-    const todayScores = scoreByDay.get(todayStr)!;
-    const todayParts = ADMIN_STAGES.filter((st) => todayScores[st] > 0).map((st) => `${st} ${fmtScore(todayScores[st])}`);
+    const range = `${data.monday.format('MM/DD')} 월 ~ ${dayjs(lastDay).format('MM/DD')} ${weekday(lastDay)}`;
+    const sub = `<i>${data.campaigns.length ? `${escapeHtml(data.campaigns.join(' · '))} · ` : ''}점수 기준</i>\n`;
 
-    let text =
-        `📊 <b>이번 주 행정 결과 / 주간 목표</b> (${data.monday.format('MM/DD')} 월 ~ ${dayjs(todayStr).format('MM/DD')} ${weekday(todayStr)})\n` +
-        (data.campaigns.length ? `<i>${escapeHtml(data.campaigns.join(' · '))} · 점수 기준</i>\n` : `<i>점수 기준</i>\n`) +
-        `✅ <b>오늘 등록: ${todayParts.length ? todayParts.join(' · ') : '없음'}</b>\n\n`;
-    const cum = Object.fromEntries(ADMIN_STAGES.map((s) => [s, 0])) as Record<AdminStage, number>;
-    for (const d of data.days) {
-        const day = scoreByDay.get(d)!;
-        for (const st of ADMIN_STAGES) cum[st] = round1(cum[st] + day[st]);
-        const isToday = d === todayStr;
-        const parts = shown.map((st) => {
-            const g = goalOf(st);
-            if (g <= 0) return `${st} ${fmtScore(cum[st])}`;
-            return `${st} ${fmtScore(cum[st])}/${fmtScore(g)}` + (isToday ? ` (${Math.round((cum[st] / g) * 100)}%)` : '');
-        });
-        const label = `${weekday(d)} ${dayjs(d).format('M/D')}`;
-        text += isToday ? `<b>${label} 누적: ${parts.join(' · ')}</b>\n` : `${label} 누적: ${parts.join(' · ')}\n`;
+    let text: string;
+    if (mode === 'recap') {
+        text =
+            `📊 <b>지난주 행정 결과 / 주간 목표</b> (${range})\n` +
+            sub +
+            `<b>${shown.map((st) => cell(st, weekTotal[st], goalOf(st), true)).join(' · ')}</b>\n`;
+    } else {
+        const todayScores = scoreByDay.get(lastDay)!;
+        const todayParts = ADMIN_STAGES.filter((st) => todayScores[st] > 0).map((st) => `${st} ${fmtScore(todayScores[st])}`);
+        text =
+            `📊 <b>이번 주 행정 결과 / 주간 목표</b> (${range})\n` +
+            sub +
+            `✅ <b>오늘 등록: ${todayParts.length ? todayParts.join(' · ') : '없음'}</b>\n\n`;
+        const cum = zero();
+        for (const d of data.days) {
+            const day = scoreByDay.get(d)!;
+            for (const st of ADMIN_STAGES) cum[st] = round1(cum[st] + day[st]);
+            const isToday = d === lastDay;
+            const line = `${weekday(d)} ${dayjs(d).format('M/D')} 누적: ${shown.map((st) => cell(st, cum[st], goalOf(st), isToday)).join(' · ')}`;
+            text += isToday ? `<b>${line}</b>\n` : `${line}\n`;
+        }
     }
+
+    // 팀별(지역별) 누적 / 목표 — 목표나 결과가 있는 팀만
+    const groups = [...new Set([...groupGoal.keys(), ...groupTotal.keys()])].sort((a, b) =>
+        byRegion ? regions.indexOf(a) - regions.indexOf(b) : teamOrder(a) - teamOrder(b) || a.localeCompare(b)
+    );
+    const groupLines = groups
+        .map((group) => {
+            const actual = groupTotal.get(group) ?? zero();
+            const g = groupGoal.get(group) ?? goalZero();
+            const parts = shown.filter((st) => goalOf(st, g) > 0 || actual[st] > 0).map((st) => cell(st, actual[st], goalOf(st, g), false));
+            return parts.length ? `• ${escapeHtml(byRegion ? group : teamLabel(group))}: ${parts.join(' · ')}\n` : '';
+        })
+        .filter(Boolean);
+    if (groupLines.length) text += `\n👥 <b>${byRegion ? '지역별' : '팀별'} ${mode === 'recap' ? '합계' : '누적'}</b>\n` + groupLines.join('');
     return text + `━━━━━━━━━━━━━━━━━━\n\n`;
+}
+
+/* =====================================================
+ * 📅 지난주 결산 (월요일 오전 10시, 지역 담당방마다 / 관리자 주간 요약 맨 위)
+ * - 지난주 행정 결과 / 주간 목표 (팀별·지역별)
+ * - 신규 만남(인터뷰 → 교사 전환 포함), 중단 건수와 사유, 지금 확인할 것
+ * ===================================================== */
+const ALL_GOAL_REGIONS = Object.keys(defaultRegionGoals(1));
+
+async function buildWeeklyRecap(regions: string[] | null, today: dayjs.Dayjs, cache?: { data?: WeeklyAdminData | null; chats?: ChatRecord[]; events?: MeetingEvent[] }): Promise<string> {
+    const monday = today.subtract((today.day() + 6) % 7, 'day');
+    const lastMonday = monday.subtract(7, 'day');
+    const lastSunday = monday.subtract(1, 'day');
+    const todayStr = today.format('YYYY-MM-DD');
+    const data =
+        cache && 'data' in cache ? cache.data ?? null : await loadWeeklyAdminData(lastSunday).catch((err) => {
+            console.error('[지난주 행정 결과 조회 실패]:', getErrorMessage(err));
+            return null;
+        });
+    const chats = cache?.chats ?? (await getAllChats());
+    const events = cache?.events ?? (await getMeetingEvents(lastMonday, monday));
+    const inScope = (a?: string | null, b?: string | null) =>
+        !regions || regions.some((r) => regionMatches(r, a) || regionMatches(r, b));
+    const mine = chats.filter((c) => inScope(c.guide_region, c.teacher_region));
+    const myEvents = events.filter((e) => inScope(e.guide_region, e.teacher_region));
+
+    let msg =
+        `📅 <b>[${escapeHtml(regions ? `${regions.join(', ')} 지역` : '전체')} 지난주 결산] ${lastMonday.format('MM/DD')} ~ ${lastSunday.format('MM/DD')}</b>\n` +
+        `━━━━━━━━━━━━━━━━━━\n\n`;
+    if (data) msg += formatWeeklyAdmin(data, regions ?? ALL_GOAL_REGIONS, 'recap');
+
+    // 신규 만남 (인터뷰 → 교사 전환은 따로)
+    const count = (category: MeetingCategory, source?: string) =>
+        myEvents.filter((e) => e.category === category && (!source || e.source === source)).length;
+    msg +=
+        `🆕 <b>신규 만남: ${myEvents.length}건</b>\n` +
+        `• 인터뷰 매칭 ${count('인터뷰매칭')} · 교사 매칭 ${count('교사매칭')}` +
+        ` (인터뷰 후 전환 ${count('교사매칭', '인터뷰후속')}) · 지인 ${count('지인매칭')}\n\n`;
+
+    // 지난주 중단 (봇에서 중단한 시각, 없으면 마지막 수정 시각)
+    const stopped = mine.filter((c) => {
+        if (c.meeting_date !== '중단') return false;
+        const at = dayjs(c.stopped_at || c.updated_at).tz('Asia/Seoul');
+        return !at.isBefore(lastMonday) && at.isBefore(monday);
+    });
+    const tally = (values: string[]) =>
+        [...values.reduce((m, v) => m.set(v, (m.get(v) || 0) + 1), new Map<string, number>())]
+            .sort((a, b) => b[1] - a[1])
+            .map(([k, n]) => `${escapeHtml(k)} ${n}`)
+            .join(' · ');
+    msg += `🛑 <b>중단: ${stopped.length}건</b>\n`;
+    if (stopped.length) {
+        msg += `• 사유: ${tally(stopped.map((c) => c.stop_category || '사유 미기록'))}\n`;
+        msg += `• 시점: ${tally(stopped.map((c) => c.stop_phase || '시점 미기록'))}\n`;
+    }
+
+    // 지금 확인할 것 (진행 멈춤 안내 기준 + 행정 탈락 미처리)
+    const needs = new Map<string, number>();
+    for (const c of mine) {
+        const nudge = getRoomNudge(c, today, todayStr);
+        if (nudge) needs.set(nudge.label, (needs.get(nudge.label) || 0) + 1);
+    }
+    const notDropped = mine.filter(isStoppedNotDropped).length;
+    if (notDropped) needs.set('행정 탈락 처리 확인', notDropped);
+    msg += `\n📌 <b>지금 확인할 것: ${[...needs.values()].reduce((a, b) => a + b, 0)}건</b>\n`;
+    for (const [label, n] of [...needs].sort((a, b) => b[1] - a[1])) msg += `• ${escapeHtml(label)}: ${n}건\n`;
+    return msg;
+}
+
+// 월요일 오전 크론에서 호출: 지역 담당방마다 지난주 결산 (하루 한 번)
+async function sendRegionWeeklyRecaps() {
+    const today = dayjs().tz('Asia/Seoul').startOf('day');
+    if (today.day() !== 1) return;
+    const todayStr = today.format('YYYY-MM-DD');
+    const already = await neonPool.query(`SELECT value FROM bot_meta WHERE key = 'region_weekly_recap_sent'`);
+    if (already.rows[0]?.value === todayStr) return;
+    const regionChats = await getRegionChats();
+    if (regionChats.length === 0) return;
+
+    const monday = today;
+    const cache = {
+        data: await loadWeeklyAdminData(monday.subtract(1, 'day')).catch((err) => {
+            console.error('[지난주 행정 결과 조회 실패]:', getErrorMessage(err));
+            return null;
+        }),
+        chats: await getAllChats(),
+        events: await getMeetingEvents(monday.subtract(7, 'day'), monday),
+    };
+    const regionsByChat = new Map<string, string[]>();
+    for (const rc of regionChats) regionsByChat.set(rc.chat_id, [...(regionsByChat.get(rc.chat_id) || []), rc.region]);
+    for (const [target, regions] of regionsByChat) {
+        const msg = await buildWeeklyRecap(regions, today, cache);
+        for (const part of splitLongMessage(msg)) {
+            await bot.telegram
+                .sendMessage(target, part, { parse_mode: 'HTML' })
+                .catch((err) => console.error(`[지난주 결산 발송 실패] ${target}:`, getErrorMessage(err)));
+        }
+    }
+    await neonPool.query(
+        `INSERT INTO bot_meta (key, value) VALUES ('region_weekly_recap_sent', $1)
+         ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value`,
+        [todayStr]
+    );
+}
+
+// 봇에서 중단했는데 행정에서는 탈락이 아닌 방
+function isStoppedNotDropped(c: ChatRecord): boolean {
+    return c.meeting_date === '중단' && !!c.matched_member_id && !c.student_dropped_at && !String(c.student_stage ?? '').includes('탈락');
 }
 
 // 요약에 넣을 '확인 필요' 항목 (진행 멈춤 안내와 같은 기준) — 보고서 미제출은 요약의 미제출 항목과 겹쳐서 제외
@@ -2045,8 +2250,14 @@ async function sendRegionDailySummaries(mode: 'morning' | 'night') {
     const MAX_LINES = 20;
     const listText = (lines: string[]) =>
         lines.slice(0, MAX_LINES).join('') + (lines.length > MAX_LINES ? `…외 ${lines.length - MAX_LINES}건\n` : '');
+    // 인터뷰는 전날 대상자 연락 확인 결과도 표시 (D-1 버튼)
+    const contactMark = (c: ChatRecord) => {
+        if (c.meeting_type !== '인터뷰' || !isYmd(c.meeting_date)) return '';
+        const v = c.interview_contact?.startsWith(`${c.meeting_date}:`) ? c.interview_contact.slice(11) : '';
+        return v === 'ok' ? ' · ✅ 연락 확인' : v === 'fail' ? ' · 📵 연락 안 됨' : v === 'wait' ? ' · ⏳ 연락 대기중' : ' · ❔ 연락 미확인';
+    };
     const meetingLine = (c: ChatRecord) =>
-        `${line(c)}${c.meeting_type ? ` [${c.meeting_type}]` : ''}${c.meeting_time ? ` ${escapeHtml(c.meeting_time)}` : ''}\n`;
+        `${line(c)}${c.meeting_type ? ` [${c.meeting_type}]` : ''}${c.meeting_time ? ` ${escapeHtml(c.meeting_time)}` : ''}${contactMark(c)}\n`;
     const dayLabel = (d: dayjs.Dayjs) => `${d.format('MM/DD')} (${'일월화수목금토'[d.day()]})`;
 
     for (const [target, regions] of regionsByChat) {
@@ -2091,6 +2302,18 @@ async function sendRegionDailySummaries(mode: 'morning' | 'night') {
                 : `\n⏸ <b>확인 필요: ${needsCount}건</b>\n` +
                   [...needs.entries()].map(([label, lines]) => `<u>${escapeHtml(label)} ${lines.length}건</u>\n` + listText(lines)).join('');
 
+        // 봇에서 중단했는데 행정은 아직 탈락이 아님 (행정에 반영해야 목표·현황 인원이 맞음) — 마감 요약에만
+        const notDropped = mine.filter(isStoppedNotDropped);
+        const notDroppedText =
+            notDropped.length === 0
+                ? ''
+                : `\n🗂 <b>행정 탈락 처리 확인: ${notDropped.length}건</b> <i>(봇에서 중단, 행정은 진행 중)</i>\n` +
+                  listText(
+                      notDropped.map(
+                          (c) => `${line(c)} · ${escapeHtml([c.stop_phase, c.stop_category].filter(Boolean).join(' · ') || '중단')}\n`
+                      )
+                  );
+
         const regionName = escapeHtml(regions.join(', '));
         let msg: string;
         if (mode === 'morning') {
@@ -2108,6 +2331,7 @@ async function sendRegionDailySummaries(mode: 'morning' | 'night') {
             const adminText = weeklyAdmin ? formatWeeklyAdmin(weeklyAdmin, regions) : '';
             if (
                 !adminText &&
+                notDropped.length === 0 &&
                 todayUnreported.length === 0 &&
                 overdue.length === 0 &&
                 tomorrowMeetings.length === 0 &&
@@ -2124,7 +2348,7 @@ async function sendRegionDailySummaries(mode: 'morning' | 'night') {
                 `📋 <b>오늘 만남 중 보고서 미제출: ${todayUnreported.length}건</b>\n` +
                 todayUnreported.map(meetingLine).join('');
             msg += `\n⚠️ <b>이전 만남 보고서 미제출: ${overdue.length}건</b>\n` + overdueText;
-            msg += waitingText + needsText;
+            msg += waitingText + needsText + notDroppedText;
             msg +=
                 `\n🗓 <b>내일 만남: ${tomorrowMeetings.length}건</b>\n` + tomorrowMeetings.map(meetingLine).join('');
         }
@@ -2480,20 +2704,32 @@ const STAGE_REMINDER_MAX = 3;
 function interviewPendingStage(
     c: ChatRecord,
     today: dayjs.Dayjs
-): { key: 'no_pre' | 'no_date' | 'no_post'; text: string } | null {
+): { key: 'no_pre' | 'no_date' | 'no_post'; text: string; label?: string; keyboard?: { inline_keyboard: any[][] } } | null {
     if (c.meeting_type !== '인터뷰' || c.interview_report_submitted || c.meeting_date === '중단') return null;
     const who = c.matched_student_name ? ` (👤 ${escapeHtml(c.matched_student_name)})` : '';
 
     if (!c.interviewer_name) {
         if (c.type_selected_at && !dayjs(c.type_selected_at).isBefore(today)) return null;
+        // 대상자 연락 상태를 버튼으로 묻는다: 연락 확인됨 → 사전 보고서 양식 / 대기중 · 안 됨 → 계속 확인
+        const contact = preContactState(c);
+        const state =
+            contact === 'ok'
+                ? `✅ 대상자 연락은 확인되었습니다. 사전 보고서를 올려 주세요.\n\n💡 양식: <code>/인터뷰사전양식</code>`
+                : contact === 'wait'
+                  ? `⏳ 대상자 <b>연락 대기중</b>입니다. 연락이 되면 [연락 확인됨]을 눌러 주세요.`
+                  : contact === 'fail'
+                    ? `📵 대상자와 <b>연락이 안 되는</b> 상태입니다. 다시 연락이 되면 [연락 확인됨]을 눌러 주세요.`
+                    : `👇 <b>대상자와 연락이 되었나요?</b> [연락 확인됨]을 누르면 사전 보고서 양식이 나옵니다.`;
         return {
             key: 'no_pre',
+            label: `인터뷰 사전 보고서 미등록 (${contact ? PRE_CONTACT_LABEL[contact] : '연락 미확인'})`,
             text:
                 `📝 <b>[인터뷰 사전 보고서 미등록 안내]</b>${who}\n` +
                 `인터뷰 만남으로 지정되었지만 <b>[인터뷰 사전 보고서]</b>가 아직 올라오지 않았습니다.\n` +
                 `사전 보고서를 올리면 인터뷰어·타이퍼·예정일이 등록되고 일정 알림이 시작됩니다.\n\n` +
-                `💡 양식: <code>/인터뷰사전양식</code>\n` +
+                `${state}\n` +
                 `💡 인터뷰 전에 연락두절·거절되었다면 <code>/만남중단</code> (인터뷰 전 중단으로 기록)`,
+            keyboard: contact === 'ok' ? undefined : preContactKeyboard(contact),
         };
     }
     if (!c.meeting_date || c.meeting_date === '미정') {
@@ -2545,7 +2781,65 @@ function droppedKeyboard() {
     return { inline_keyboard: [...rows, [{ text: '▶️ 계속 진행 (탈락 아님)', callback_data: 'dropkeep' }]] };
 }
 
+// 일정·보고서 안내가 없을 때만 진행(행정) 안내를 본다 — 우선순위: 일정·보고서 → 행정 등록 누락 → 단계 정체
 function getRoomNudge(c: ChatRecord, today: dayjs.Dayjs, todayStr: string): RoomNudge | null {
+    const nudge = getScheduleNudge(c, today, todayStr);
+    if (nudge || c.meeting_date === '중단' || !c.matched_member_id || isDroppedActive(c)) return nudge;
+    return getProgressNudge(c, today);
+}
+
+// 행정 등록 누락: 교사 만남이 이만큼 쌓였는데 행정이 아직 발·찾이거나 교사가 지정되지 않음
+const ADMIN_MISSING_MEETINGS = 2;
+// 단계 정체: 이 날수 넘게 행정 단계가 그대로면 다음 단계 계획을 묻는다
+const STAGE_STALL_DAYS: Record<string, number> = { 합: 14, 섭: 21, 복: 21 };
+
+function getProgressNudge(c: ChatRecord, today: dayjs.Dayjs): RoomNudge | null {
+    if (c.meeting_type !== '교사') return null;
+    const who = c.matched_student_name ? ` (👤 ${escapeHtml(c.matched_student_name)})` : '';
+    const stage = String(c.student_stage ?? '').trim();
+    const count = c.teacher_meeting_count ?? 0;
+
+    const early = stage === '발' || stage === '찾';
+    if (count >= ADMIN_MISSING_MEETINGS && (early || !c.teacher_code)) {
+        const missing = [early ? `합 등록 (지금 행정 단계: <b>${escapeHtml(stage)}</b>)` : null, !c.teacher_code ? '교사 지정' : null].filter(Boolean);
+        return {
+            key: 'admin_missing',
+            label: '행정 등록 누락 (합·교사)',
+            text:
+                `🗂 <b>[행정 등록 확인 안내]</b>${who}\n` +
+                `교사 만남이 <b>${count}회</b> 진행됐지만 행정에 아직 반영되지 않은 내용이 있습니다.\n` +
+                missing.map((m) => `• ${m}\n`).join('') +
+                `\n행정(학생 관리)에 등록해 주세요. 등록해야 목표 실적에 들어갑니다.`,
+        };
+    }
+
+    const stallDays = STAGE_STALL_DAYS[stage];
+    const since = stage === '합' ? c.student_hab_date : stage === '섭' ? c.student_seop_date : stage === '복' ? c.student_bok_date : null;
+    if (!stallDays || !isYmd(since)) return null;
+    const days = today.diff(dayjs(since), 'day');
+    if (days < stallDays) return null;
+    // 진행 구분 목표일(섭등목표 등)을 앞으로 잡아 두었으면 계획이 있는 것으로 봄
+    const planned = getStageDate(c.progress_note);
+    if (c.progress_stage && planned && !planned.isBefore(today)) return null;
+    const next = { 합: '섭등', 섭: '복등', 복: '예정' }[stage as '합' | '섭' | '복'];
+    const hint =
+        stage === '합'
+            ? `계획이 있다면 <code>/섭등목표 MM-DD</code>로 목표일을 등록해 주세요.`
+            : stage === '복'
+              ? `계획이 있다면 <code>/예정목표 MM-DD</code>로 목표일을 등록해 주세요.`
+              : `복등 계획을 방에 공유해 주세요.`;
+    return {
+        key: `stall_${stage}`,
+        label: `${stage} 단계 ${stallDays}일 이상 정체`,
+        text:
+            `📈 <b>[단계 진행 확인 안내]</b>${who}\n` +
+            `행정 <b>${escapeHtml(stage)}</b> 등록(${dayjs(since).format('MM/DD')}) 후 <b>${days}일</b>째 다음 단계(${next}) 전입니다.\n` +
+            `${hint}\n` +
+            `💡 진행이 어렵다면 <code>/만남중단</code>`,
+    };
+}
+
+function getScheduleNudge(c: ChatRecord, today: dayjs.Dayjs, todayStr: string): RoomNudge | null {
     if (c.meeting_date === '중단') return null;
     const who = c.matched_student_name ? ` (👤 ${escapeHtml(c.matched_student_name)})` : '';
     const before = (t?: string | null) => !t || dayjs(t).isBefore(today); // 기록이 없으면(예전 방) 지난 것으로 봄
@@ -2595,7 +2889,7 @@ function getRoomNudge(c: ChatRecord, today: dayjs.Dayjs, todayStr: string): Room
     const interview = interviewPendingStage(c, today);
     if (interview) {
         const labels = { no_pre: '인터뷰 사전 보고서 미등록', no_date: '인터뷰 예정일 미정', no_post: '인터뷰 사후 보고서 미제출' };
-        return { key: interview.key, label: labels[interview.key], text: interview.text };
+        return { key: interview.key, label: interview.label ?? labels[interview.key], text: interview.text, keyboard: interview.keyboard };
     }
     if (c.meeting_type === '인터뷰') return null;
 
@@ -2787,7 +3081,7 @@ async function notifyWebRegistration(chatId: string): Promise<{ ok: boolean; err
     if (!record.matched_member_id) return { ok: false, error: '매칭된 대상자가 없습니다.' };
     // 유형 미선택 리마인드 기준 시각 (웹은 matched_at을 따로 기록하지 않으므로 여기서 기록)
     await neonPool.query(
-        `UPDATE counseling_chats SET matched_at = NOW(), stage_reminder_count = 0, drop_ack_at = NULL WHERE chat_id = $1`,
+        `UPDATE counseling_chats SET matched_at = NOW(), stage_reminder_count = 0, drop_ack_at = NULL, interview_contact = NULL WHERE chat_id = $1`,
         [chatId]
     );
 
@@ -2874,6 +3168,7 @@ bot.hears(/^[\/!]최초등록(?:@\w+)?(?:\s+(.+))?$/i, async (ctx) => {
         await updateChat(ctx.chat.id, {
             matched_member_id: match.student_id,
             matched_at: new Date().toISOString(),
+            interview_contact: null,
             stage_reminder_count: 0,
             drop_ack_at: null,
         });
@@ -3076,6 +3371,10 @@ bot.hears(/^[\/!]교사\s*전환(?:@\w+)?$/i, async (ctx) => {
 // 인터뷰 사전 보고서 양식 출력 (/인터뷰사전양식)
 // 예시는 일반 텍스트로 보여주고, 탭하여 복사되는 <code> 블록은 빈 양식만 제공
 bot.hears(/^[\/!](인터뷰사전양식|사전양식|사전보고서양식)(?:@\w+)?$/i, async (ctx) => {
+    await ctx.reply(interviewPreFormText(), { parse_mode: 'HTML' });
+});
+
+function interviewPreFormText(): string {
     const example =
         `[인터뷰 사전 보고서]\n` +
         `• 인터뷰어: 강북 1팀 귀요미\n` +
@@ -3089,7 +3388,7 @@ bot.hears(/^[\/!](인터뷰사전양식|사전양식|사전보고서양식)(?:@\
         `• 인터뷰일시: \n` +
         `• 사전메모: `;
 
-    await ctx.reply(
+    return (
         `📋 <b>[인터뷰 사전 보고서 양식]</b>\n\n` +
             `✏️ <b>작성 예시</b>\n` +
             `<i>${escapeHtml(example)}</i>\n\n` +
@@ -3097,10 +3396,9 @@ bot.hears(/^[\/!](인터뷰사전양식|사전양식|사전보고서양식)(?:@\
             `<code>${escapeHtml(blank)}</code>\n\n` +
             `💡 <b>안내:</b>\n` +
             `• 인터뷰어/타이퍼는 <code>지역 팀 이름</code> 형태로 적어주시면 됩니다.\n` +
-            `• 타이퍼가 없는 경우 <code>없음</code> 또는 <code>미지정</code>으로 작성하세요.`,
-        { parse_mode: 'HTML' }
+            `• 타이퍼가 없는 경우 <code>없음</code> 또는 <code>미지정</code>으로 작성하세요.`
     );
-});
+}
 
 // 인터뷰 결과(사후) 보고서 양식 출력 (/인터뷰사후양식)
 // 예시는 일반 텍스트로 보여주고, 탭하여 복사되는 <code> 블록은 빈 양식만 제공
@@ -3725,6 +4023,9 @@ bot.action(/^stop:(\w+)$/, async (ctx) => {
                 `• <b>중단 시점</b>: <b>${escapeHtml(phase)}</b>\n` +
                 `• <b>중단 사유</b>: <b>${escapeHtml(label)}</b>\n` +
                 (detail ? `• <b>상세 사유</b>: ${escapeHtml(detail)}\n` : '') +
+                (before?.matched_member_id && !before.student_dropped_at && !String(before.student_stage ?? '').includes('탈락')
+                    ? `\n🗂 행정(학생 관리)에도 <b>탈락</b> 처리해 주세요. (마감 요약에서 확인합니다)\n`
+                    : '') +
                 `\n💡 만남이 재개되면 <code>/만남일 MM-DD</code>를 입력하여 새 일정을 등록해주세요.`,
             { parse_mode: 'HTML' }
         );
@@ -3740,6 +4041,140 @@ bot.action(/^stop:(\w+)$/, async (ctx) => {
         }
     } catch (err: unknown) {
         console.error('[만남 중단 사유 선택 에러]:', getErrorMessage(err));
+        await ctx.answerCbQuery('처리 중 오류가 발생했습니다.').catch(() => {});
+    }
+});
+
+// 인터뷰 사전 보고서 전 대상자 연락 확인 (진행 멈춤 안내의 버튼) — interview_contact에 'pre:ok|wait|fail'
+type ContactState = 'ok' | 'wait' | 'fail';
+const PRE_CONTACT_LABEL: Record<ContactState, string> = { ok: '연락 확인', wait: '연락 대기중', fail: '연락 안 됨' };
+
+function preContactState(c: ChatRecord): ContactState | null {
+    const m = (c.interview_contact || '').match(/^pre:(ok|wait|fail)$/);
+    return m ? (m[1] as ContactState) : null;
+}
+
+// 지금 상태 버튼은 빼고 보여준다
+function preContactKeyboard(current?: ContactState | null) {
+    const buttons = [
+        { state: 'ok', text: '✅ 연락 확인됨' },
+        { state: 'wait', text: '⏳ 연락 대기중' },
+        { state: 'fail', text: '📵 연락 안 됨' },
+    ]
+        .filter((b) => b.state !== current)
+        .map((b) => ({ text: b.text, callback_data: `ivp:${b.state}` }));
+    return { inline_keyboard: [buttons] };
+}
+
+bot.action(/^ivp:(ok|wait|fail)$/, async (ctx) => {
+    try {
+        if (!ctx.chat) return;
+        const result = ctx.match[1] as ContactState;
+        const record = await getChatRecord(ctx.chat.id);
+        if (!record || record.meeting_type !== '인터뷰' || record.meeting_date === '중단' || record.interviewer_name) {
+            await ctx.answerCbQuery(record?.interviewer_name ? '이미 사전 보고서가 등록되었습니다.' : '지금은 사전 보고서를 기다리는 인터뷰가 아닙니다.');
+            await ctx.editMessageReplyMarkup(undefined).catch(() => {});
+            return;
+        }
+        // 상태가 바뀌면 진행 멈춤 안내 횟수를 새로 센다 (대기중·안 됨이면 다시 최대 3번 확인)
+        await updateChat(ctx.chat.id, { interview_contact: `pre:${result}`, stage_reminder_count: 0 });
+        await ctx.answerCbQuery(`${PRE_CONTACT_LABEL[result]}(으)로 기록했습니다.`);
+        await ctx.editMessageReplyMarkup(undefined).catch(() => {});
+        const who = escapeHtml(ctx.from?.first_name || '');
+        const name = record.matched_student_name ? ` (👤 ${escapeHtml(record.matched_student_name)})` : '';
+
+        if (result === 'ok') {
+            await ctx.reply(
+                `✅ <b>대상자 연락 확인</b>${name}${who ? ` · ${who}` : ''}\n아래 양식으로 <b>인터뷰 사전 보고서</b>를 올려 주세요.`,
+                { parse_mode: 'HTML' }
+            );
+            await ctx.reply(interviewPreFormText(), { parse_mode: 'HTML' });
+            return;
+        }
+        if (result === 'wait') {
+            await ctx.reply(
+                `⏳ <b>대상자 연락 대기중</b>${name}${who ? ` · ${who}` : ''}\n` +
+                    `연락이 되면 [연락 확인됨]을 눌러 주세요. 오전 안내 때 다시 확인합니다. 👇`,
+                { parse_mode: 'HTML', reply_markup: preContactKeyboard('wait') }
+            );
+            return;
+        }
+        await ctx.reply(
+            `📵 <b>대상자 연락 안 됨</b>${name}${who ? ` · ${who}` : ''}\n` +
+                `지역 담당방에 알렸습니다. 다시 연락이 되면 [연락 확인됨]을 눌러 주세요.\n` +
+                `💡 연락두절·거절이면 <code>/만남중단</code> (인터뷰 전 중단으로 기록)`,
+            { parse_mode: 'HTML', reply_markup: preContactKeyboard('fail') }
+        );
+        await notifyRegionChats(
+            record,
+            `📵 <b>[인터뷰 전 대상자 연락 안 됨]</b> <i>(사전 보고서 전)</i>\n` + regionRoomInfo(record)
+        );
+    } catch (err: unknown) {
+        console.error('[사전 연락 확인 에러]:', getErrorMessage(err));
+        await ctx.answerCbQuery('처리 중 오류가 발생했습니다.').catch(() => {});
+    }
+});
+
+// 인터뷰 D-1 대상자 연락 확인 버튼 — 연락이 안 되면 바로 지역 담당방에 알림 (인터뷰 전 연락두절 줄이기)
+const INTERVIEW_CONTACT_KEYBOARD = {
+    inline_keyboard: [
+        [
+            { text: '✅ 연락 확인됨', callback_data: 'ivc:ok' },
+            { text: '⏳ 연락 대기중', callback_data: 'ivc:wait' },
+        ],
+        [{ text: '📵 연락 안 됨', callback_data: 'ivc:fail' }],
+    ],
+};
+
+bot.action(/^ivc:(ok|fail|wait)$/, async (ctx) => {
+    try {
+        if (!ctx.chat) return;
+        const result = ctx.match[1] as 'ok' | 'fail' | 'wait';
+        const record = await getChatRecord(ctx.chat.id);
+        if (!record || record.meeting_type !== '인터뷰' || !isYmd(record.meeting_date)) {
+            await ctx.answerCbQuery('지금은 인터뷰 일정이 없습니다.');
+            await ctx.editMessageReplyMarkup(undefined).catch(() => {});
+            return;
+        }
+        await updateChat(ctx.chat.id, { interview_contact: `${record.meeting_date}:${result}` });
+        await ctx.answerCbQuery(`${PRE_CONTACT_LABEL[result]}(으)로 기록했습니다.`);
+        await ctx.editMessageReplyMarkup(undefined).catch(() => {});
+        const who = escapeHtml(ctx.from?.first_name || '');
+        const date = dayjs(record.meeting_date).format('MM/DD');
+        if (result === 'ok') {
+            await ctx.reply(`✅ <b>인터뷰(${date}) 대상자 연락 확인</b>${who ? ` · ${who}` : ''}`, { parse_mode: 'HTML' });
+            return;
+        }
+        if (result === 'wait') {
+            await ctx.reply(`⏳ <b>인터뷰(${date}) 대상자 연락 대기중</b>${who ? ` · ${who}` : ''}\n연락이 되면 눌러 주세요. 👇`, {
+                parse_mode: 'HTML',
+                reply_markup: {
+                    inline_keyboard: [
+                        [
+                            { text: '✅ 연락 확인됨', callback_data: 'ivc:ok' },
+                            { text: '📵 연락 안 됨', callback_data: 'ivc:fail' },
+                        ],
+                    ],
+                },
+            });
+            return;
+        }
+        await ctx.reply(
+            `📵 <b>인터뷰(${date}) 대상자 연락 안 됨</b>${who ? ` · ${who}` : ''}\n` +
+                `지역 담당방에 알렸습니다.\n\n` +
+                `• 일정이 바뀌면 <code>/인터뷰일 MM-DD</code>\n` +
+                `• 연락두절·거절이면 <code>/만남중단</code> (인터뷰 전 중단으로 기록)`,
+            { parse_mode: 'HTML' }
+        );
+        await notifyRegionChats(
+            record,
+            `📵 <b>[인터뷰 전날 대상자 연락 안 됨]</b>\n` +
+                regionRoomInfo(record) +
+                `• 인터뷰 예정: <b>${formatMeetingWhen(date, record.meeting_time)}</b>\n` +
+                `• 인터뷰어: ${escapeHtml(record.interviewer_info || '미등록')}`
+        );
+    } catch (err: unknown) {
+        console.error('[인터뷰 연락 확인 에러]:', getErrorMessage(err));
         await ctx.answerCbQuery('처리 중 오류가 발생했습니다.').catch(() => {});
     }
 });
@@ -4991,7 +5426,9 @@ async function buildWeeklySummary(): Promise<string> {
         (c) => c.meeting_date === '중단' && c.updated_at && dayjs(c.updated_at).isAfter(weekAgo)
     );
 
-    let msg = `📊 <b>[주간 요약] ${dayjs(weekDays[0]).format('MM/DD')} ~ ${dayjs(weekEnd).format('MM/DD')}</b>\n`;
+    // 맨 위: 전체 지난주 결산 (행정 결과 / 주간 목표, 지역별)
+    let msg = (await buildWeeklyRecap(null, today, { chats })) + `\n`;
+    msg += `📊 <b>[주간 요약] ${dayjs(weekDays[0]).format('MM/DD')} ~ ${dayjs(weekEnd).format('MM/DD')}</b>\n`;
     msg += `기준시각: ${dayjs().tz('Asia/Seoul').format('YYYY-MM-DD HH:mm')}\n`;
     msg += `━━━━━━━━━━━━━━━━━━\n\n`;
 
@@ -5785,8 +6222,9 @@ async function triggerMorningReminder() {
                             `내일(${formatMeetingWhen(mDate.format('MM/DD'), chat.meeting_time)})은 인터뷰 만남 예정일입니다.\n` +
                             `• 담당 인터뷰어: ${escapeHtml(chat.interviewer_info || '미등록')}\n` +
                             `• 타이퍼: ${escapeHtml(chat.typer_info || '미지정')}\n\n` +
-                            `인터뷰 전 사전 준비사항과 대상자 상태를 점검해 주세요!`,
-                        { parse_mode: 'HTML' }
+                            `인터뷰 전 사전 준비사항과 대상자 상태를 점검해 주세요!\n` +
+                            `👇 <b>대상자와 내일 일정 연락이 되었나요?</b>`,
+                        { parse_mode: 'HTML', reply_markup: INTERVIEW_CONTACT_KEYBOARD }
                     );
                 } else if (chat.meeting_type === '행사') {
                     await bot.telegram.sendMessage(
@@ -6036,6 +6474,7 @@ const server = http.createServer(async (req, res) => {
             async () => {
                 await triggerMorningReminder();
                 await sendWeeklySummaryIfMonday();
+                await sendRegionWeeklyRecaps();
                 await sendRegionDailySummaries('morning');
             },
             'Morning reminder executed',
