@@ -1467,7 +1467,7 @@ bot.hears(/^[\/!]담당방\s*등록(?:@\w+)?(?:\s+(.+))?$/i, async (ctx) => {
                 `• 🚨 보고서 제출 지연 (만남일 2일 경과)\n` +
                 `• 🛑 만남 중단 발생\n` +
                 `• ☀️ 매일 오전 10시 지역 요약 (오늘 만남 · 보고서 미제출)\n` +
-                `• 🌙 매일 밤 10시 마감 요약 (오늘 신규 만남 · 오늘 보고서 미제출 · 내일 만남)\n\n` +
+                `• 🌙 매일 밤 10시 마감 요약 (이번 주 행정 결과/주간 목표 · 오늘 신규 만남 · 오늘 보고서 미제출 · 내일 만남)\n\n` +
                 `<i>해제: <code>/담당방해제</code> (특정 지역만: <code>/담당방해제 강북</code>)</i>`,
             { parse_mode: 'HTML' }
         );
@@ -1805,12 +1805,214 @@ function waitingTeacherDays(c: ChatRecord, today: dayjs.Dayjs, todayStr: string)
     return days >= WAITING_TEACHER_DAYS ? days : null;
 }
 
+// ===== 이번 주 행정 결과 / 주간 목표 (마감 요약 맨 위) =====
+// 웹 목표 달성과 같은 규칙으로 계산한다 (웹 lib/goalPlan · lib/goalConfig · lib/goalScoring)
+// - 점수: 발·찾·합은 인도자 지역 1점, 섭·복·예정·센확은 인도자 0.5 + 교사 0.5
+// - 주간 목표: 진행 중인 개강(기간이 겹치면 모두)마다 팀 예정 목표 → 단계별 월 목표(배수) → 주차별로 나눈 이번 주 몫의 합
+// - 주는 월~일, 결과는 그 날 행정에 등록된(단계 완료일) 점수 전체
+const GOAL_STEPS = ['발', '찾', '합', '섭', '복', '예정'] as const;
+type GoalStep = (typeof GOAL_STEPS)[number];
+const ADMIN_STAGES = [...GOAL_STEPS, '센확'] as const;
+type AdminStage = (typeof ADMIN_STAGES)[number];
+const GOAL_MULTIPLIERS: Record<GoalStep, number> = { 발: 30, 찾: 10, 합: 4, 섭: 2, 복: 1.5, 예정: 1 };
+const GOAL_WEEK_WEIGHTS: Record<number, Partial<Record<GoalStep, number>>> = {
+    0: { 발: 1 },
+    1: { 발: 1, 찾: 1 },
+    2: { 찾: 1, 합: 1 },
+    3: { 합: 1 },
+    4: { 섭: 1 },
+    5: { 섭: 1, 복: 1 },
+    6: { 복: 1 },
+    7: {},
+};
+const SPLIT_SCORE_STAGES = new Set<string>(['섭', '복', '예정', '센확']);
+const goalUnit = (step: GoalStep) => (['발', '찾', '합'].includes(step) ? 1 : 0.5);
+const round1 = (n: number) => Math.round(n * 10) / 10;
+const fmtScore = (n: number) => (Number.isInteger(n) ? String(n) : n.toFixed(1));
+
+// 목표 설정이 없을 때의 지역별 팀 예정 목표 (웹 get_DEFAULT_예정_goals와 같은 값)
+function defaultRegionGoals(month: number): Record<string, Record<string, string>> {
+    if (month % 2 === 0) {
+        return {
+            도봉: { team1: '1.5', team2: '1.5', team3: '1.5', 사랑: '0.5' },
+            성북: { team1: '1.5', team2: '1.5', team3: '1.5', 사랑: '0.5' },
+            노원: { team1: '1.5', team2: '1.5', team3: '1.5', 사랑: '0.5' },
+            중랑: { team1: '2', team2: '2', team3: '1', 사랑: '0' },
+            강북: { team1: '1.5', team2: '1.5', team3: '1.5', 사랑: '0.5' },
+            대학: { team1: '0.5', team2: '0.5', team3: '0.5', team4: '0.5', 사랑: '0' },
+            새신자: { team1: '1.5', team2: '1.5' },
+            이음: { team1: '1' },
+        };
+    }
+    return {
+        도봉: { team1: '0.5', team2: '0.5', team3: '0.5', 사랑: '0.5' },
+        성북: { team1: '0.5', team2: '0.5', team3: '0.5', 사랑: '0.5' },
+        노원: { team1: '0.5', team2: '0.5', team3: '0.5', 사랑: '0.5' },
+        중랑: { team1: '1', team2: '0.5', team3: '0.5', 사랑: '0' },
+        강북: { team1: '0.5', team2: '0.5', team3: '0.5', 사랑: '0.5' },
+        대학: { team1: '3', team2: '3', team3: '3', team4: '3', 사랑: '0' },
+        새신자: { team1: '3', team2: '3' },
+        이음: { team1: '1' },
+    };
+}
+
+// 개강 주차 기본값 (웹 getDefaultWeekCount / getDefaultWeek1Start와 같은 계산)
+const defaultWeekCount = (year: number, month: number) => (year < 2025 || (year === 2025 && month <= 8) ? 5 : 8);
+function defaultWeek1Start(year: number, month: number): string {
+    const firstDay = dayjs(new Date(year, month - 1, 1));
+    const dow = firstDay.day();
+    const firstMonday = firstDay.add(dow === 1 ? 0 : (8 - dow) % 7, 'day');
+    const offset = year === 2025 && month === 12 ? -28 : year === 2025 && month >= 9 ? -35 : year >= 2026 ? -35 : -14;
+    return firstMonday.add(offset, 'day').format('YYYY-MM-DD');
+}
+
+// 한 팀의 예정 목표 → 주차별 단계 목표 (웹 buildMonthlyGoalsFrom예정 + distributeWeeklyGoals와 같은 계산)
+function teamWeeklyGoals(teamGoal: number, weekCount: number): Record<GoalStep, number>[] {
+    const result = Array.from({ length: weekCount }, () => Object.fromEntries(GOAL_STEPS.map((s) => [s, 0])) as Record<GoalStep, number>);
+    for (const step of GOAL_STEPS) {
+        const unit = goalUnit(step);
+        const totalUnits = Math.round((teamGoal * GOAL_MULTIPLIERS[step]) / unit);
+        if (!totalUnits) continue;
+        let wArr = Array.from({ length: weekCount }, (_, i) => GOAL_WEEK_WEIGHTS[i]?.[step] ?? 0);
+        let wSum = wArr.reduce((a, b) => a + b, 0);
+        if (wSum === 0) {
+            wArr = Array(weekCount).fill(1);
+            wSum = weekCount;
+        }
+        const quotas = wArr.map((w) => (totalUnits * w) / wSum);
+        const units = quotas.map((q) => Math.floor(q));
+        let remain = totalUnits - units.reduce((a, b) => a + b, 0);
+        const order = quotas.map((q, i) => ({ i, r: q - Math.floor(q) })).sort((a, b) => b.r - a.r);
+        for (let k = 0; remain > 0; k++, remain--) units[order[k % weekCount].i] += 1;
+        units.forEach((u, i) => (result[i][step] = u * unit));
+    }
+    return result;
+}
+
+interface WeeklyAdminData {
+    monday: dayjs.Dayjs;
+    days: string[]; // 월요일 ~ 오늘 (YYYY-MM-DD)
+    campaigns: string[]; // 진행 중인 개강 (예: '10월 개강 7/9주')
+    goalByRegion: Map<string, Record<GoalStep, number>>; // 지역 → 이번 주 단계별 목표
+    rows: { dates: Partial<Record<AdminStage, string>>; leaderRegion: string | null; teacherRegion: string | null }[];
+}
+
+// 이번 주 행정 결과와 주간 목표를 한 번에 읽는다 (지역 담당방마다 나눠서 쓴다)
+async function loadWeeklyAdminData(today: dayjs.Dayjs): Promise<WeeklyAdminData> {
+    const monday = today.subtract((today.day() + 6) % 7, 'day');
+    const days = Array.from({ length: today.diff(monday, 'day') + 1 }, (_, i) => monday.add(i, 'day').format('YYYY-MM-DD'));
+
+    // 이번 주가 들어 있는 개강: 개강 월 기준 앞뒤 몇 달을 보고 1주차 시작일·주차 수로 판단
+    const months = Array.from({ length: 6 }, (_, i) => today.startOf('month').add(i - 2, 'month'));
+    const settingsRes = await neonPool.query(
+        `SELECT year, month, week_count, to_char(week1_start, 'YYYY-MM-DD') AS week1_start
+         FROM month_settings WHERE (year, month) IN (${months.map((_, i) => `($${i * 2 + 1}::int, $${i * 2 + 2}::int)`).join(', ')})`,
+        months.flatMap((m) => [m.year(), m.month() + 1])
+    );
+    const goalByRegion = new Map<string, Record<GoalStep, number>>();
+    const campaigns: string[] = [];
+    for (const m of months) {
+        const year = m.year();
+        const month = m.month() + 1;
+        const row = settingsRes.rows.find((r) => r.year === year && r.month === month);
+        const weekCount: number = row?.week_count ?? defaultWeekCount(year, month);
+        const week1Start: string = row?.week1_start ?? defaultWeek1Start(year, month);
+        const weekIdx = Math.floor(today.diff(dayjs(week1Start), 'day') / 7);
+        if (weekIdx < 0 || weekIdx >= weekCount) continue;
+        campaigns.push(`${month}월 개강 ${weekIdx + 1}/${weekCount}주`);
+
+        const overrides = await neonPool.query(
+            `SELECT region, 예정_goals FROM region_goal_overrides WHERE year = $1 AND month = $2`,
+            [year, month]
+        );
+        const regionGoals = defaultRegionGoals(month);
+        for (const r of overrides.rows) if (r.region in regionGoals) regionGoals[r.region] = r.예정_goals || {};
+        for (const [region, teams] of Object.entries(regionGoals)) {
+            const sum = goalByRegion.get(region) ?? (Object.fromEntries(GOAL_STEPS.map((s) => [s, 0])) as Record<GoalStep, number>);
+            for (const goal of Object.values(teams)) {
+                const week = teamWeeklyGoals(Math.max(0, Number(goal) || 0), weekCount)[weekIdx];
+                for (const s of GOAL_STEPS) sum[s] = round1(sum[s] + week[s]);
+            }
+            goalByRegion.set(region, sum);
+        }
+    }
+
+    const res = await neonPool.query(
+        `SELECT ${ADMIN_STAGES.map((st) => `to_char(s.${st}_완료일, 'YYYY-MM-DD') AS "${st}"`).join(', ')},
+                m1.지역 AS leader_region, m2.지역 AS teacher_region
+         FROM students s
+         LEFT JOIN members m1 ON s.인도자_고유번호 = m1.고유번호
+         LEFT JOIN members m2 ON s.교사_고유번호 = m2.고유번호
+         WHERE ${ADMIN_STAGES.map((st) => `s.${st}_완료일::date BETWEEN $1 AND $2`).join(' OR ')}`,
+        [days[0], days[days.length - 1]]
+    );
+    const rows = res.rows.map((r) => ({
+        dates: Object.fromEntries(ADMIN_STAGES.map((st) => [st, r[st]])) as Partial<Record<AdminStage, string>>,
+        leaderRegion: r.leader_region as string | null,
+        teacherRegion: r.teacher_region as string | null,
+    }));
+    return { monday, days, campaigns, goalByRegion, rows };
+}
+
+// 담당 지역(들)의 이번 주 행정 결과 블록 — 요일마다 월요일부터의 누적 / 주간 목표
+function formatWeeklyAdmin(data: WeeklyAdminData, regions: string[]): string {
+    const inRegions = (r: string | null) => regions.some((reg) => regionMatches(reg, r));
+    // 날짜 · 단계별 점수
+    const scoreByDay = new Map<string, Record<AdminStage, number>>(
+        data.days.map((d) => [d, Object.fromEntries(ADMIN_STAGES.map((s) => [s, 0])) as Record<AdminStage, number>])
+    );
+    for (const row of data.rows) {
+        const leader = inRegions(row.leaderRegion);
+        const teacher = inRegions(row.teacherRegion);
+        for (const st of ADMIN_STAGES) {
+            const day = row.dates[st] ? scoreByDay.get(row.dates[st]!) : undefined;
+            if (!day) continue;
+            const score = SPLIT_SCORE_STAGES.has(st) ? (leader ? 0.5 : 0) + (teacher ? 0.5 : 0) : leader ? 1 : 0;
+            day[st] = round1(day[st] + score);
+        }
+    }
+    const goal = Object.fromEntries(GOAL_STEPS.map((s) => [s, 0])) as Record<GoalStep, number>;
+    for (const [region, g] of data.goalByRegion) {
+        if (!regions.some((reg) => regionMatches(reg, region))) continue;
+        for (const s of GOAL_STEPS) goal[s] = round1(goal[s] + g[s]);
+    }
+    const goalOf = (st: AdminStage) => (st === '센확' ? 0 : goal[st]);
+    const weekTotal = (st: AdminStage) => round1(data.days.reduce((n, d) => n + scoreByDay.get(d)![st], 0));
+    // 이번 주 목표가 있거나 결과가 있는 단계만
+    const shown = ADMIN_STAGES.filter((st) => goalOf(st) > 0 || weekTotal(st) > 0);
+    if (shown.length === 0) return '';
+
+    const todayStr = data.days[data.days.length - 1];
+    const weekday = (d: string) => '일월화수목금토'[dayjs(d).day()];
+    const todayScores = scoreByDay.get(todayStr)!;
+    const todayParts = ADMIN_STAGES.filter((st) => todayScores[st] > 0).map((st) => `${st} ${fmtScore(todayScores[st])}`);
+
+    let text =
+        `📊 <b>이번 주 행정 결과 / 주간 목표</b> (${data.monday.format('MM/DD')} 월 ~ ${dayjs(todayStr).format('MM/DD')} ${weekday(todayStr)})\n` +
+        (data.campaigns.length ? `<i>${escapeHtml(data.campaigns.join(' · '))} · 점수 기준</i>\n` : `<i>점수 기준</i>\n`) +
+        `✅ <b>오늘 등록: ${todayParts.length ? todayParts.join(' · ') : '없음'}</b>\n\n`;
+    const cum = Object.fromEntries(ADMIN_STAGES.map((s) => [s, 0])) as Record<AdminStage, number>;
+    for (const d of data.days) {
+        const day = scoreByDay.get(d)!;
+        for (const st of ADMIN_STAGES) cum[st] = round1(cum[st] + day[st]);
+        const isToday = d === todayStr;
+        const parts = shown.map((st) => {
+            const g = goalOf(st);
+            if (g <= 0) return `${st} ${fmtScore(cum[st])}`;
+            return `${st} ${fmtScore(cum[st])}/${fmtScore(g)}` + (isToday ? ` (${Math.round((cum[st] / g) * 100)}%)` : '');
+        });
+        const label = `${weekday(d)} ${dayjs(d).format('M/D')}`;
+        text += isToday ? `<b>${label} 누적: ${parts.join(' · ')}</b>\n` : `${label} 누적: ${parts.join(' · ')}\n`;
+    }
+    return text + `━━━━━━━━━━━━━━━━━━\n\n`;
+}
+
 // 요약에 넣을 '확인 필요' 항목 (진행 멈춤 안내와 같은 기준) — 보고서 미제출은 요약의 미제출 항목과 겹쳐서 제외
 const SUMMARY_SKIP_NUDGES = new Set(['no_post', 'report_late']);
 
 // 크론에서 호출: 지역 담당방마다 하루 요약 (오전 10시 'morning' / 밤 10시 'night', 각각 하루 한 번)
 // - 오전: 오늘 만남 · 보고서 미제출 · 교사 만남 미배정 · 확인 필요
-// - 밤: 오늘 만남 중 보고서 미제출 · 이전 만남 미제출 · 교사 만남 미배정 · 확인 필요 · 내일 만남
+// - 밤: (맨 위) 이번 주 행정 결과 / 주간 목표 · 오늘 만남 중 보고서 미제출 · 이전 만남 미제출 · 교사 만남 미배정 · 확인 필요 · 내일 만남
 // - 이름은 방 제목(가린 이름) 대신 매칭된 대상자 실명으로 표시
 //   (보고서가 제출되면 만남일이 다음 만남일로 바뀌므로, 밤에 만남일이 오늘인 방 = 아직 보고서가 안 올라온 방)
 async function sendRegionDailySummaries(mode: 'morning' | 'night') {
@@ -1825,6 +2027,14 @@ async function sendRegionDailySummaries(mode: 'morning' | 'night') {
     if (regionChats.length === 0) return;
     const chats = await getAllChats();
     const todayEvents = mode === 'night' ? await getMeetingEvents(today, today.add(1, 'day')) : [];
+    // 마감 요약 맨 위: 이번 주 행정 결과 / 주간 목표 (읽기에 실패해도 나머지 요약은 보낸다)
+    let weeklyAdmin: WeeklyAdminData | null = null;
+    if (mode === 'night') {
+        weeklyAdmin = await loadWeeklyAdminData(today).catch((err) => {
+            console.error('[주간 행정 결과 조회 실패]:', getErrorMessage(err));
+            return null;
+        });
+    }
 
     const regionsByChat = new Map<string, string[]>();
     for (const rc of regionChats) regionsByChat.set(rc.chat_id, [...(regionsByChat.get(rc.chat_id) || []), rc.region]);
@@ -1895,7 +2105,9 @@ async function sendRegionDailySummaries(mode: 'morning' | 'night') {
             const newEvents = todayEvents.filter((e) =>
                 regions.some((r) => regionMatches(r, e.guide_region) || regionMatches(r, e.teacher_region))
             );
+            const adminText = weeklyAdmin ? formatWeeklyAdmin(weeklyAdmin, regions) : '';
             if (
+                !adminText &&
                 todayUnreported.length === 0 &&
                 overdue.length === 0 &&
                 tomorrowMeetings.length === 0 &&
@@ -1904,7 +2116,7 @@ async function sendRegionDailySummaries(mode: 'morning' | 'night') {
                 needsCount === 0
             )
                 continue;
-            msg = `🌙 <b>[${regionName} 지역 오늘 마감 요약] ${dayLabel(today)}</b>\n━━━━━━━━━━━━━━━━━━\n\n`;
+            msg = `🌙 <b>[${regionName} 지역 오늘 마감 요약] ${dayLabel(today)}</b>\n━━━━━━━━━━━━━━━━━━\n\n` + adminText;
             msg += `🆕 <b>오늘 신규 만남 발생: ${newEvents.length}건</b>\n`;
             if (newEvents.length) msg += formatMeetingEvents(newEvents, false);
             else msg += `\n`;
