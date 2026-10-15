@@ -2698,8 +2698,47 @@ const TYPE_SELECTED_MESSAGE: Record<'인터뷰' | '교사' | '지인', string> =
         `• 교사 만남으로 넘어가면: <code>/교사전환</code>`,
 };
 
+// 인터뷰 결과(사후) 보고서를 반영했을 때 방에 보내는 안내 (결과 보고서 처리, 웹에서 입력한 경우 공통)
+// 신청·행사: date/time = 다음 만남일(행사일), warning = 날짜를 못 읽었을 때 안내. 미신청: reason, category(웹에서 고른 분류)
+function interviewResultMessage(
+    kind: '신청' | '행사' | '미신청',
+    o: { date?: string; time?: string | null; warning?: string; reason?: string; category?: string | null }
+): string {
+    const when = !o.date || o.date === '미정' ? '미정' : formatMeetingWhen(formatYmdWithDay(o.date), o.time);
+    if (kind === '미신청') {
+        return (
+            `🛑 <b>인터뷰 결과 보고서가 반영되었습니다.</b>\n\n` +
+            `• <b>후속 신청</b>: <b>미신청</b>\n` +
+            (o.category ? `• <b>사유 분류</b>: ${escapeHtml(o.category)}\n` : '') +
+            `• <b>상세 사유</b>: ${escapeHtml(o.reason || '사유 미입력')}\n` +
+            `• <b>대화방 상태</b>: 만남 중단 처리됨`
+        );
+    }
+    if (kind === '행사') {
+        return (
+            `🎪 <b>인터뷰 결과 보고서가 반영되었습니다.</b>\n\n` +
+            `• <b>후속</b>: <b>행사 참석</b> (상담이 아닌 행사로 기록)\n` +
+            `• <b>행사일</b>: <b>${when}</b>\n` +
+            (o.warning || '') +
+            `\n행사 참석은 <b>일정만 관리</b>합니다 (보고서 제출·미제출 알림 없음).\n` +
+            `• 일정 변경: <code>/만남일 MM-DD</code>\n` +
+            `• 행사 후 상담(교사 만남)으로 이어지면: <code>/교사전환</code>`
+        );
+    }
+    return (
+        `🎉 <b>인터뷰 결과 보고서가 정상 반영되었습니다!</b>\n\n` +
+        `• <b>후속 신청</b>: <b>신청 완료 ✅</b>\n` +
+        `• <b>만남 단계</b>: <b>👨‍🏫 교사 만남</b>으로 자동 전환되었습니다.\n` +
+        `• <b>다음 만남 예정일</b>: <b>${when}</b>\n` +
+        (o.warning || '') +
+        `\n` +
+        `앞으로 교사 만남 주기(D-1 피드백, 당일 만남보고서)에 맞춰 자동 관리됩니다.`
+    );
+}
+
 // 웹(관리 화면)에서 상담방을 고쳤을 때 그 방에 보내는 알림. actions로 상담 봇이 같은 일을 했을 때의 안내를 덧붙인다
-// actions: type:인터뷰|type:교사|type:지인 (첫 만남 유형), pre_report (인터뷰 사전 보고서), stop (중단), resume (중단 해제)
+// actions: type:인터뷰|type:교사|type:지인 (첫 만남 유형), pre_report (인터뷰 사전 보고서),
+//          post_report:신청|행사|미신청 (인터뷰 결과 보고서), stop (중단), resume (중단 해제)
 function webEditMessage(record: ChatRecord, changes: string[], actions: Set<string>): string {
     let msg =
         `✏️ <b>[관리 화면에서 수정되었습니다]</b>` +
@@ -2720,6 +2759,19 @@ function webEditMessage(record: ChatRecord, changes: string[], actions: Set<stri
             }</b>\n` +
             `• <b>D-1 알림 (10:00)</b>: 인터뷰 안내 알림\n` +
             `• <b>당일 알림 (22:00)</b>: 결과 보고서 등록 알림`;
+    }
+    // 인터뷰 결과(사후) 보고서: 결과 보고서를 올렸을 때와 같은 안내 (지금 기록으로)
+    for (const kind of ['신청', '행사', '미신청'] as const) {
+        if (!actions.has(`post_report:${kind}`)) continue;
+        const reason = (record.stop_reason || '').replace(/^인터뷰 후속 미신청:\s*/, '');
+        msg +=
+            `\n\n` +
+            interviewResultMessage(kind, {
+                date: record.meeting_date,
+                time: record.meeting_time,
+                reason: record.follow_up_reason || reason,
+                category: record.stop_category,
+            });
     }
     if (actions.has('stop')) msg += `\n\n💡 만남이 재개되면 <code>/만남일 MM-DD</code>를 입력하여 새 일정을 등록해주세요.`;
     if (actions.has('resume') && (!record.meeting_date || record.meeting_date === '미정')) {
@@ -5252,14 +5304,10 @@ async function handleIncomingText(ctx: any, rawText: string, source: 'text' | 'c
                 report_submitted: 1,
             });
 
-            await ctx.reply(
-                `🛑 <b>인터뷰 결과 보고서가 반영되었습니다.</b>\n\n` +
-                    `• <b>후속 신청</b>: <b>미신청</b>\n` +
-                    `• <b>상세 사유</b>: ${escapeHtml(reason)}\n` +
-                    `• <b>대화방 상태</b>: 만남 중단 처리됨\n\n` +
-                    `👇 <b>미신청 사유 분류를 선택해주세요:</b>`,
-                { parse_mode: 'HTML', reply_markup: buildStopCategoryKeyboard('fu') }
-            );
+            await ctx.reply(interviewResultMessage('미신청', { reason }) + `\n\n👇 <b>미신청 사유 분류를 선택해주세요:</b>`, {
+                parse_mode: 'HTML',
+                reply_markup: buildStopCategoryKeyboard('fu'),
+            });
             return;
         }
 
@@ -5282,15 +5330,14 @@ async function handleIncomingText(ctx: any, rawText: string, source: 'text' | 'c
             });
 
             await ctx.reply(
-                `🎪 <b>인터뷰 결과 보고서가 반영되었습니다.</b>\n\n` +
-                    `• <b>후속</b>: <b>행사 참석</b> (상담이 아닌 행사로 기록)\n` +
-                    `• <b>행사일</b>: <b>${eventStr === '미정' ? '미정' : formatMeetingWhen(formatYmdWithDay(eventStr), eventTime)}</b>\n` +
-                    (eventStr === '미정' && rawEventDate && !rawEventDate.includes('미정')
-                        ? `⚠️ 날짜(<code>${escapeHtml(rawEventDate)}</code>)를 인식하지 못해 [미정]으로 등록했습니다. <code>/만남일 MM-DD</code>로 다시 등록해주세요.\n`
-                        : '') +
-                    `\n행사 참석은 <b>일정만 관리</b>합니다 (보고서 제출·미제출 알림 없음).\n` +
-                    `• 일정 변경: <code>/만남일 MM-DD</code>\n` +
-                    `• 행사 후 상담(교사 만남)으로 이어지면: <code>/교사전환</code>`,
+                interviewResultMessage('행사', {
+                    date: eventStr,
+                    time: eventTime,
+                    warning:
+                        eventStr === '미정' && rawEventDate && !rawEventDate.includes('미정')
+                            ? `⚠️ 날짜(<code>${escapeHtml(rawEventDate)}</code>)를 인식하지 못해 [미정]으로 등록했습니다. <code>/만남일 MM-DD</code>로 다시 등록해주세요.\n`
+                            : '',
+                }),
                 { parse_mode: 'HTML' }
             );
             return;
@@ -5318,17 +5365,14 @@ async function handleIncomingText(ctx: any, rawText: string, source: 'text' | 'c
             await recordMeetingEvent(chatId, '교사매칭', '인터뷰후속');
 
             await ctx.reply(
-                `🎉 <b>인터뷰 결과 보고서가 정상 반영되었습니다!</b>\n\n` +
-                    `• <b>후속 신청</b>: <b>신청 완료 ✅</b>\n` +
-                    `• <b>만남 단계</b>: <b>👨‍🏫 교사 만남</b>으로 자동 전환되었습니다.\n` +
-                    `• <b>다음 만남 예정일</b>: <b>${
-                        nextMeetingStr === '미정' ? '미정' : formatMeetingWhen(formatYmdWithDay(nextMeetingStr), nextTime)
-                    }</b>\n` +
-                    (nextMeetingStr === '미정' && rawNextDate && !isUndecided
-                        ? `⚠️ 날짜(<code>${escapeHtml(rawNextDate)}</code>)를 인식하지 못해 [미정]으로 등록했습니다. <code>/만남일 MM-DD</code>로 다시 등록해주세요.\n`
-                        : '') +
-                    `\n` +
-                    `앞으로 교사 만남 주기(D-1 피드백, 당일 만남보고서)에 맞춰 자동 관리됩니다.`,
+                interviewResultMessage('신청', {
+                    date: nextMeetingStr,
+                    time: nextTime,
+                    warning:
+                        nextMeetingStr === '미정' && rawNextDate && !isUndecided
+                            ? `⚠️ 날짜(<code>${escapeHtml(rawNextDate)}</code>)를 인식하지 못해 [미정]으로 등록했습니다. <code>/만남일 MM-DD</code>로 다시 등록해주세요.\n`
+                            : '',
+                }),
                 { parse_mode: 'HTML' }
             );
             return;
