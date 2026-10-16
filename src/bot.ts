@@ -75,7 +75,7 @@ async function initDb() {
                 PRIMARY KEY (chat_id, region)
             );
             -- 신규 만남 발생 기록 (인터뷰 매칭 = 상담 이하 / 교사 매칭 = 상담 1회차)
-            -- category: 인터뷰매칭 / 동아리매칭 / 지역행사매칭 / (예전) 지인매칭 / 교사매칭
+            -- category: 인터뷰매칭 / 지역행사매칭 / 동아리매칭 / 지인매칭 / 교사매칭
             -- source: '최초등록'(첫 만남 유형 선택) / '인터뷰후속'(인터뷰 결과 보고서 후속 신청) / 'OO후속'(/교사전환)
             -- 교사 만남 누적 기록: 대상자·만남일당 1회 (보고서를 고쳐서 다시 올려도 1회)
             CREATE TABLE IF NOT EXISTS teacher_meetings (
@@ -389,7 +389,7 @@ function teacherText(row: { teacher_name?: string | null; teacher_region?: strin
 }
 
 // 일정만 관리하는 만남 유형 — 보고서 제출·미제출 알림·독촉 대상에서 제외, /교사전환으로 교사 만남 전환
-// 첫 만남 유형: 동아리·지역행사 (지인은 예전 방만), 행사: 인터뷰 후속 행사 참석
+// 첫 만남 유형: 지역행사·동아리·지인, 행사: 인터뷰 후속 행사 참석
 type ScheduleOnlyType = '동아리' | '지역행사' | '지인' | '행사';
 const SCHEDULE_ONLY: Record<ScheduleOnlyType, { icon: string; name: string; dateLabel: string; phase: string; convertSource: string }> = {
     동아리: { icon: '🧩', name: '동아리', dateLabel: '모임일', phase: '동아리 진행 중', convertSource: '동아리후속' },
@@ -1706,11 +1706,11 @@ bot.action(/^notice:(send|cancel):(\w+)$/, async (ctx) => {
 /* =====================================================
  * 🆕 신규 만남 발생 (상담 이하 = 인터뷰 매칭 / 상담 1회차 = 교사 매칭)
  * ===================================================== */
-type MeetingCategory = '인터뷰매칭' | '동아리매칭' | '지역행사매칭' | '지인매칭' | '교사매칭';
+type MeetingCategory = '인터뷰매칭' | '지역행사매칭' | '동아리매칭' | '지인매칭' | '교사매칭';
 const MEETING_CATEGORY_LABEL: Record<MeetingCategory, string> = {
     인터뷰매칭: '🎙️ 상담 이하 (인터뷰 매칭)',
-    동아리매칭: '🧩 동아리',
     지역행사매칭: '🎉 지역행사',
+    동아리매칭: '🧩 동아리',
     지인매칭: '🤝 지인 만남',
     교사매칭: '👨‍🏫 상담 1회차 (교사 매칭)',
 };
@@ -2149,9 +2149,7 @@ async function buildWeeklyRecap(regions: string[] | null, today: dayjs.Dayjs, ca
     msg +=
         `🆕 <b>신규 만남: ${myEvents.length}건</b>\n` +
         `• 인터뷰 매칭 ${count('인터뷰매칭')} · 교사 매칭 ${count('교사매칭')}` +
-        ` (인터뷰 후 전환 ${count('교사매칭', '인터뷰후속')}) · 동아리 ${count('동아리매칭')} · 지역행사 ${count('지역행사매칭')}` +
-        (count('지인매칭') ? ` · 지인 ${count('지인매칭')}` : '') +
-        `\n\n`;
+        ` (인터뷰 후 전환 ${count('교사매칭', '인터뷰후속')}) · 지역행사 ${count('지역행사매칭')} · 동아리 ${count('동아리매칭')} · 지인 ${count('지인매칭')}\n\n`;
 
     // 지난주 중단 (봇에서 중단한 시각, 없으면 마지막 수정 시각)
     const stopped = mine.filter((c) => {
@@ -2520,8 +2518,8 @@ bot.hears(/^[\/!](start|help|도움말)(?:@\w+)?$/i, async (ctx) => {
             '   <i>(섭등 후 3회차부터 복등 전이면 보고서 반영 때 복등 안내, 3회차 때 지역 담당방에도 알림)</i>\n' +
             '• <b>만남 보고서 제출</b>: 양식 내 <code>다음만남일: MM-DD</code> 포함\n' +
             '   <i>(사진 설명글로 올려도 인식됩니다. 이미 보낸 메시지를 편집하면 반영되지 않으니 다시 올려 주세요)</i>\n\n' +
-            '<b>4. 동아리 · 지역행사 (일정만 관리)</b>\n' +
-            '• <b>지정</b>: <code>/최초등록</code> 후 [🧩 동아리] 또는 [🎉 지역행사] 선택 → <code>/만남일 MM-DD</code>로 일정 등록\n' +
+            '<b>4. 지역행사 · 동아리 · 지인 만남 (일정만 관리)</b>\n' +
+            '• <b>지정</b>: <code>/최초등록</code> 후 [🎉 지역행사] · [🧩 동아리] · [🤝 지인 만남] 중 선택 → <code>/만남일 MM-DD</code>로 일정 등록\n' +
             '• <b>교사 만남으로 전환</b>: <code>/교사전환</code>\n\n' +
             '<b>5. 방 진행 단계 (특수 구분)</b>\n' +
             '• <b>단계 설정</b>: <code>/섭등목표 MM-DD</code>, <code>/예정목표 MM-DD</code>, <code>/가능목표 MM-DD</code>, <code>/확정목표 MM-DD</code> (날짜만 입력)\n' +
@@ -2534,7 +2532,7 @@ bot.hears(/^[\/!](start|help|도움말)(?:@\w+)?$/i, async (ctx) => {
             '👑 <b>관리자 전용 명령어</b>\n' +
             '• <b>인터뷰 예정건 모아보기</b>: <code>관리자 인터뷰</code>\n' +
             '• <b>교사 만남 진행건 모아보기</b>: <code>관리자 교사</code>\n' +
-            '• <b>동아리·지역행사 진행건 모아보기</b>: <code>관리자 동아리</code>, <code>관리자 지역행사</code> (인터뷰 후속 행사: <code>관리자 행사</code>, 예전 지인: <code>관리자 지인</code>)\n' +
+            '• <b>지역행사·동아리·지인 진행건 모아보기</b>: <code>관리자 지역행사</code>, <code>관리자 동아리</code>, <code>관리자 지인</code> (인터뷰 후속 행사: <code>관리자 행사</code>)\n' +
             '• <b>만남 명단 조회</b>: <code>관리자 오늘만남</code>, <code>관리자 내일만남</code>, <code>관리자 일자만남 MM-DD</code>\n' +
             '• <b>보고서 미제출 명단</b>: <code>관리자 미제출</code> (일괄 독촉: <code>관리자 미제출 알림</code>)\n' +
             '• <b>미등록 및 미정 방 조회</b>: <code>관리자 미등록</code>\n' +
@@ -2552,7 +2550,7 @@ bot.hears(/^[\/!](start|help|도움말)(?:@\w+)?$/i, async (ctx) => {
             '• <b>지역 담당방 등록</b>: 담당방에서 <code>/담당방등록 강북</code> (해제: <code>/담당방해제</code>, 목록: <code>관리자 담당방</code>)\n' +
             '   <i>(보고서 지연·만남 중단·매일 오전 10시/밤 10시 지역 요약이 담당방으로 자동 발송)</i>\n' +
             '• <b>신규 만남 발생</b>: <code>관리자 신규</code> (기간: <code>오늘</code>, <code>어제</code>, <code>이번주</code>, <code>지난주</code>, <code>10월</code>)\n' +
-            '   <i>(상담 이하 = 인터뷰 매칭 / 동아리 / 지역행사 · 상담 1회차 = 교사 매칭, 밤 10시 지역 요약에도 포함)</i>\n' +
+            '   <i>(상담 이하 = 인터뷰 매칭 / 지역행사 / 동아리 / 지인 만남 · 상담 1회차 = 교사 매칭, 밤 10시 지역 요약에도 포함)</i>\n' +
             '• <b>담당방 공지</b>: <code>/담당방공지 내용</code> (특정 지역만: <code>/담당방공지 [강북,강남] 내용</code>)\n' +
             '• <b>봇 상태 점검</b>: <code>관리자 봇상태</code> (설정·DB·웹훅 오류 확인)\n' +
             '• <b>채팅방 ID 확인</b>: <code>/방ID</code>\n' +
@@ -2907,7 +2905,7 @@ function getScheduleNudge(c: ChatRecord, today: dayjs.Dayjs, todayStr: string): 
     }
     if (c.meeting_type === '인터뷰') return null;
 
-    // C. 교사·동아리·지역행사를 골랐는데 만남일 없음
+    // C. 교사·지역행사·동아리·지인을 골랐는데 만남일 없음
     if (!c.meeting_date) {
         if (!before(c.type_selected_at)) return null;
         return {
@@ -3071,9 +3069,10 @@ const MEETING_TYPE_KEYBOARD = {
             { text: '👨‍🏫 교사 만남', callback_data: 'type_teacher' },
         ],
         [
-            { text: '🧩 동아리', callback_data: 'type_club' },
             { text: '🎉 지역행사', callback_data: 'type_local_event' },
+            { text: '🧩 동아리', callback_data: 'type_club' },
         ],
+        [{ text: '🤝 지인 만남', callback_data: 'type_acquaintance' }],
     ],
 };
 
@@ -3206,7 +3205,7 @@ bot.hears(/^[\/!]최초등록(?:@\w+)?(?:\s+(.+))?$/i, async (ctx) => {
 });
 
 // 첫 만남 유형을 정했을 때 방에 보내는 안내 (유형 버튼, 웹에서 고른 경우 공통)
-type FirstMeetingType = '인터뷰' | '교사' | '동아리' | '지역행사' | '지인';
+type FirstMeetingType = '인터뷰' | '교사' | '지역행사' | '동아리' | '지인';
 // 받침이 있으면 true (조사 고르기용: 동아리 → 로/는, 지인 만남 → 으로/은)
 const hasBatchim = (word: string) => {
     const code = word.charCodeAt(word.length - 1) - 0xac00;
@@ -3276,7 +3275,7 @@ function interviewResultMessage(
 }
 
 // 웹(관리 화면)에서 상담방을 고쳤을 때 그 방에 보내는 알림. actions로 상담 봇이 같은 일을 했을 때의 안내를 덧붙인다
-// actions: type:인터뷰|type:교사|type:동아리|type:지역행사|type:지인 (첫 만남 유형), pre_report (인터뷰 사전 보고서),
+// actions: type:인터뷰|type:교사|type:지역행사|type:동아리|type:지인 (첫 만남 유형), pre_report (인터뷰 사전 보고서),
 //          post_report:신청|행사|미신청 (인터뷰 결과 보고서), stop (중단), resume (중단 해제)
 function webEditMessage(record: ChatRecord, changes: string[], actions: Set<string>): string {
     let msg =
@@ -3284,7 +3283,7 @@ function webEditMessage(record: ChatRecord, changes: string[], actions: Set<stri
         (record.matched_student_name ? ` (👤 ${escapeHtml(record.matched_student_name)})` : '') +
         `\n` +
         changes.map((c) => `• ${escapeHtml(c)}`).join('\n');
-    for (const type of ['인터뷰', '교사', '동아리', '지역행사', '지인'] as const) {
+    for (const type of ['인터뷰', '교사', '지역행사', '동아리', '지인'] as const) {
         if (actions.has(`type:${type}`)) msg += `\n\n${TYPE_SELECTED_MESSAGE[type]}`;
     }
     if (actions.has('pre_report')) {
@@ -3413,7 +3412,7 @@ async function applyFirstMeetingType(ctx: any, type: FirstMeetingType) {
     );
 }
 
-// 버튼 콜백: 첫 만남 유형 선택 (예전 안내에 남은 지인 버튼 포함)
+// 버튼 콜백: 첫 만남 유형 선택
 for (const [action, type] of [
     ['type_interview', '인터뷰'],
     ['type_teacher', '교사'],
@@ -3466,7 +3465,7 @@ bot.hears(/^[\/!](?:만남)?유형\s*(?:변경|선택|수정)(?:@\w+)?$/i, async
     }
 });
 
-// 동아리·지역행사·행사 참석(·예전 지인) → 교사 만남 전환 (/교사전환)
+// 지역행사·동아리·지인 만남·행사 참석 → 교사 만남 전환 (/교사전환)
 bot.hears(/^[\/!]교사\s*전환(?:@\w+)?$/i, async (ctx) => {
     try {
         const record = await getChatRecord(ctx.chat.id);
@@ -3475,7 +3474,7 @@ bot.hears(/^[\/!]교사\s*전환(?:@\w+)?$/i, async (ctx) => {
             await ctx.reply(
                 record?.meeting_type === '교사'
                     ? 'ℹ️ 이미 교사 만남으로 진행 중입니다.'
-                    : '⚠️ 동아리·지역행사·행사 참석으로 진행 중인 방에서만 사용할 수 있습니다.\n<i>(인터뷰 만남은 결과 보고서의 후속 [신청]으로 전환됩니다)</i>',
+                    : '⚠️ 지역행사·동아리·지인 만남·행사 참석으로 진행 중인 방에서만 사용할 수 있습니다.\n<i>(인터뷰 만남은 결과 보고서의 후속 [신청]으로 전환됩니다)</i>',
                 { parse_mode: 'HTML' }
             );
             return;
@@ -4617,7 +4616,7 @@ bot.hears(/^(?:[\/!]?관리자\s+)(교사|교사만남|교사목록|교사건)$/
     }
 });
 
-// 관리자 동아리·지역행사·행사 참석·지인 진행건 모아보기 (일정만 관리)
+// 관리자 지역행사·동아리·지인·행사 참석 진행건 모아보기 (일정만 관리)
 bot.hears(/^(?:[\/!]?관리자\s+)(동아리|동아리목록|동아리건|지역행사|지역행사목록|지역행사건|지인|지인만남|지인목록|지인건|행사|행사참석|행사목록|행사건)$/i, async (ctx) => {
     try {
         if (!isAdmin(ctx.from?.id)) {
@@ -5066,7 +5065,7 @@ bot.hears(/^(?:[\/!]?관리자\s+)(중단\s*명단|중단|만남중단)$/i, asyn
         // 중단 시점별로 묶어서 (기록 도입 전 중단은 '시점 미기록')
         const phaseOf = (c: ChatRecord) =>
             c.stop_phase || (String(c.stop_reason || '').startsWith('인터뷰 후속 미신청') ? '인터뷰 후' : '시점 미기록');
-        const phaseOrder = ['인터뷰 전', '인터뷰 후', '유형 선택 전', '교사 만남 중', '동아리 진행 중', '지역행사 단계', '지인 만남 중', '행사 참석 단계', '시점 미기록'];
+        const phaseOrder = ['인터뷰 전', '인터뷰 후', '유형 선택 전', '교사 만남 중', '지역행사 단계', '동아리 진행 중', '지인 만남 중', '행사 참석 단계', '시점 미기록'];
         stoppedChats.sort((a, b) => phaseOrder.indexOf(phaseOf(a)) - phaseOrder.indexOf(phaseOf(b)));
         const phaseCounts = phaseOrder
             .map((p) => [p, stoppedChats.filter((c) => phaseOf(c) === p).length] as const)
@@ -5344,9 +5343,9 @@ bot.hears(/^(?:[\/!]?관리자\s+)(점검|현황|종합\s*점검|전체\s*점검
         msg += `🎙️ <b>[진행 분류별 현황]</b>\n`;
         msg += `• 인터뷰 만남 진행: <b>${interviewCount}개 방</b> (조회: <code>관리자 인터뷰</code>)\n`;
         msg += `• 교사 만남 진행: <b>${teacherCount}개 방</b> (조회: <code>관리자 교사</code>)\n`;
-        msg += `• 동아리 진행: <b>${typeCount('동아리')}개 방</b> (조회: <code>관리자 동아리</code>)\n`;
         msg += `• 지역행사 진행: <b>${typeCount('지역행사')}개 방</b> (조회: <code>관리자 지역행사</code>)\n`;
-        if (typeCount('지인')) msg += `• 지인 만남 진행 (예전 유형): <b>${typeCount('지인')}개 방</b> (조회: <code>관리자 지인</code>)\n`;
+        msg += `• 동아리 진행: <b>${typeCount('동아리')}개 방</b> (조회: <code>관리자 동아리</code>)\n`;
+        msg += `• 지인 만남 진행: <b>${typeCount('지인')}개 방</b> (조회: <code>관리자 지인</code>)\n`;
         msg += `• 행사 참석 (인터뷰 후속): <b>${typeCount('행사')}개 방</b> (조회: <code>관리자 행사</code>)\n\n`;
 
         msg += `🏷 <b>[진행 단계별 현황]</b>\n`;
@@ -5586,7 +5585,7 @@ async function buildWeeklySummary(): Promise<string> {
         if (n) msg += `• ${dayjs(day).format('MM/DD')} (${'일월화수목금토'[dayjs(day).day()]}): ${n}건\n`;
     }
     const countType = (type: string) => meetingsThisWeek.filter((c) => c.meeting_type === type).length;
-    msg += `  (인터뷰 ${countType('인터뷰')} · 교사 ${countType('교사')} · 동아리 ${countType('동아리')} · 지역행사 ${countType('지역행사')} · 지인 ${countType('지인')} · 행사 ${countType('행사')})\n\n`;
+    msg += `  (인터뷰 ${countType('인터뷰')} · 교사 ${countType('교사')} · 지역행사 ${countType('지역행사')} · 동아리 ${countType('동아리')} · 지인 ${countType('지인')} · 행사 ${countType('행사')})\n\n`;
 
     msg += `🏷 <b>이번 주 진행 구분 목표일: ${stageThisWeek.length}건</b>\n`;
     for (const c of sortByStageDateDesc(stageThisWeek).reverse()) {
@@ -6375,7 +6374,7 @@ async function triggerMorningReminder() {
                         { parse_mode: 'HTML' }
                     );
                 } else if (scheduleOnlyInfo(chat.meeting_type)) {
-                    // 동아리·지역행사·(예전) 지인 — 일정 안내만
+                    // 지역행사·동아리·지인 — 일정 안내만
                     const info = scheduleOnlyInfo(chat.meeting_type)!;
                     await bot.telegram.sendMessage(
                         chat.chat_id,
