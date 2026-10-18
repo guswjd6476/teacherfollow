@@ -449,6 +449,8 @@ async function getAllChats(): Promise<ChatRecord[]> {
         LEFT JOIN students s ON c.matched_member_id::text = s.id::text
         LEFT JOIN members m ON s."인도자_고유번호" = m."고유번호"
         LEFT JOIN members t ON s."교사_고유번호" = t."고유번호"
+        -- 개인 대화(양수 ID)는 상담방이 아니므로 모든 목록에서 뺀다
+        WHERE c.chat_id::text LIKE '-%'
         ORDER BY c.created_at ASC;
     `;
     const res = await neonPool.query(query);
