@@ -2540,6 +2540,7 @@ bot.hears(/^[\/!](start|help|도움말)(?:@\w+)?$/i, async (ctx) => {
             '   일괄 독촉: <code>관리자 미갱신 알림</code>, <code>관리자 미갱신 타부서포함 알림</code>\n' +
             '• <b>찾등 이상 봇 미초대 명단</b>: <code>관리자 미초대</code>\n' +
             '• <b>만남 중단 방 목록</b>: <code>관리자 중단</code>\n' +
+            '• <b>필수 인원 방 참여 점검</b>: <code>관리자 인원점검</code> (모든 방 / 섭등 이상 방)\n' +
             '• <b>특수 구분 현황 (3가지 종합)</b>: <code>관리자 구분</code>\n' +
             '• <b>구분별 단독 조회</b>: <code>관리자 n월 섭등목표</code>, <code>관리자 n월 예정목표</code>, <code>관리자 n월 가능목표</code>, <code>관리자 n월 확정목표</code>\n' +
             '• <b>일반방 조회 (특수 3종 및 중단 제외)</b>: <code>관리자 n월 일반</code>\n' +
@@ -5040,6 +5041,91 @@ bot.hears(/^(?:[\/!]?관리자\s+)(미초대|봇미초대|초대누락)$/i, asyn
     } catch (err: unknown) {
         console.error('[미초대 명단 조회 에러]:', err);
         await replyError(ctx, '미초대 명단 조회', err);
+    }
+});
+
+// 필수 인원 방 참여 점검 (관리자 인원점검)
+// 웹 관리자 > 봇 설정의 bot_settings (counselingAllUserIds: 봇이 있는 모든 방 / counselingSeopUserIds: 섭등 이상(중단 제외) 방)
+async function getRequiredMembers(key: string): Promise<{ id: string; memo: string }[]> {
+    const res = await neonPool.query(`SELECT value FROM bot_settings WHERE key = $1`, [key]);
+    const list = res.rows[0]?.value;
+    return Array.isArray(list) ? list.filter((e) => e?.id).map((e) => ({ id: String(e.id), memo: String(e.memo ?? '') })) : [];
+}
+
+bot.hears(/^(?:[\/!]?관리자\s+)(인원\s*점검|필수\s*인원|방\s*인원)$/i, async (ctx) => {
+    try {
+        if (!isAdmin(ctx.from?.id)) {
+            await ctx.reply('⛔ 접근 권한이 없습니다.', { parse_mode: 'HTML' });
+            return;
+        }
+        const allMembers = await getRequiredMembers('counselingAllUserIds');
+        const seopMembers = await getRequiredMembers('counselingSeopUserIds');
+        const REQUIRED_ALL_IDS = allMembers.map((e) => e.id);
+        const REQUIRED_SEOP_IDS = seopMembers.map((e) => e.id);
+        if (REQUIRED_ALL_IDS.length + REQUIRED_SEOP_IDS.length === 0) {
+            await ctx.reply(
+                'ℹ️ 점검할 인원이 설정되지 않았습니다.\n' +
+                    '웹 관리자 > 봇 설정의 <b>상담 봇 모든 방 필수 인원</b>, <b>상담 봇 섭등 이상 방 필수 인원</b>에 ' +
+                    '텔레그램 ID를 넣어주세요. (ID는 <code>관리자 인증목록</code>에서 확인)',
+                { parse_mode: 'HTML' }
+            );
+            return;
+        }
+        await ctx.reply('🔎 방마다 인원을 확인하는 중입니다...');
+
+        // 이름: 웹에 적은 메모 → 인증 목록 이름 → ID
+        const names = new Map<string, string>(
+            (
+                await neonPool.query(`SELECT user_id, name, username FROM verified_users WHERE user_id = ANY($1)`, [
+                    [...REQUIRED_ALL_IDS, ...REQUIRED_SEOP_IDS],
+                ])
+            ).rows.map((u) => [u.user_id, displayName({ first_name: u.name, username: u.username })])
+        );
+        for (const e of [...allMembers, ...seopMembers]) if (e.memo) names.set(e.id, e.memo);
+        const nameOf = (id: string) => escapeHtml(names.get(id) || id);
+
+        const isSeop = (c: ChatRecord) =>
+            c.meeting_date !== '중단' && (getStudentStageRank(c.student_stage) >= 3 || !!c.student_seop_date);
+        const chats = await getAllChats();
+        const problems: { chat: ChatRecord; missing: string[] }[] = [];
+        // 10방씩 동시에 확인 (텔레그램 요청 제한 고려)
+        for (let i = 0; i < chats.length; i += 10) {
+            await Promise.all(
+                chats.slice(i, i + 10).map(async (c) => {
+                    const ids = [...new Set([...REQUIRED_ALL_IDS, ...(isSeop(c) ? REQUIRED_SEOP_IDS : [])])];
+                    const missing: string[] = [];
+                    for (const id of ids) {
+                        try {
+                            const m = await ctx.telegram.getChatMember(c.chat_id, Number(id));
+                            const inChat = ['creator', 'administrator', 'member'].includes(m.status) ||
+                                (m.status === 'restricted' && m.is_member);
+                            if (!inChat) missing.push(nameOf(id));
+                        } catch (err: unknown) {
+                            missing.push(`${nameOf(id)} (확인 실패: ${escapeHtml(getErrorMessage(err))})`);
+                        }
+                    }
+                    if (missing.length) problems.push({ chat: c, missing });
+                })
+            );
+        }
+
+        if (problems.length === 0) {
+            await ctx.reply(`✨ <b>모든 방(${chats.length}곳)에 필수 인원이 다 있습니다.</b>`, { parse_mode: 'HTML' });
+            return;
+        }
+        const header =
+            `👥 <b>[필수 인원 누락 방] (${problems.length}곳 / 전체 ${chats.length}곳)</b>\n` +
+            `• 모든 방: ${REQUIRED_ALL_IDS.map(nameOf).join(', ') || '-'}\n` +
+            `• 섭등 이상 방 (중단 제외): ${REQUIRED_SEOP_IDS.map(nameOf).join(', ') || '-'}\n` +
+            `━━━━━━━━━━━━━━━━━━\n\n`;
+        await sendChunkedList(ctx, header, problems, ({ chat, missing }, idx) =>
+            `<b>${idx}. ${escapeHtml(chat.room_title || chat.chat_id)}</b>` +
+            `${chat.matched_student_name ? ` · ${escapeHtml(chat.matched_student_name)} [${escapeHtml(chat.student_stage || '-')}]` : ''}\n` +
+            `   • 없음: ${missing.join(', ')}\n\n`
+        );
+    } catch (err: unknown) {
+        console.error('[필수 인원 점검 에러]:', err);
+        await replyError(ctx, '필수 인원 점검', err);
     }
 });
 
