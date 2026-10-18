@@ -2540,7 +2540,7 @@ bot.hears(/^[\/!](start|help|도움말)(?:@\w+)?$/i, async (ctx) => {
             '   일괄 독촉: <code>관리자 미갱신 알림</code>, <code>관리자 미갱신 타부서포함 알림</code>\n' +
             '• <b>찾등 이상 봇 미초대 명단</b>: <code>관리자 미초대</code>\n' +
             '• <b>만남 중단 방 목록</b>: <code>관리자 중단</code>\n' +
-            '• <b>필수 인원 방 참여 점검</b>: <code>관리자 인원점검</code> (모든 방 / 섭등 이상 방)\n' +
+            '• <b>필수 인원 방 참여 점검</b>: <code>관리자 인원점검</code> (모든 방 / 섭등 이상 방, 탈락 제외)\n' +
             '• <b>특수 구분 현황 (3가지 종합)</b>: <code>관리자 구분</code>\n' +
             '• <b>구분별 단독 조회</b>: <code>관리자 n월 섭등목표</code>, <code>관리자 n월 예정목표</code>, <code>관리자 n월 가능목표</code>, <code>관리자 n월 확정목표</code>\n' +
             '• <b>일반방 조회 (특수 3종 및 중단 제외)</b>: <code>관리자 n월 일반</code>\n' +
@@ -5086,7 +5086,10 @@ bot.hears(/^(?:[\/!]?관리자\s+)(인원\s*점검|필수\s*인원|방\s*인원)
 
         const isSeop = (c: ChatRecord) =>
             c.meeting_date !== '중단' && (getStudentStageRank(c.student_stage) >= 3 || !!c.student_seop_date);
-        const chats = await getAllChats();
+        // 탈락 대상자 방은 점검하지 않음
+        const chats = (await getAllChats()).filter(
+            (c) => !c.student_dropped_at && !String(c.student_stage ?? '').includes('탈락')
+        );
         const problems: { chat: ChatRecord; missing: string[] }[] = [];
         // 10방씩 동시에 확인 (텔레그램 요청 제한 고려)
         for (let i = 0; i < chats.length; i += 10) {
