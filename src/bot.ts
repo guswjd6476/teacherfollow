@@ -2241,7 +2241,9 @@ async function sendRegionDailySummaries(mode: 'morning' | 'night') {
     if (already.rows[0]?.value === todayStr) return; // 같은 날 크론이 여러 번 호출돼도 한 번만
 
     const regionChats = await getRegionChats();
-    if (regionChats.length === 0) return;
+    // 청년회 전체 요약을 받을 사람 (웹 관리자 > 봇 설정, 개인 대화로 발송)
+    const wholeIds = (await getBotSettingEntries('counselingSummaryUserIds').catch(() => [])).map((e) => e.id);
+    if (regionChats.length === 0 && wholeIds.length === 0) return;
     const chats = await getAllChats();
     const todayEvents = mode === 'night' ? await getMeetingEvents(today, today.add(1, 'day')) : [];
     // 마감 요약 맨 위: 이번 주 행정 결과 / 주간 목표 (읽기에 실패해도 나머지 요약은 보낸다)
@@ -2272,10 +2274,12 @@ async function sendRegionDailySummaries(mode: 'morning' | 'night') {
         `${line(c)}${c.meeting_type ? ` [${c.meeting_type}]` : ''}${c.meeting_time ? ` ${escapeHtml(c.meeting_time)}` : ''}${contactMark(c)}\n`;
     const dayLabel = (d: dayjs.Dayjs) => `${d.format('MM/DD')} (${'일월화수목금토'[d.day()]})`;
 
-    for (const [target, regions] of regionsByChat) {
-        const mine = chats.filter((c) =>
-            regions.some((r) => regionMatches(r, c.guide_region) || regionMatches(r, c.teacher_region))
-        );
+    // regions가 null이면 청년회 전체
+    const targets: [string, string[] | null][] = [...regionsByChat, ...wholeIds.map((id): [string, null] => [id, null])];
+    for (const [target, regions] of targets) {
+        const inRegions = (a?: string | null, b?: string | null) =>
+            !regions || regions.some((r) => regionMatches(r, a) || regionMatches(r, b));
+        const mine = chats.filter((c) => inRegions(c.guide_region, c.teacher_region));
         const todayMeetings = mine.filter((c) => c.meeting_date === todayStr);
         const overdue = mine
             .filter((c) => isPastMeetingDate(c, todayStr) && !c.report_submitted && needsReport(c))
@@ -2326,21 +2330,19 @@ async function sendRegionDailySummaries(mode: 'morning' | 'night') {
                       )
                   );
 
-        const regionName = escapeHtml(regions.join(', '));
+        const regionName = regions ? `${escapeHtml(regions.join(', '))} 지역` : '청년회 전체';
         let msg: string;
         if (mode === 'morning') {
             if (todayMeetings.length === 0 && overdue.length === 0 && waiting.length === 0 && needsCount === 0) continue;
-            msg = `☀️ <b>[${regionName} 지역 오늘의 요약] ${dayLabel(today)}</b>\n━━━━━━━━━━━━━━━━━━\n\n`;
+            msg = `☀️ <b>[${regionName} 오늘의 요약] ${dayLabel(today)}</b>\n━━━━━━━━━━━━━━━━━━\n\n`;
             msg += `🗓 <b>오늘 만남: ${todayMeetings.length}건</b>\n` + todayMeetings.map(meetingLine).join('');
             msg += `\n⚠️ <b>보고서 미제출: ${overdue.length}건</b>\n` + overdueText;
             msg += waitingText + needsText;
         } else {
             const todayUnreported = todayMeetings.filter((c) => !c.report_submitted && needsReport(c));
             const tomorrowMeetings = mine.filter((c) => c.meeting_date === tomorrowStr);
-            const newEvents = todayEvents.filter((e) =>
-                regions.some((r) => regionMatches(r, e.guide_region) || regionMatches(r, e.teacher_region))
-            );
-            const adminText = weeklyAdmin ? formatWeeklyAdmin(weeklyAdmin, regions) : '';
+            const newEvents = todayEvents.filter((e) => inRegions(e.guide_region, e.teacher_region));
+            const adminText = weeklyAdmin ? formatWeeklyAdmin(weeklyAdmin, regions ?? ALL_GOAL_REGIONS) : '';
             if (
                 !adminText &&
                 notDropped.length === 0 &&
@@ -2352,7 +2354,7 @@ async function sendRegionDailySummaries(mode: 'morning' | 'night') {
                 needsCount === 0
             )
                 continue;
-            msg = `🌙 <b>[${regionName} 지역 오늘 마감 요약] ${dayLabel(today)}</b>\n━━━━━━━━━━━━━━━━━━\n\n` + adminText;
+            msg = `🌙 <b>[${regionName} 오늘 마감 요약] ${dayLabel(today)}</b>\n━━━━━━━━━━━━━━━━━━\n\n` + adminText;
             msg += `🆕 <b>오늘 신규 만남 발생: ${newEvents.length}건</b>\n`;
             if (newEvents.length) msg += formatMeetingEvents(newEvents, false);
             else msg += `\n`;
@@ -5047,8 +5049,8 @@ bot.hears(/^(?:[\/!]?관리자\s+)(미초대|봇미초대|초대누락)$/i, asyn
 });
 
 // 필수 인원 방 참여 점검 (관리자 인원점검)
-// 웹 관리자 > 봇 설정의 bot_settings (counselingAllUserIds: 봇이 있는 모든 방 / counselingSeopUserIds: 섭등 이상 방, 탈락·중단 방은 제외)
-async function getRequiredMembers(key: string): Promise<{ id: string; memo: string }[]> {
+// 명단: 웹 관리자 > 봇 설정의 bot_settings (counselingAllUserIds: 봇이 있는 모든 방 / counselingSeopUserIds: 섭등 이상 방, 탈락·중단 방은 제외)
+async function getBotSettingEntries(key: string): Promise<{ id: string; memo: string }[]> {
     const res = await neonPool.query(`SELECT value FROM bot_settings WHERE key = $1`, [key]);
     const list = res.rows[0]?.value;
     return Array.isArray(list) ? list.filter((e) => e?.id).map((e) => ({ id: String(e.id), memo: String(e.memo ?? '') })) : [];
@@ -5060,8 +5062,8 @@ bot.hears(/^(?:[\/!]?관리자\s+)(인원\s*점검|필수\s*인원|방\s*인원)
             await ctx.reply('⛔ 접근 권한이 없습니다.', { parse_mode: 'HTML' });
             return;
         }
-        const allMembers = await getRequiredMembers('counselingAllUserIds');
-        const seopMembers = await getRequiredMembers('counselingSeopUserIds');
+        const allMembers = await getBotSettingEntries('counselingAllUserIds');
+        const seopMembers = await getBotSettingEntries('counselingSeopUserIds');
         const REQUIRED_ALL_IDS = allMembers.map((e) => e.id);
         const REQUIRED_SEOP_IDS = seopMembers.map((e) => e.id);
         if (REQUIRED_ALL_IDS.length + REQUIRED_SEOP_IDS.length === 0) {
