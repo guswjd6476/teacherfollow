@@ -2544,7 +2544,8 @@ bot.hears(/^[\/!](start|help|도움말)(?:@\w+)?$/i, async (ctx) => {
             '   일괄 독촉: <code>관리자 미갱신 알림</code>, <code>관리자 미갱신 타부서포함 알림</code>\n' +
             '• <b>찾등 이상 봇 미초대 명단</b>: <code>관리자 미초대</code>\n' +
             '• <b>만남 중단 방 목록</b>: <code>관리자 중단</code>\n' +
-            '• <b>필수 인원 방 참여 점검</b>: <code>관리자 인원점검</code> (모든 방 / 섭등 이상 방, 탈락·중단 제외)\n' +
+            '• <b>필수 인원 방 참여 점검</b>: <code>관리자 인원점검</code> (모든 방 / 섭등 이상 방 / 개강 강사, 탈락·중단 제외)\n' +
+            '   개강 강사만: <code>관리자 강사점검</code>, 목표월만: <code>관리자 강사점검 11월</code>\n' +
             '• <b>특수 구분 현황 (3가지 종합)</b>: <code>관리자 구분</code>\n' +
             '• <b>구분별 단독 조회</b>: <code>관리자 n월 섭등목표</code>, <code>관리자 n월 예정목표</code>, <code>관리자 n월 가능목표</code>, <code>관리자 n월 확정목표</code>\n' +
             '• <b>일반방 조회 (특수 3종 및 중단 제외)</b>: <code>관리자 n월 일반</code>\n' +
@@ -4677,7 +4678,7 @@ bot.hears(/^(?:[\/!]?관리자\s+)(동아리|동아리목록|동아리건|지역
 
 // 날짜별 만남 조회 (관리자 오늘만남, 관리자 내일만남, 관리자 일자만남 MM-DD)
 bot.hears(
-    /^(?:[\/!]?관리자(?:\s+(?!\d{1,2}\s*월\s*(?:섭등목표|예정목표|가능목표|확정목표|섭등예정|예정가능일|가능가능일|일반|일반방|미분류)$)(?!(?:인원\s*점검|필수\s*인원|방\s*인원|미초대|봇미초대|초대누락|미제출|미등록|미정|미갱신|최초미등록|점검|현황|중단|구분|단계|특수|섭등목표|예정목표|가능목표|확정목표|섭등예정|예정가능일|가능가능일|일반|일반방|미분류|인터뷰|인터뷰예정|인터뷰목록|인터뷰건|교사|교사만남|교사목록|교사건|지인|지인만남|지인목록|지인건|동아리|동아리목록|동아리건|지역행사|지역행사목록|지역행사건|행사|행사참석|행사목록|행사건|주간))(.+))?|[\/!](?:만남명단|만남일정)(?:@\w+)?(?:\s+(.+))?)$/i,
+    /^(?:[\/!]?관리자(?:\s+(?!\d{1,2}\s*월\s*(?:섭등목표|예정목표|가능목표|확정목표|섭등예정|예정가능일|가능가능일|일반|일반방|미분류)$)(?!(?:강사\s*점검|인원\s*점검|필수\s*인원|방\s*인원|미초대|봇미초대|초대누락|미제출|미등록|미정|미갱신|최초미등록|점검|현황|중단|구분|단계|특수|섭등목표|예정목표|가능목표|확정목표|섭등예정|예정가능일|가능가능일|일반|일반방|미분류|인터뷰|인터뷰예정|인터뷰목록|인터뷰건|교사|교사만남|교사목록|교사건|지인|지인만남|지인목록|지인건|동아리|동아리목록|동아리건|지역행사|지역행사목록|지역행사건|행사|행사참석|행사목록|행사건|주간))(.+))?|[\/!](?:만남명단|만남일정)(?:@\w+)?(?:\s+(.+))?)$/i,
     async (ctx) => {
         try {
             const userId = String(ctx.from?.id);
@@ -5049,27 +5050,41 @@ bot.hears(/^(?:[\/!]?관리자\s+)(미초대|봇미초대|초대누락)$/i, asyn
 });
 
 // 필수 인원 방 참여 점검 (관리자 인원점검)
-// 명단: 웹 관리자 > 봇 설정의 bot_settings (counselingAllUserIds: 봇이 있는 모든 방 / counselingSeopUserIds: 섭등 이상 방, 탈락·중단 방은 제외)
+// 명단: 웹 관리자 > 봇 설정의 bot_settings (counselingAllUserIds: 봇이 있는 모든 방 / counselingSeopUserIds: 섭등 이상 방,
+// counselingLecturerUserIds: 그 달 개강(목표월) 합등 이상 방 — 메모에 'n월 이름'), 탈락·중단 방은 제외
+// 관리자 강사점검 [n월]: 개강 강사만 점검 / 관리자 인원점검 [n월]: 전부 점검 (n월 = 대상자 목표월만)
 async function getBotSettingEntries(key: string): Promise<{ id: string; memo: string }[]> {
     const res = await neonPool.query(`SELECT value FROM bot_settings WHERE key = $1`, [key]);
     const list = res.rows[0]?.value;
     return Array.isArray(list) ? list.filter((e) => e?.id).map((e) => ({ id: String(e.id), memo: String(e.memo ?? '') })) : [];
 }
 
-bot.hears(/^(?:[\/!]?관리자\s+)(인원\s*점검|필수\s*인원|방\s*인원)$/i, async (ctx) => {
+bot.hears(/^(?:[\/!]?관리자\s+)(인원\s*점검|필수\s*인원|방\s*인원|강사\s*점검)(?:\s+(\d{1,2})\s*월)?$/i, async (ctx) => {
     try {
         if (!isAdmin(ctx.from?.id)) {
             await ctx.reply('⛔ 접근 권한이 없습니다.', { parse_mode: 'HTML' });
             return;
         }
-        const allMembers = await getBotSettingEntries('counselingAllUserIds');
-        const seopMembers = await getBotSettingEntries('counselingSeopUserIds');
+        const lecturerOnly = /강사/.test(ctx.match[1]);
+        const month = ctx.match[2] ? Number(ctx.match[2]) : null;
+        const allMembers = lecturerOnly ? [] : await getBotSettingEntries('counselingAllUserIds');
+        const seopMembers = lecturerOnly ? [] : await getBotSettingEntries('counselingSeopUserIds');
+        // 메모 'n월 이름' → 월별 강사 (메모에 월이 없으면 쓰지 않음)
+        const lecturers = (await getBotSettingEntries('counselingLecturerUserIds'))
+            .map((e) => ({ ...e, month: Number(e.memo.match(/(\d{1,2})\s*월/)?.[1]) || null, memo: e.memo.replace(/\d{1,2}\s*월/, '').trim() }))
+            .filter((e) => e.month);
         const REQUIRED_ALL_IDS = allMembers.map((e) => e.id);
         const REQUIRED_SEOP_IDS = seopMembers.map((e) => e.id);
-        if (REQUIRED_ALL_IDS.length + REQUIRED_SEOP_IDS.length === 0) {
+        const lecturerIdsFor = (c: ChatRecord) => {
+            const m = getTargetMonthNumber(c.student_target);
+            const isHap = isHapOrAbove(c) || !!c.student_hab_date || !!c.student_seop_date;
+            return isHap ? lecturers.filter((e) => e.month === m).map((e) => e.id) : [];
+        };
+        if (REQUIRED_ALL_IDS.length + REQUIRED_SEOP_IDS.length + lecturers.length === 0) {
             await ctx.reply(
                 'ℹ️ 점검할 인원이 설정되지 않았습니다.\n' +
-                    '웹 관리자 > 봇 설정의 <b>상담 봇 모든 방 필수 인원</b>, <b>상담 봇 섭등 이상 방 필수 인원</b>에 ' +
+                    '웹 관리자 > 봇 설정의 <b>상담 봇 모든 방 필수 인원</b>, <b>상담 봇 섭등 이상 방 필수 인원</b>, ' +
+                    '<b>상담 봇 개강 강사</b>(메모에 <code>11월 이름</code>)에 ' +
                     '텔레그램 ID를 넣어주세요. (ID는 <code>관리자 인증목록</code>에서 확인)',
                 { parse_mode: 'HTML' }
             );
@@ -5081,16 +5096,16 @@ bot.hears(/^(?:[\/!]?관리자\s+)(인원\s*점검|필수\s*인원|방\s*인원)
         const names = new Map<string, string>(
             (
                 await neonPool.query(`SELECT user_id, name, username FROM verified_users WHERE user_id = ANY($1)`, [
-                    [...REQUIRED_ALL_IDS, ...REQUIRED_SEOP_IDS],
+                    [...REQUIRED_ALL_IDS, ...REQUIRED_SEOP_IDS, ...lecturers.map((e) => e.id)],
                 ])
             ).rows.map((u) => [u.user_id, displayName({ first_name: u.name, username: u.username })])
         );
-        for (const e of [...allMembers, ...seopMembers]) if (e.memo) names.set(e.id, e.memo);
+        for (const e of [...allMembers, ...seopMembers, ...lecturers]) if (e.memo) names.set(e.id, e.memo);
         const nameOf = (id: string) => escapeHtml(names.get(id) || id);
 
         const isSeop = (c: ChatRecord) => getStudentStageRank(c.student_stage) >= 3 || !!c.student_seop_date;
         // 탈락 대상자·만남 중단 방은 점검하지 않음
-        const chats = (await getAllChats()).filter(
+        const chats = filterByTargetMonth(await getAllChats(), month).filter(
             (c) => c.meeting_date !== '중단' && !c.student_dropped_at && !String(c.student_stage ?? '').includes('탈락')
         );
         const problems: { chat: ChatRecord; missing: string[] }[] = [];
@@ -5098,7 +5113,7 @@ bot.hears(/^(?:[\/!]?관리자\s+)(인원\s*점검|필수\s*인원|방\s*인원)
         for (let i = 0; i < chats.length; i += 10) {
             await Promise.all(
                 chats.slice(i, i + 10).map(async (c) => {
-                    const ids = [...new Set([...REQUIRED_ALL_IDS, ...(isSeop(c) ? REQUIRED_SEOP_IDS : [])])];
+                    const ids = [...new Set([...REQUIRED_ALL_IDS, ...(isSeop(c) ? REQUIRED_SEOP_IDS : []), ...lecturerIdsFor(c)])];
                     const missing: string[] = [];
                     for (const id of ids) {
                         try {
@@ -5115,18 +5130,23 @@ bot.hears(/^(?:[\/!]?관리자\s+)(인원\s*점검|필수\s*인원|방\s*인원)
             );
         }
 
+        const scope = month ? `${month}월 개강 ` : '';
         if (problems.length === 0) {
-            await ctx.reply(`✨ <b>모든 방(${chats.length}곳)에 필수 인원이 다 있습니다.</b>`, { parse_mode: 'HTML' });
+            await ctx.reply(`✨ <b>${scope}모든 방(${chats.length}곳)에 ${lecturerOnly ? '개강 강사가' : '필수 인원이'} 다 있습니다.</b>`, { parse_mode: 'HTML' });
             return;
         }
+        const lecturerText = lecturers.map((e) => `${e.month}월 ${nameOf(e.id)}`).join(', ') || '-';
         const header =
-            `👥 <b>[필수 인원 누락 방] (${problems.length}곳 / 전체 ${chats.length}곳)</b>\n` +
-            `• 모든 방: ${REQUIRED_ALL_IDS.map(nameOf).join(', ') || '-'}\n` +
-            `• 섭등 이상 방: ${REQUIRED_SEOP_IDS.map(nameOf).join(', ') || '-'}\n` +
+            `👥 <b>[${scope}${lecturerOnly ? '개강 강사' : '필수 인원'} 누락 방] (${problems.length}곳 / 전체 ${chats.length}곳)</b>\n` +
+            (lecturerOnly
+                ? ''
+                : `• 모든 방: ${REQUIRED_ALL_IDS.map(nameOf).join(', ') || '-'}\n` +
+                  `• 섭등 이상 방: ${REQUIRED_SEOP_IDS.map(nameOf).join(', ') || '-'}\n`) +
+            `• 개강 강사 (그 달 개강 합등 이상 방): ${lecturerText}\n` +
             `━━━━━━━━━━━━━━━━━━\n\n`;
         await sendChunkedList(ctx, header, problems, ({ chat, missing }, idx) =>
             `<b>${idx}. ${escapeHtml(chat.room_title || chat.chat_id)}</b>` +
-            `${chat.matched_student_name ? ` · ${escapeHtml(chat.matched_student_name)} [${escapeHtml(chat.student_stage || '-')}]` : ''}\n` +
+            `${chat.matched_student_name ? ` · ${escapeHtml(chat.matched_student_name)} [${escapeHtml(chat.student_stage || '-')}] ${formatTargetMonth(chat.student_target)}` : ''}\n` +
             `   • 없음: ${missing.join(', ')}\n\n`
         );
     } catch (err: unknown) {
