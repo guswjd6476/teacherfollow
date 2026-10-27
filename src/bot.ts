@@ -165,6 +165,7 @@ async function initDb() {
                 WHEN meeting_type = '인터뷰' THEN '인터뷰 후'
                 WHEN meeting_type = '교사' THEN '교사 만남 중'
                 WHEN meeting_type = '지인' THEN '지인 만남 중'
+                WHEN meeting_type = '당터뷰' THEN '당터뷰 진행 중'
                 WHEN meeting_type = '동아리' THEN '동아리 진행 중'
                 WHEN meeting_type = '지역행사' THEN '지역행사 단계'
             END
@@ -390,11 +391,12 @@ function teacherText(row: { teacher_name?: string | null; teacher_region?: strin
 
 // 일정만 관리하는 만남 유형 — 보고서 제출·미제출 알림·독촉 대상에서 제외, /교사전환으로 교사 만남 전환
 // 첫 만남 유형: 지역행사·동아리·지인, 행사: 인터뷰 후속 행사 참석
-type ScheduleOnlyType = '동아리' | '지역행사' | '지인' | '행사';
+type ScheduleOnlyType = '동아리' | '지역행사' | '지인' | '당터뷰' | '행사';
 const SCHEDULE_ONLY: Record<ScheduleOnlyType, { icon: string; name: string; dateLabel: string; phase: string; convertSource: string }> = {
     동아리: { icon: '🧩', name: '동아리', dateLabel: '모임일', phase: '동아리 진행 중', convertSource: '동아리후속' },
     지역행사: { icon: '🎉', name: '지역행사', dateLabel: '행사일', phase: '지역행사 단계', convertSource: '지역행사후속' },
     지인: { icon: '🤝', name: '지인 만남', dateLabel: '만남일', phase: '지인 만남 중', convertSource: '지인후속' },
+    당터뷰: { icon: '🗣️', name: '당터뷰', dateLabel: '만남일', phase: '당터뷰 진행 중', convertSource: '당터뷰후속' },
     행사: { icon: '🎪', name: '행사 참석', dateLabel: '행사일', phase: '행사 참석 단계', convertSource: '행사후속' },
 };
 const scheduleOnlyInfo = (type?: string | null) => (type && type in SCHEDULE_ONLY ? SCHEDULE_ONLY[type as ScheduleOnlyType] : null);
@@ -1708,12 +1710,13 @@ bot.action(/^notice:(send|cancel):(\w+)$/, async (ctx) => {
 /* =====================================================
  * 🆕 신규 만남 발생 (상담 이하 = 인터뷰 매칭 / 상담 1회차 = 교사 매칭)
  * ===================================================== */
-type MeetingCategory = '인터뷰매칭' | '지역행사매칭' | '동아리매칭' | '지인매칭' | '교사매칭';
+type MeetingCategory = '인터뷰매칭' | '지역행사매칭' | '동아리매칭' | '지인매칭' | '당터뷰매칭' | '교사매칭';
 const MEETING_CATEGORY_LABEL: Record<MeetingCategory, string> = {
     인터뷰매칭: '🎙️ 상담 이하 (인터뷰 매칭)',
     지역행사매칭: '🎉 지역행사',
     동아리매칭: '🧩 동아리',
     지인매칭: '🤝 지인 만남',
+    당터뷰매칭: '🗣️ 당터뷰',
     교사매칭: '👨‍🏫 상담 1회차 (교사 매칭)',
 };
 
@@ -2151,7 +2154,7 @@ async function buildWeeklyRecap(regions: string[] | null, today: dayjs.Dayjs, ca
     msg +=
         `🆕 <b>신규 만남: ${myEvents.length}건</b>\n` +
         `• 인터뷰 매칭 ${count('인터뷰매칭')} · 교사 매칭 ${count('교사매칭')}` +
-        ` (인터뷰 후 전환 ${count('교사매칭', '인터뷰후속')}) · 지역행사 ${count('지역행사매칭')} · 동아리 ${count('동아리매칭')} · 지인 ${count('지인매칭')}\n\n`;
+        ` (인터뷰 후 전환 ${count('교사매칭', '인터뷰후속')}) · 지역행사 ${count('지역행사매칭')} · 동아리 ${count('동아리매칭')} · 지인 ${count('지인매칭')} · 당터뷰 ${count('당터뷰매칭')}\n\n`;
 
     // 지난주 중단 (봇에서 중단한 시각, 없으면 마지막 수정 시각)
     const stopped = mine.filter((c) => {
@@ -2522,8 +2525,8 @@ bot.hears(/^[\/!](start|help|도움말)(?:@\w+)?$/i, async (ctx) => {
             '   <i>(섭등 후 3회차부터 복등 전이면 보고서 반영 때 복등 안내, 3회차 때 지역 담당방에도 알림)</i>\n' +
             '• <b>만남 보고서 제출</b>: 양식 내 <code>다음만남일: MM-DD</code> 포함\n' +
             '   <i>(사진 설명글로 올려도 인식됩니다. 이미 보낸 메시지를 편집하면 반영되지 않으니 다시 올려 주세요)</i>\n\n' +
-            '<b>4. 지역행사 · 동아리 · 지인 만남 (일정만 관리)</b>\n' +
-            '• <b>지정</b>: <code>/최초등록</code> 후 [🎉 지역행사] · [🧩 동아리] · [🤝 지인 만남] 중 선택 → <code>/만남일 MM-DD</code>로 일정 등록\n' +
+            '<b>4. 지역행사 · 동아리 · 지인 만남 · 당터뷰 (일정만 관리)</b>\n' +
+            '• <b>지정</b>: <code>/최초등록</code> 후 [🎉 지역행사] · [🧩 동아리] · [🤝 지인 만남] · [🗣️ 당터뷰] 중 선택 → <code>/만남일 MM-DD</code>로 일정 등록\n' +
             '• <b>교사 만남으로 전환</b>: <code>/교사전환</code>\n\n' +
             '<b>5. 방 진행 단계 (특수 구분)</b>\n' +
             '• <b>단계 설정</b>: <code>/섭등목표 MM-DD</code>, <code>/예정목표 MM-DD</code>, <code>/가능목표 MM-DD</code>, <code>/확정목표 MM-DD</code> (날짜만 입력)\n' +
@@ -2536,7 +2539,7 @@ bot.hears(/^[\/!](start|help|도움말)(?:@\w+)?$/i, async (ctx) => {
             '👑 <b>관리자 전용 명령어</b>\n' +
             '• <b>인터뷰 예정건 모아보기</b>: <code>관리자 인터뷰</code>\n' +
             '• <b>교사 만남 진행건 모아보기</b>: <code>관리자 교사</code>\n' +
-            '• <b>지역행사·동아리·지인 진행건 모아보기</b>: <code>관리자 지역행사</code>, <code>관리자 동아리</code>, <code>관리자 지인</code> (인터뷰 후속 행사: <code>관리자 행사</code>)\n' +
+            '• <b>지역행사·동아리·지인 진행건 모아보기</b>: <code>관리자 지역행사</code>, <code>관리자 동아리</code>, <code>관리자 지인</code>, <code>관리자 당터뷰</code> (인터뷰 후속 행사: <code>관리자 행사</code>)\n' +
             '• <b>만남 명단 조회</b>: <code>관리자 오늘만남</code>, <code>관리자 내일만남</code>, <code>관리자 일자만남 MM-DD</code>\n' +
             '• <b>보고서 미제출 명단</b>: <code>관리자 미제출</code> (일괄 독촉: <code>관리자 미제출 알림</code>)\n' +
             '• <b>미등록 및 미정 방 조회</b>: <code>관리자 미등록</code>\n' +
@@ -3078,7 +3081,10 @@ const MEETING_TYPE_KEYBOARD = {
             { text: '🎉 지역행사', callback_data: 'type_local_event' },
             { text: '🧩 동아리', callback_data: 'type_club' },
         ],
-        [{ text: '🤝 지인 만남', callback_data: 'type_acquaintance' }],
+        [
+            { text: '🤝 지인 만남', callback_data: 'type_acquaintance' },
+            { text: '🗣️ 당터뷰', callback_data: 'type_dangterview' },
+        ],
     ],
 };
 
@@ -3211,13 +3217,13 @@ bot.hears(/^[\/!]최초등록(?:@\w+)?(?:\s+(.+))?$/i, async (ctx) => {
 });
 
 // 첫 만남 유형을 정했을 때 방에 보내는 안내 (유형 버튼, 웹에서 고른 경우 공통)
-type FirstMeetingType = '인터뷰' | '교사' | '지역행사' | '동아리' | '지인';
+type FirstMeetingType = '인터뷰' | '교사' | '지역행사' | '동아리' | '지인' | '당터뷰';
 // 받침이 있으면 true (조사 고르기용: 동아리 → 로/는, 지인 만남 → 으로/은)
 const hasBatchim = (word: string) => {
     const code = word.charCodeAt(word.length - 1) - 0xac00;
     return code >= 0 && code <= 11171 && code % 28 !== 0;
 };
-const scheduleOnlySelected = (type: '동아리' | '지역행사' | '지인') => {
+const scheduleOnlySelected = (type: '동아리' | '지역행사' | '지인' | '당터뷰') => {
     const info = SCHEDULE_ONLY[type];
     const b = hasBatchim(info.name);
     return (
@@ -3240,6 +3246,7 @@ const TYPE_SELECTED_MESSAGE: Record<FirstMeetingType, string> = {
     동아리: scheduleOnlySelected('동아리'),
     지역행사: scheduleOnlySelected('지역행사'),
     지인: scheduleOnlySelected('지인'),
+    당터뷰: scheduleOnlySelected('당터뷰'),
 };
 
 // 인터뷰 결과(사후) 보고서를 반영했을 때 방에 보내는 안내 (결과 보고서 처리, 웹에서 입력한 경우 공통)
@@ -3281,7 +3288,7 @@ function interviewResultMessage(
 }
 
 // 웹(관리 화면)에서 상담방을 고쳤을 때 그 방에 보내는 알림. actions로 상담 봇이 같은 일을 했을 때의 안내를 덧붙인다
-// actions: type:인터뷰|type:교사|type:지역행사|type:동아리|type:지인 (첫 만남 유형), pre_report (인터뷰 사전 보고서),
+// actions: type:인터뷰|type:교사|type:지역행사|type:동아리|type:지인|type:당터뷰 (첫 만남 유형), pre_report (인터뷰 사전 보고서),
 //          post_report:신청|행사|미신청 (인터뷰 결과 보고서), stop (중단), resume (중단 해제)
 function webEditMessage(record: ChatRecord, changes: string[], actions: Set<string>): string {
     let msg =
@@ -3289,7 +3296,7 @@ function webEditMessage(record: ChatRecord, changes: string[], actions: Set<stri
         (record.matched_student_name ? ` (👤 ${escapeHtml(record.matched_student_name)})` : '') +
         `\n` +
         changes.map((c) => `• ${escapeHtml(c)}`).join('\n');
-    for (const type of ['인터뷰', '교사', '지역행사', '동아리', '지인'] as const) {
+    for (const type of ['인터뷰', '교사', '지역행사', '동아리', '지인', '당터뷰'] as const) {
         if (actions.has(`type:${type}`)) msg += `\n\n${TYPE_SELECTED_MESSAGE[type]}`;
     }
     if (actions.has('pre_report')) {
@@ -3331,6 +3338,7 @@ const FIRST_TYPE_CATEGORY: Record<FirstMeetingType, MeetingCategory> = {
     동아리: '동아리매칭',
     지역행사: '지역행사매칭',
     지인: '지인매칭',
+    당터뷰: '당터뷰매칭',
 };
 
 // 첫 만남 유형을 바꿀 수 없는 경우 (잘못 누른 것을 고치는 용도라 진행이 시작되기 전까지만) — 바꿀 수 있으면 null
@@ -3425,6 +3433,7 @@ for (const [action, type] of [
     ['type_club', '동아리'],
     ['type_local_event', '지역행사'],
     ['type_acquaintance', '지인'],
+    ['type_dangterview', '당터뷰'],
 ] as const) {
     bot.action(action, async (ctx) => {
         try {
@@ -3480,7 +3489,7 @@ bot.hears(/^[\/!]교사\s*전환(?:@\w+)?$/i, async (ctx) => {
             await ctx.reply(
                 record?.meeting_type === '교사'
                     ? 'ℹ️ 이미 교사 만남으로 진행 중입니다.'
-                    : '⚠️ 지역행사·동아리·지인 만남·행사 참석으로 진행 중인 방에서만 사용할 수 있습니다.\n<i>(인터뷰 만남은 결과 보고서의 후속 [신청]으로 전환됩니다)</i>',
+                    : '⚠️ 지역행사·동아리·지인 만남·당터뷰·행사 참석으로 진행 중인 방에서만 사용할 수 있습니다.\n<i>(인터뷰 만남은 결과 보고서의 후속 [신청]으로 전환됩니다)</i>',
                 { parse_mode: 'HTML' }
             );
             return;
@@ -4623,7 +4632,7 @@ bot.hears(/^(?:[\/!]?관리자\s+)(교사|교사만남|교사목록|교사건)$/
 });
 
 // 관리자 지역행사·동아리·지인·행사 참석 진행건 모아보기 (일정만 관리)
-bot.hears(/^(?:[\/!]?관리자\s+)(동아리|동아리목록|동아리건|지역행사|지역행사목록|지역행사건|지인|지인만남|지인목록|지인건|행사|행사참석|행사목록|행사건)$/i, async (ctx) => {
+bot.hears(/^(?:[\/!]?관리자\s+)(동아리|동아리목록|동아리건|지역행사|지역행사목록|지역행사건|지인|지인만남|지인목록|지인건|당터뷰|당터뷰목록|당터뷰건|행사|행사참석|행사목록|행사건)$/i, async (ctx) => {
     try {
         if (!isAdmin(ctx.from?.id)) {
             await ctx.reply('⛔ <b>접근 권한이 없습니다.</b> 관리자만 사용할 수 있습니다.', { parse_mode: 'HTML' });
@@ -4632,7 +4641,7 @@ bot.hears(/^(?:[\/!]?관리자\s+)(동아리|동아리목록|동아리건|지역
 
         const today = dayjs().tz('Asia/Seoul').startOf('day');
         const word = ctx.match[1];
-        const kind: ScheduleOnlyType = word.startsWith('동아리') ? '동아리' : word.startsWith('지역행사') ? '지역행사' : word.startsWith('행사') ? '행사' : '지인';
+        const kind: ScheduleOnlyType = word.startsWith('동아리') ? '동아리' : word.startsWith('지역행사') ? '지역행사' : word.startsWith('행사') ? '행사' : word.startsWith('당터뷰') ? '당터뷰' : '지인';
         const [kindIcon, kindName] = [SCHEDULE_ONLY[kind].icon, SCHEDULE_ONLY[kind].name];
         const chats = (await getAllChats())
             .filter((c) => c.meeting_type === kind && c.meeting_date !== '중단')
@@ -4678,7 +4687,7 @@ bot.hears(/^(?:[\/!]?관리자\s+)(동아리|동아리목록|동아리건|지역
 
 // 날짜별 만남 조회 (관리자 오늘만남, 관리자 내일만남, 관리자 일자만남 MM-DD)
 bot.hears(
-    /^(?:[\/!]?관리자(?:\s+(?!\d{1,2}\s*월\s*(?:섭등목표|예정목표|가능목표|확정목표|섭등예정|예정가능일|가능가능일|일반|일반방|미분류)$)(?!(?:강사\s*점검|인원\s*점검|필수\s*인원|방\s*인원|미초대|봇미초대|초대누락|미제출|미등록|미정|미갱신|최초미등록|점검|현황|중단|구분|단계|특수|섭등목표|예정목표|가능목표|확정목표|섭등예정|예정가능일|가능가능일|일반|일반방|미분류|인터뷰|인터뷰예정|인터뷰목록|인터뷰건|교사|교사만남|교사목록|교사건|지인|지인만남|지인목록|지인건|동아리|동아리목록|동아리건|지역행사|지역행사목록|지역행사건|행사|행사참석|행사목록|행사건|주간))(.+))?|[\/!](?:만남명단|만남일정)(?:@\w+)?(?:\s+(.+))?)$/i,
+    /^(?:[\/!]?관리자(?:\s+(?!\d{1,2}\s*월\s*(?:섭등목표|예정목표|가능목표|확정목표|섭등예정|예정가능일|가능가능일|일반|일반방|미분류)$)(?!(?:강사\s*점검|인원\s*점검|필수\s*인원|방\s*인원|미초대|봇미초대|초대누락|미제출|미등록|미정|미갱신|최초미등록|점검|현황|중단|구분|단계|특수|섭등목표|예정목표|가능목표|확정목표|섭등예정|예정가능일|가능가능일|일반|일반방|미분류|인터뷰|인터뷰예정|인터뷰목록|인터뷰건|교사|교사만남|교사목록|교사건|지인|지인만남|지인목록|지인건|당터뷰|당터뷰목록|당터뷰건|동아리|동아리목록|동아리건|지역행사|지역행사목록|지역행사건|행사|행사참석|행사목록|행사건|주간))(.+))?|[\/!](?:만남명단|만남일정)(?:@\w+)?(?:\s+(.+))?)$/i,
     async (ctx) => {
         try {
             const userId = String(ctx.from?.id);
@@ -5177,7 +5186,7 @@ bot.hears(/^(?:[\/!]?관리자\s+)(중단\s*명단|중단|만남중단)$/i, asyn
         // 중단 시점별로 묶어서 (기록 도입 전 중단은 '시점 미기록')
         const phaseOf = (c: ChatRecord) =>
             c.stop_phase || (String(c.stop_reason || '').startsWith('인터뷰 후속 미신청') ? '인터뷰 후' : '시점 미기록');
-        const phaseOrder = ['인터뷰 전', '인터뷰 후', '유형 선택 전', '교사 만남 중', '지역행사 단계', '동아리 진행 중', '지인 만남 중', '행사 참석 단계', '시점 미기록'];
+        const phaseOrder = ['인터뷰 전', '인터뷰 후', '유형 선택 전', '교사 만남 중', '지역행사 단계', '동아리 진행 중', '지인 만남 중', '당터뷰 진행 중', '행사 참석 단계', '시점 미기록'];
         stoppedChats.sort((a, b) => phaseOrder.indexOf(phaseOf(a)) - phaseOrder.indexOf(phaseOf(b)));
         const phaseCounts = phaseOrder
             .map((p) => [p, stoppedChats.filter((c) => phaseOf(c) === p).length] as const)
@@ -5458,6 +5467,7 @@ bot.hears(/^(?:[\/!]?관리자\s+)(점검|현황|종합\s*점검|전체\s*점검
         msg += `• 지역행사 진행: <b>${typeCount('지역행사')}개 방</b> (조회: <code>관리자 지역행사</code>)\n`;
         msg += `• 동아리 진행: <b>${typeCount('동아리')}개 방</b> (조회: <code>관리자 동아리</code>)\n`;
         msg += `• 지인 만남 진행: <b>${typeCount('지인')}개 방</b> (조회: <code>관리자 지인</code>)\n`;
+        msg += `• 당터뷰 진행: <b>${typeCount('당터뷰')}개 방</b> (조회: <code>관리자 당터뷰</code>)\n`;
         msg += `• 행사 참석 (인터뷰 후속): <b>${typeCount('행사')}개 방</b> (조회: <code>관리자 행사</code>)\n\n`;
 
         msg += `🏷 <b>[진행 단계별 현황]</b>\n`;
@@ -5697,7 +5707,7 @@ async function buildWeeklySummary(): Promise<string> {
         if (n) msg += `• ${dayjs(day).format('MM/DD')} (${'일월화수목금토'[dayjs(day).day()]}): ${n}건\n`;
     }
     const countType = (type: string) => meetingsThisWeek.filter((c) => c.meeting_type === type).length;
-    msg += `  (인터뷰 ${countType('인터뷰')} · 교사 ${countType('교사')} · 지역행사 ${countType('지역행사')} · 동아리 ${countType('동아리')} · 지인 ${countType('지인')} · 행사 ${countType('행사')})\n\n`;
+    msg += `  (인터뷰 ${countType('인터뷰')} · 교사 ${countType('교사')} · 지역행사 ${countType('지역행사')} · 동아리 ${countType('동아리')} · 지인 ${countType('지인')} · 당터뷰 ${countType('당터뷰')} · 행사 ${countType('행사')})\n\n`;
 
     msg += `🏷 <b>이번 주 진행 구분 목표일: ${stageThisWeek.length}건</b>\n`;
     for (const c of sortByStageDateDesc(stageThisWeek).reverse()) {
