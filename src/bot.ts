@@ -6405,7 +6405,32 @@ async function handleIncomingText(ctx: any, rawText: string, source: 'text' | 'c
     }
 }
 
-bot.on('text', (ctx) => handleIncomingText(ctx, ctx.message.text, 'text'));
+// 텔레그램은 4096자가 넘는 메시지를 여러 개로 나눠 보낸다 → 긴 메시지는 같은 사람이 이어 보낸 조각과 합쳐서 한 번에 처리
+// shortcut: 메모리에만 보관하므로 대기 중(최대 SPLIT_WAIT_MS) 봇이 재시작되면 그 조각은 처리되지 않음
+const SPLIT_MIN_LENGTH = 3000; // 이보다 긴 메시지는 뒤에 조각이 더 올 수 있다고 본다
+const SPLIT_WAIT_MS = 5000;
+const pendingSplits = new Map<string, { ctx: any; text: string; timer: NodeJS.Timeout }>();
+
+function flushSplit(key: string) {
+    const p = pendingSplits.get(key);
+    if (!p) return;
+    clearTimeout(p.timer);
+    pendingSplits.delete(key);
+    return handleIncomingText(p.ctx, p.text, 'text');
+}
+
+bot.on('text', (ctx) => {
+    const text = ctx.message.text;
+    const key = `${ctx.chat.id}:${ctx.from?.id}`;
+    const pending = pendingSplits.get(key);
+    if (pending) pending.text += '\n' + text;
+    // 짧은 메시지는 마지막 조각(또는 일반 메시지)이므로 바로 처리
+    if (text.length < SPLIT_MIN_LENGTH) return pending ? flushSplit(key) : handleIncomingText(ctx, text, 'text');
+    if (pending) clearTimeout(pending.timer);
+    const entry = pending ?? { ctx, text, timer: undefined as unknown as NodeJS.Timeout };
+    entry.timer = setTimeout(() => void flushSplit(key), SPLIT_WAIT_MS);
+    pendingSplits.set(key, entry);
+});
 
 // 사진·파일에 설명글로 붙인 보고서 / #피드백도 인식
 bot.on(['photo', 'document', 'video'], async (ctx) => {
