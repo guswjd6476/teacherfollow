@@ -82,3 +82,13 @@ test('날짜 버튼: 이번 주는 오늘~일요일, 다음 주는 월~일', () 
     assert.equal(mon.thisWeek.length, 7);
     assert.equal(mon.nextWeek[0], '2026-11-09');
 });
+
+test('진행 내역(누적): 보고서에서 꺼내 다음 양식에 이어 씀', async () => {
+    const { extractProgressHistory, fillProgressHistory } = await import('../src/parse.ts');
+    const report = `▶️ 교사 컨셉\n- 언니\n\n▶️ 진행 내역(누적)\n1. 10/3 인터뷰\n2. 10/10 1과\n3. \n\n▶️ 단계향상 목표 및 달성여부\n항목/`;
+    const h = extractProgressHistory(report);
+    assert.equal(h, '1. 10/3 인터뷰\n2. 10/10 1과');
+    const tpl = `▶️ 진행 내역(누적)\n1. \n2. \n\n▶️ 단계향상 목표 및 달성여부`;
+    assert.equal(fillProgressHistory(tpl, h!), `▶️ 진행 내역(누적)\n1. 10/3 인터뷰\n2. 10/10 1과\n3. \n\n▶️ 단계향상 목표 및 달성여부`);
+    assert.equal(extractProgressHistory(`▶️ 진행 내역(누적)\n1. \n2. \n▶️ 진행내용\n- 복습`), null);
+});

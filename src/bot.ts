@@ -16,6 +16,8 @@ import {
     getWeekdayWarning,
     parseFlexibleDate,
     parseFlexibleTime,
+    extractProgressHistory,
+    fillProgressHistory,
     stripDatePart,
     weekDateOptions,
 } from './parse.js';
@@ -106,6 +108,8 @@ async function initDb() {
             ALTER TABLE counseling_chats ADD COLUMN IF NOT EXISTS teacher_meeting_base INTEGER DEFAULT 0;
             -- 섭등 후 회차 중 봇 기록 이전 진행분 (/섭등회차 n 으로 보정)
             ALTER TABLE counseling_chats ADD COLUMN IF NOT EXISTS seop_meeting_base INTEGER DEFAULT 0;
+            -- 마지막 만남 보고서의 진행 내역(누적), 다음 보고서 양식에 미리 채움
+            ALTER TABLE counseling_chats ADD COLUMN IF NOT EXISTS progress_history TEXT;
             CREATE TABLE IF NOT EXISTS meeting_events (
                 id SERIAL PRIMARY KEY,
                 chat_id TEXT NOT NULL,
@@ -338,6 +342,7 @@ interface ChatRecord {
     drop_ack_at?: string | null;
     stop_phase?: string | null;
     stopped_at?: string | null;
+    progress_history?: string | null; // 마지막 만남 보고서의 진행 내역(누적)
     interview_contact?: string | null;
     student_dropped_at?: string | null;
     student_hab_date?: string | null; // 행정 단계 완료일 (YYYY-MM-DD)
@@ -3578,7 +3583,8 @@ function fillMeetingReportTemplate(c?: ChatRecord | null): string {
     const count = c.teacher_meeting_count ?? 0;
     // 만남일이 아직 안 지났고 이미 누적된 회차가 있으면 이번 보고서는 수정본 → 회차 유지
     const round = isYmd(c.meeting_date) && c.meeting_date > dayjs().tz('Asia/Seoul').format('YYYY-MM-DD') && count > 0 ? count : count + 1;
-    return fillTemplate(MEETING_REPORT_TEMPLATE, c, round);
+    const filled = fillTemplate(MEETING_REPORT_TEMPLATE, c, round);
+    return c.progress_history ? fillProgressHistory(filled, c.progress_history) : filled;
 }
 
 // 양식의 '▪️항목 : ' 줄 뒤에 이 방 정보를 채움 (보고서·피드백 양식 공통)
@@ -6441,6 +6447,10 @@ async function handleIncomingText(ctx: any, rawText: string, source: 'text' | 'c
             );
             return;
         }
+
+        // 진행 내역(누적)을 남겨 다음 보고서 양식에 이어 씀 (수정본이면 덮어씀)
+        const history = extractProgressHistory(text);
+        if (history) await updateChat(chatId, { progress_history: history });
 
         // 만남일이 다음 일정으로 바뀌기 전에 이번 만남을 누적
         const meeting = await recordTeacherMeeting(ctx, chatId);

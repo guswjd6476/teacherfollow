@@ -134,6 +134,30 @@ export function extractReportField(text: string, label: RegExp): string | null {
     return body.join('\n').trim();
 }
 
+// 만남 보고서의 '진행 내역(누적)' 내용 (머리의 '(누적)'과 내용 없는 번호 줄은 뺌), 비었으면 null
+export function extractProgressHistory(text: string): string | null {
+    const v = extractReportField(text, /진행\s*내역/);
+    if (isBlankReportField(v)) return null;
+    return v!
+        .replace(/^\(누적\)\s*/, '')
+        .split('\n')
+        .filter((l) => !/^\s*\d+\s*[.)]\s*$/.test(l))
+        .join('\n')
+        .trim();
+}
+
+// 양식의 '진행 내역(누적)' 아래 빈 번호 줄을 지난 내역 + 다음 번호 빈 줄로 바꿈
+export function fillProgressHistory(template: string, history: string): string {
+    const lines = template.split('\n');
+    const i = lines.findIndex((l) => /진행\s*내역/.test(l));
+    if (i < 0) return template;
+    let end = i + 1;
+    while (end < lines.length && /^\s*\d+\s*[.)]/.test(lines[end])) end++;
+    const nums = [...history.matchAll(/^\s*(\d+)\s*[.)]/gm)].map((m) => Number(m[1]));
+    const next = (nums.length ? Math.max(...nums) : 0) + 1;
+    return [...lines.slice(0, i + 1), history, `${next}. `, ...lines.slice(end)].join('\n');
+}
+
 // 괄호 안내문구·번호(1. 2.)·기호만 있으면 빈칸으로 간주
 export function isBlankReportField(value: string | null): boolean {
     if (value === null) return true;
