@@ -1753,6 +1753,40 @@ function defaultRegionGoals(month: number): Record<string, Record<string, string
     };
 }
 
+// 섭 주간: 주차별 목표에서 섭 목표가 처음 잡히는 주 (지금 계획으로 5주차)
+const SEOP_WEEK_IDX = Number(Object.keys(GOAL_WEEK_WEIGHTS).find((k) => GOAL_WEEK_WEIGHTS[Number(k)].섭));
+
+// 오늘이 섭 주간인 개강 월 → 그 주 기간 (예: 11 → '10/27~11/02'). 진행 안내가 동기 함수라 하루 한 번 읽어 둔다
+let seopWeekMonths = new Map<number, string>();
+let seopWeekLoadedOn = '';
+async function loadSeopWeekMonths(today: dayjs.Dayjs) {
+    const todayStr = today.format('YYYY-MM-DD');
+    if (seopWeekLoadedOn === todayStr) return;
+    const months = Array.from({ length: 6 }, (_, i) => today.startOf('month').add(i - 2, 'month'));
+    try {
+        const res = await neonPool.query(
+            `SELECT year, month, week_count, to_char(week1_start, 'YYYY-MM-DD') AS week1_start
+             FROM month_settings WHERE (year, month) IN (${months.map((_, i) => `($${i * 2 + 1}::int, $${i * 2 + 2}::int)`).join(', ')})`,
+            months.flatMap((m) => [m.year(), m.month() + 1])
+        );
+        const next = new Map<number, string>();
+        for (const m of months) {
+            const year = m.year();
+            const month = m.month() + 1;
+            const row = res.rows.find((r) => r.year === year && r.month === month);
+            const weekCount: number = row?.week_count ?? defaultWeekCount(year, month);
+            if (SEOP_WEEK_IDX >= weekCount) continue;
+            const start = dayjs(row?.week1_start ?? defaultWeek1Start(year, month)).add(SEOP_WEEK_IDX * 7, 'day');
+            if (!today.isBefore(start) && today.isBefore(start.add(7, 'day')))
+                next.set(month, `${start.format('MM/DD')}~${start.add(6, 'day').format('MM/DD')}`);
+        }
+        seopWeekMonths = next;
+        seopWeekLoadedOn = todayStr;
+    } catch (err: unknown) {
+        console.error('[섭 주간 조회 실패]:', getErrorMessage(err));
+    }
+}
+
 // 개강 주차 기본값 (웹 getDefaultWeekCount / getDefaultWeek1Start와 같은 계산)
 const defaultWeekCount = (year: number, month: number) => (year < 2025 || (year === 2025 && month <= 8) ? 5 : 8);
 function defaultWeek1Start(year: number, month: number): string {
@@ -2087,7 +2121,7 @@ function isStoppedNotDropped(c: ChatRecord): boolean {
 const SUMMARY_SKIP_NUDGES = new Set(['no_post', 'report_late']);
 
 // 크론에서 호출: 지역 담당방마다 하루 요약 (오전 10시 'morning' / 밤 10시 'night', 각각 하루 한 번)
-// - 오전: 오늘 만남 · 보고서 미제출 · 교사 만남 미배정 · 확인 필요
+// - 오전: 오늘 만남 · 오늘 합등 예정 · 보고서 미제출 · 교사 만남 미배정 · 확인 필요
 // - 밤: (맨 위) 이번 주 행정 결과 / 주간 목표 · 오늘 만남 중 보고서 미제출 · 이전 만남 미제출 · 교사 만남 미배정 · 확인 필요 · 내일 만남
 // - 이름은 방 제목(가린 이름) 대신 매칭된 대상자 실명으로 표시
 //   (보고서가 제출되면 만남일이 다음 만남일로 바뀌므로, 밤에 만남일이 오늘인 방 = 아직 보고서가 안 올라온 방)
@@ -2098,6 +2132,7 @@ async function sendRegionDailySummaries(mode: 'morning' | 'night') {
     const metaKey = mode === 'morning' ? 'region_summary_sent' : 'region_night_summary_sent';
     const already = await neonPool.query(`SELECT value FROM bot_meta WHERE key = $1`, [metaKey]);
     if (already.rows[0]?.value === todayStr) return; // 같은 날 크론이 여러 번 호출돼도 한 번만
+    await loadSeopWeekMonths(today); // 확인 필요 항목(진행 안내)이 섭 주간을 본다
 
     const regionChats = await getRegionChats();
     // 청년회 전체 요약을 받을 사람 (웹 관리자 > 봇 설정, 개인 대화로 발송)
@@ -2195,6 +2230,17 @@ async function sendRegionDailySummaries(mode: 'morning' | 'night') {
             if (todayMeetings.length === 0 && overdue.length === 0 && waiting.length === 0 && needsCount === 0) continue;
             msg = `☀️ <b>[${regionName} 오늘의 요약] ${dayLabel(today)}</b>\n━━━━━━━━━━━━━━━━━━\n\n`;
             msg += `🗓 <b>오늘 만남: ${todayMeetings.length}건</b>\n` + todayMeetings.map(meetingLine).join('');
+            // 오늘 합등 예정: 교사 만남을 하면 합등이 되므로, 오늘 교사 만남인 합 전 대상자 (웹 '이번 주 합등 예정'과 같은 기준)
+            const todayHap = todayMeetings.filter(
+                (c) =>
+                    c.meeting_type === '교사' &&
+                    !!c.matched_member_id &&
+                    !c.student_dropped_at &&
+                    !String(c.student_stage ?? '').includes('탈락') &&
+                    !c.student_hab_date &&
+                    !isHapOrAbove(c)
+            );
+            msg += `\n🎯 <b>오늘 합등 예정: ${todayHap.length}건</b>\n` + todayHap.map(meetingLine).join('');
             msg += `\n⚠️ <b>보고서 미제출: ${overdue.length}건</b>\n` + overdueText;
             msg += waitingText + needsText;
         } else {
@@ -2669,6 +2715,8 @@ function getRoomNudge(c: ChatRecord, today: dayjs.Dayjs, todayStr: string): Room
 
 // 행정 등록 누락: 교사 만남이 이만큼 쌓였는데 행정이 아직 발·찾이거나 교사가 지정되지 않음
 const ADMIN_MISSING_MEETINGS = 2;
+// 합 단계에서 교사 만남이 이만큼이면 섭등목표일 등록을 안내
+const SEOP_GOAL_MEETINGS = 2;
 // 단계 정체: 이 날수 넘게 행정 단계가 그대로면 다음 단계 계획을 묻는다
 const STAGE_STALL_DAYS: Record<string, number> = { 합: 14, 섭: 21, 복: 21 };
 
@@ -2692,14 +2740,41 @@ function getProgressNudge(c: ChatRecord, today: dayjs.Dayjs): RoomNudge | null {
         };
     }
 
+    // 진행 구분 목표일(섭등목표 등)을 앞으로 잡아 두었으면 계획이 있는 것으로 봄
+    const planned = getStageDate(c.progress_note);
+    const hasPlan = !!c.progress_stage && !!planned && !planned.isBefore(today);
+
+    // 합 단계인데 섭등목표일이 없음: 목표월 개강의 섭 주간이면 모두, 아니면 교사 만남 2회 이상
+    const needsSeopGoal = getStudentStageRank(stage) === 2 && !c.student_seop_date && !hasPlan;
+    const targetMonth = getTargetMonthNumber(c.student_target);
+    const seopWeek = targetMonth ? seopWeekMonths.get(targetMonth) : undefined;
+    if (needsSeopGoal && seopWeek) {
+        return {
+            key: 'seop_week',
+            label: '섭 주간 섭등목표 미등록',
+            text:
+                `📌 <b>[섭등목표 등록 안내]</b>${who}\n` +
+                `이번 주(${seopWeek})는 <b>${targetMonth}월 개강 섭등 주간</b>입니다.\n` +
+                `합등 대상자의 섭등 목표일을 <code>/섭등목표 MM-DD</code>로 등록해 주세요.`,
+        };
+    }
+    if (needsSeopGoal && count >= SEOP_GOAL_MEETINGS) {
+        return {
+            key: 'seop_goal',
+            label: `상담 ${SEOP_GOAL_MEETINGS}회 이상 섭등목표 미등록`,
+            text:
+                `📌 <b>[섭등목표 등록 안내]</b>${who}\n` +
+                `교사 만남이 <b>${count}회</b> 진행되었습니다.\n` +
+                `섭등 목표일을 <code>/섭등목표 MM-DD</code>로 등록해 주세요.`,
+        };
+    }
+
     const stallDays = STAGE_STALL_DAYS[stage];
     const since = stage === '합' ? c.student_hab_date : stage === '섭' ? c.student_seop_date : stage === '복' ? c.student_bok_date : null;
     if (!stallDays || !isYmd(since)) return null;
     const days = today.diff(dayjs(since), 'day');
     if (days < stallDays) return null;
-    // 진행 구분 목표일(섭등목표 등)을 앞으로 잡아 두었으면 계획이 있는 것으로 봄
-    const planned = getStageDate(c.progress_note);
-    if (c.progress_stage && planned && !planned.isBefore(today)) return null;
+    if (hasPlan) return null;
     const next = { 합: '섭등', 섭: '복등', 복: '예정' }[stage as '합' | '섭' | '복'];
     const hint =
         stage === '합'
@@ -6490,6 +6565,7 @@ async function triggerMorningReminder() {
 
     try {
     const today = dayjs().tz('Asia/Seoul').startOf('day');
+    await loadSeopWeekMonths(today);
     const chats = await getAllChats();
     const regionChats = await getRegionChats();
 
