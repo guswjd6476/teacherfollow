@@ -2414,7 +2414,8 @@ bot.hears(/^[\/!](start|help|도움말)(?:@\w+)?$/i, async (ctx) => {
             '• <b>만남 전 피드백 양식</b>: <code>/피드백양식</code>\n' +
             '• <b>현재 방 상태 확인</b>: <code>/상태확인</code>\n' +
             '• <b>행정 등록 확인</b>: <code>/행정확인</code>\n' +
-            '• <b>목표월 수정</b>: <code>/목표월수정 n월</code>\n\n' +
+            '• <b>목표월 수정</b>: <code>/목표월수정 n월</code>\n' +
+            '• <b>단계향상표 보기</b>: <code>/단계향상표</code>\n\n' +
             '<b>2. 인터뷰 만남 단계</b>\n' +
             '• <b>사전 보고서 등록</b>: 채팅방에 <code>[인터뷰 사전 보고서]</code> 양식 전송\n' +
             '• <b>사전 보고서 양식</b>: <code>/인터뷰사전양식</code>\n' +
@@ -4056,6 +4057,42 @@ bot.hears(/^[\/!]목표월(?:\s*(?:수정|변경|설정))?(?:@\w+)?(?:\s+(.+))?$
         await replyError(ctx, '목표월 수정', err);
     }
 });
+
+// 단계향상표 사진 (/단계향상표). 사진은 관리자가 봇에 사진 + 설명글 /단계향상표등록 으로 바꾼다 (텔레그램 file_id를 bot_meta에 저장)
+const STAGE_CHART_KEY = 'stage_chart_photo';
+const STAGE_CHART_REGISTER = /^[\/!]단계향상표\s*등록(?:@\w+)?\s*$/i;
+bot.hears(/^[\/!]단계향상표(?:@\w+)?$/i, async (ctx) => {
+    try {
+        const res = await neonPool.query(`SELECT value FROM bot_meta WHERE key = $1`, [STAGE_CHART_KEY]);
+        const fileId = res.rows[0]?.value;
+        if (!fileId) {
+            await ctx.reply('아직 등록된 단계향상표가 없습니다. 관리자가 사진에 설명글 /단계향상표등록 을 붙여 보내면 등록됩니다.');
+            return;
+        }
+        await ctx.replyWithPhoto(fileId);
+    } catch (err: unknown) {
+        console.error('[/단계향상표 에러]:', err);
+        await replyError(ctx, '단계향상표', err);
+    }
+});
+
+async function registerStageChart(ctx: any) {
+    if (!isAdmin(ctx.from?.id)) {
+        await ctx.reply('⛔ 단계향상표는 관리자만 바꿀 수 있습니다.');
+        return;
+    }
+    const photos = (ctx.message as any)?.photo as { file_id: string }[] | undefined;
+    if (!photos?.length) {
+        await ctx.reply('사진(파일이 아닌 사진)으로 보내 주세요.');
+        return;
+    }
+    // 텔레그램은 크기별로 여러 장을 주고 마지막이 가장 크다
+    await neonPool.query(
+        `INSERT INTO bot_meta (key, value) VALUES ($1, $2) ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value`,
+        [STAGE_CHART_KEY, photos[photos.length - 1].file_id]
+    );
+    await ctx.reply('✅ 단계향상표를 등록했습니다. 이제 /단계향상표 로 볼 수 있습니다.');
+}
 
 // 개별 방 상태 확인 (/상태확인)
 bot.hears(/^[\/!](?:상태확인|status)(?:@\w+)?$/i, (ctx) => showStatus(ctx));
@@ -6527,6 +6564,15 @@ bot.on('text', (ctx) => {
 bot.on(['photo', 'document', 'video'], async (ctx) => {
     const caption: string | undefined = (ctx.message as any)?.caption;
     if (!caption) return;
+    if (STAGE_CHART_REGISTER.test(caption.trim())) {
+        try {
+            await registerStageChart(ctx);
+        } catch (err: unknown) {
+            console.error('[/단계향상표등록 에러]:', err);
+            await replyError(ctx, '단계향상표 등록', err);
+        }
+        return;
+    }
     await handleIncomingText(ctx, caption, 'caption');
 });
 
