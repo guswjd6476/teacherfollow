@@ -2571,7 +2571,7 @@ bot.hears(/^(?:[\/!]?관리자\s+)(봇\s*상태|상태\s*점검|설정\s*점검)
     msg += `• 관리자: ${ADMIN_IDS.length}명\n`;
     msg += `• BOT_NOTIFY_SECRET (웹 최초등록 알림): ${yesNo(process.env.BOT_NOTIFY_SECRET)}\n`;
     msg += `• CRON_SECRET (알림 주소 보호): ${yesNo(process.env.CRON_SECRET)}\n`;
-    msg += `• WEBHOOK_SECRET: ${process.env.WEBHOOK_SECRET ? '✅ 직접 설정' : '✅ 자동 (봇 토큰에서 생성)'}\n`;
+    msg += `• WEBHOOK_SECRET: ${process.env.WEBHOOK_SECRET ? '✅ 설정됨' : '❌ 없음'}\n`;
     msg += `• WEEKLY_REPORT_CHAT_ID (주간 요약 받는 곳): ${
         process.env.WEEKLY_REPORT_CHAT_ID ? '✅ 설정됨' : 'ℹ️ 없음 (관리자에게 발송)'
     }\n\n`;
