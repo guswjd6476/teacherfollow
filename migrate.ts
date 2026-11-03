@@ -31,7 +31,7 @@ if (!dbUrl) {
 
 const pool = new Pool({
     connectionString: dbUrl,
-    ssl: { rejectUnauthorized: false },
+    ssl: { rejectUnauthorized: true },
 });
 
 async function runMigration() {

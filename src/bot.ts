@@ -33,11 +33,10 @@ if (!BOT_TOKEN) {
 }
 
 // 웹훅 비밀값: 텔레그램이 보낸 요청에만 붙는 헤더로, 없거나 다르면 거절 (웹훅 주소로 가짜 업데이트를 보내는 것 방지)
-// WEBHOOK_SECRET을 지정하지 않으면 봇 토큰에서 만들어 사용 (토큰을 모르면 알 수 없음)
-const WEBHOOK_SECRET =
-    process.env.WEBHOOK_SECRET || crypto.createHash('sha256').update(`webhook:${BOT_TOKEN}`).digest('hex');
-if (!/^[A-Za-z0-9_-]{1,256}$/.test(WEBHOOK_SECRET)) {
-    console.error('❌ WEBHOOK_SECRET은 영문·숫자·_·- 로 된 1~256자여야 합니다.');
+// 토큰과 따로 정해야 한다 (예전처럼 토큰에서 만들면 토큰이 새면 비밀값도 같이 샌다). 32자 이상
+const WEBHOOK_SECRET = process.env.WEBHOOK_SECRET ?? '';
+if (!/^[A-Za-z0-9_-]{32,256}$/.test(WEBHOOK_SECRET)) {
+    console.error('❌ WEBHOOK_SECRET을 영문·숫자·_·- 로 된 32~256자로 설정해주세요. (예: openssl rand -hex 32)');
     process.exit(1);
 }
 
@@ -50,7 +49,7 @@ if (!DB_URL) {
 // Neon PostgreSQL 연결 풀 설정
 const neonPool = new Pool({
     connectionString: DB_URL,
-    ssl: { rejectUnauthorized: false },
+    ssl: { rejectUnauthorized: true }, // 인증서 확인 (가로채기 방지)
     max: 10,
     idleTimeoutMillis: 30000,
 });
