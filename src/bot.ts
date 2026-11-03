@@ -954,6 +954,47 @@ const AUTH_REQUEST_KEYBOARD = {
     reply_markup: { inline_keyboard: [[{ text: '🔐 인증 요청하기', callback_data: 'auth_request' }]] },
 };
 
+// 시다봇 취합 방(/취합) 전달 — 시다봇을 방에 따로 초대하지 않도록 이 봇이 받은 단체방 글을 시다봇 서버로 넘김.
+// 시다봇이 처리해서 보낼 답(메시지·👍)을 돌려주면 이 봇이 보냄. 시다봇 주소·비밀값·등록된 방은 같은 DB(cdabot_relay·cdabot_rooms)에서 읽음 — 설정 불필요.
+// 이 봇으로 등록된 취합 방의 글은 상담방으로 처리하지 않고 넘기기만, 다른 방은 /취합 명령만 넘김 (방등록용)
+// (중복확인은 시다봇이 방에 직접 들어가서 함). 시다봇 테이블이 없으면 꺼진 상태
+const CDABOT_COMMAND = /^[\/!]취합(?:@\w+)?(?:\s|$)/;
+const CDABOT_METHODS = new Set(['sendMessage', 'setMessageReaction']);
+let cdabot: { at: number; load: Promise<{ url: string; secret: string; rooms: Set<string> } | null> } | null = null;
+bot.use(async (ctx, next) => {
+    const text = (ctx.message as Record<string, any> | undefined)?.text;
+    if (!ctx.chat || ctx.chat.type === 'private' || typeof text !== 'string') return next();
+    const command = CDABOT_COMMAND.test(text);
+    // 10분마다 다시 읽음 (시다봇을 나중에 배포해도 재시작 없이 켜짐)
+    if (!cdabot || Date.now() - cdabot.at > 10 * 60_000) {
+        const load = Promise.all([
+            neonPool.query(`SELECT url, secret FROM cdabot_relay WHERE id = 1;`),
+            neonPool.query(`SELECT chat_id::text AS id FROM cdabot_rooms WHERE relay;`),
+        ])
+            .then(([r, rooms]) => (r.rows[0] ? { url: r.rows[0].url, secret: r.rows[0].secret, rooms: new Set(rooms.rows.map((x: { id: string }) => x.id)) } : null))
+            .catch(() => null);
+        cdabot = { at: Date.now(), load };
+    }
+    const relay = await cdabot.load;
+    if (!relay || (!command && !relay.rooms.has(String(ctx.chat.id)))) return next();
+    try {
+        const res = await fetch(relay.url, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', 'x-relay-secret': relay.secret },
+            body: JSON.stringify(ctx.update),
+            signal: AbortSignal.timeout(15_000),
+        });
+        if (!res.ok) throw new Error(`시다봇 응답 ${res.status}`);
+        for (const a of (await res.json()) as { method: string; payload: Record<string, unknown> }[]) {
+            if (!CDABOT_METHODS.has(a.method)) continue;
+            await (ctx.telegram as any).callApi(a.method, { ...a.payload, chat_id: ctx.chat.id }).catch((err: unknown) => console.error('[시다봇 답 전송 실패]:', getErrorMessage(err)));
+        }
+    } catch (err: unknown) {
+        console.error('[시다봇 전달 실패]:', getErrorMessage(err));
+    }
+    if (command) cdabot = null; // 방등록·해제 반영
+});
+
 bot.use(async (ctx, next) => {
     const chat = ctx.chat;
     // 봇 초대/퇴장 이벤트는 my_chat_member 핸들러에서 초대한 사람을 직접 확인
