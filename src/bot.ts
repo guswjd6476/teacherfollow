@@ -954,29 +954,28 @@ const AUTH_REQUEST_KEYBOARD = {
     reply_markup: { inline_keyboard: [[{ text: '🔐 인증 요청하기', callback_data: 'auth_request' }]] },
 };
 
-// 시다봇 취합 방(/취합) 전달 — 시다봇을 방에 따로 초대하지 않도록 이 봇이 받은 단체방 글을 시다봇 서버로 넘김.
-// 시다봇이 처리해서 보낼 답(메시지·👍)을 돌려주면 이 봇이 보냄. 시다봇 주소·비밀값·등록된 방은 같은 DB(cdabot_relay·cdabot_rooms)에서 읽음 — 설정 불필요.
-// 이 봇으로 등록된 취합 방의 글은 상담방으로 처리하지 않고 넘기기만, 다른 방은 /취합 명령만 넘김 (방등록용)
-// (중복확인은 시다봇이 방에 직접 들어가서 함). 시다봇 테이블이 없으면 꺼진 상태
+// 시다봇 취합 전달 — 지역 담당방의 '#주제 #지역 내용' 글과 1:1 대화의 /취합 을 시다봇 서버로 넘김 (시다봇을 방에 초대하지 않도록).
+// 시다봇이 처리해서 보낼 답(👍·취합 결과)을 돌려주면 이 봇이 보냄. 시다봇 주소·비밀값은 같은 DB(cdabot_relay)에서 읽음 — 설정 불필요.
+// 지역 담당방 글은 넘긴 뒤 원래대로 계속 처리. 시다봇 테이블이 없으면 꺼진 상태. (중복확인은 시다봇이 방에 직접 들어가서 함)
 const CDABOT_COMMAND = /^[\/!]취합(?:@\w+)?(?:\s|$)/;
 const CDABOT_METHODS = new Set(['sendMessage', 'setMessageReaction']);
-let cdabot: { at: number; load: Promise<{ url: string; secret: string; rooms: Set<string> } | null> } | null = null;
+let cdabot: { at: number; load: Promise<{ url: string; secret: string } | null> } | null = null;
 bot.use(async (ctx, next) => {
     const text = (ctx.message as Record<string, any> | undefined)?.text;
-    if (!ctx.chat || ctx.chat.type === 'private' || typeof text !== 'string') return next();
-    const command = CDABOT_COMMAND.test(text);
+    if (!ctx.chat || typeof text !== 'string') return next();
+    const isPrivate = ctx.chat.type === 'private';
+    // 1:1 은 /취합 만, 단체방은 태그가 두 개 이상인 지역 담당방 글만
+    if (isPrivate ? !CDABOT_COMMAND.test(text) : !/#\S+[\s\S]*#\S+/.test(text) || !(await isRegionChat(ctx.chat.id))) return next();
     // 10분마다 다시 읽음 (시다봇을 나중에 배포해도 재시작 없이 켜짐)
     if (!cdabot || Date.now() - cdabot.at > 10 * 60_000) {
-        const load = Promise.all([
-            neonPool.query(`SELECT url, secret FROM cdabot_relay WHERE id = 1;`),
-            neonPool.query(`SELECT chat_id::text AS id FROM cdabot_rooms WHERE relay;`),
-        ])
-            .then(([r, rooms]) => (r.rows[0] ? { url: r.rows[0].url, secret: r.rows[0].secret, rooms: new Set(rooms.rows.map((x: { id: string }) => x.id)) } : null))
+        const load = neonPool
+            .query(`SELECT url, secret FROM cdabot_relay WHERE id = 1;`)
+            .then((r) => (r.rows[0] ? { url: r.rows[0].url as string, secret: r.rows[0].secret as string } : null))
             .catch(() => null);
         cdabot = { at: Date.now(), load };
     }
     const relay = await cdabot.load;
-    if (!relay || (!command && !relay.rooms.has(String(ctx.chat.id)))) return next();
+    if (!relay) return next();
     try {
         const res = await fetch(relay.url, {
             method: 'POST',
@@ -992,7 +991,7 @@ bot.use(async (ctx, next) => {
     } catch (err: unknown) {
         console.error('[시다봇 전달 실패]:', getErrorMessage(err));
     }
-    if (command) cdabot = null; // 방등록·해제 반영
+    if (!isPrivate) return next();
 });
 
 bot.use(async (ctx, next) => {
