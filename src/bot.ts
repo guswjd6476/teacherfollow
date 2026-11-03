@@ -398,6 +398,17 @@ async function findMemberFromDB(name: string, region: string, teamRaw: string) {
 }
 
 // 교사 표시 ('이름 (지역 구역)') — students."교사_고유번호" → members 조인 결과 사용
+// 명단 한 줄: 현행정/이름/인도자지역/인도자팀/인도자이름/교사지역/교사팀/교사이름 (행정에 옮기기 편한 형식)
+// first: 첫 칸을 단계 대신 다른 말로 (예: 탈락 처리할 명단이면 '탈락'), 미매칭 방은 이름 칸에 방 제목
+type PersonRow = Partial<
+    Pick<ChatRecord, 'matched_student_name' | 'student_stage' | 'room_title' | 'guide_name' | 'guide_region' | 'guide_district' | 'teacher_name' | 'teacher_region' | 'teacher_district'>
+>;
+function personLine(r: PersonRow, first?: string): string {
+    const name = r.matched_student_name ? `<b>${escapeHtml(r.matched_student_name)}</b>` : `${escapeHtml(r.room_title || '대화방')}(미매칭)`;
+    const cells = [r.guide_region, r.guide_district, r.guide_name, r.teacher_region, r.teacher_district, r.teacher_name].map((v) => escapeHtml(v || ''));
+    return [escapeHtml(first ?? (String(r.student_stage ?? '').trim() || '-')), name, ...cells].join('/');
+}
+
 function teacherText(row: { teacher_name?: string | null; teacher_region?: string | null; teacher_district?: string | null }): string {
     if (!row.teacher_name) return '미등록';
     const where = [row.teacher_region, row.teacher_district].filter(Boolean).join(' ');
@@ -1604,7 +1615,7 @@ async function getMeetingEvents(from: dayjs.Dayjs, to: dayjs.Dayjs): Promise<Mee
         `SELECT
             e.category, e.source, e.occurred_at,
             c.room_title,
-            s."이름" AS matched_student_name,
+            s."이름" AS matched_student_name, s."단계" AS student_stage,
             m."이름" AS guide_name, m."지역" AS guide_region, m."구역" AS guide_district,
             t."이름" AS teacher_name, t."지역" AS teacher_region, t."구역" AS teacher_district
          FROM meeting_events e
@@ -1620,15 +1631,9 @@ async function getMeetingEvents(from: dayjs.Dayjs, to: dayjs.Dayjs): Promise<Mee
 }
 
 function meetingEventLine(e: MeetingEvent, withDate = true): string {
-    const guideWhere = [e.guide_region, e.guide_district].filter(Boolean).join(' ');
     return (
-        `• ${withDate ? `${dayjs(e.occurred_at).tz('Asia/Seoul').format('MM/DD')} ` : ''}` +
-        // 실명이 있으면 실명만 (방 제목은 이름을 가려 둔 경우가 많음), 없으면 방 제목
-        (e.matched_student_name
-            ? `<b>${escapeHtml(e.matched_student_name)}</b>`
-            : `${escapeHtml(e.room_title || '이름 없음')} <i>(미매칭)</i>`) +
-        ` · 인도자 ${escapeHtml(e.guide_name || '-')}${guideWhere ? `(${escapeHtml(guideWhere)})` : ''}` +
-        (e.category === '교사매칭' ? ` · 교사 ${teacherText(e)}` : '') +
+        `• ${personLine(e)}` +
+        (withDate ? ` · ${dayjs(e.occurred_at).tz('Asia/Seoul').format('MM/DD')}` : '') +
         (e.source.endsWith('후속') ? ` · <i>${escapeHtml(e.source.replace(/후속$/, ''))} 후속</i>` : '') +
         `\n`
     );
@@ -2157,9 +2162,7 @@ async function sendRegionDailySummaries(mode: 'morning' | 'night') {
     const regionsByChat = new Map<string, string[]>();
     for (const rc of regionChats) regionsByChat.set(rc.chat_id, [...(regionsByChat.get(rc.chat_id) || []), rc.region]);
 
-    const line = (c: ChatRecord) =>
-        `• ${c.matched_student_name ? `<b>${escapeHtml(c.matched_student_name)}</b>` : `${escapeHtml(c.room_title || '대화방')} <i>(미매칭)</i>`}` +
-        ` · 인도자 ${escapeHtml(c.guide_name || '-')} · 교사 ${escapeHtml(c.teacher_name || '-')}`;
+    const line = (c: ChatRecord, first?: string) => `• ${personLine(c, first)}`;
     const MAX_LINES = 20;
     const listText = (lines: string[]) =>
         lines.slice(0, MAX_LINES).join('') + (lines.length > MAX_LINES ? `…외 ${lines.length - MAX_LINES}건\n` : '');
@@ -2225,7 +2228,7 @@ async function sendRegionDailySummaries(mode: 'morning' | 'night') {
                 : `\n🗂 <b>행정 탈락 처리 확인: ${notDropped.length}건</b> <i>(봇에서 중단, 행정은 진행 중)</i>\n` +
                   listText(
                       notDropped.map(
-                          (c) => `${line(c)} · ${escapeHtml([c.stop_phase, c.stop_category].filter(Boolean).join(' · ') || '중단')}\n`
+                          (c) => `${line(c, '탈락')} · ${escapeHtml([c.stop_phase, c.stop_category].filter(Boolean).join(' · ') || '중단')}\n`
                       )
                   );
 
@@ -4654,9 +4657,6 @@ bot.hears(/^(?:[\/!]?관리자\s+)(인터뷰|인터뷰예정|인터뷰목록|인
             `━━━━━━━━━━━━━━━━━━\n\n`;
 
         await sendChunkedList(ctx, header, interviewChats, (chat, idx) => {
-            const studentName = chat.matched_student_name
-                ? `👤 <b>${escapeHtml(chat.matched_student_name)}</b>`
-                : '미매칭';
             const interviewer = chat.interviewer_info ? escapeHtml(chat.interviewer_info) : '⚠️ 미등록';
             const typer = chat.typer_info ? escapeHtml(chat.typer_info) : '미지정';
 
@@ -4671,13 +4671,10 @@ bot.hears(/^(?:[\/!]?관리자\s+)(인터뷰|인터뷰예정|인터뷰목록|인
             }
 
             return (
-                `<b>${idx}. ${studentName}</b> [${escapeHtml(chat.room_title || '대화방')}]\n` +
+                `${idx}. ${personLine(chat)}\n` +
                 `   • 인터뷰일: <b>${dateDisplay}</b>\n` +
                 `   • 인터뷰어: ${interviewer}\n` +
-                `   • 타이퍼: ${typer}\n` +
-                `   • 담당인도자: ${escapeHtml(chat.guide_name || '-')} (${escapeHtml(
-                    chat.guide_region || ''
-                )} ${escapeHtml(chat.guide_district || '')})\n\n`
+                `   • 타이퍼: ${typer}\n\n`
             );
         });
     } catch (err: unknown) {
@@ -4717,9 +4714,6 @@ bot.hears(/^(?:[\/!]?관리자\s+)(교사|교사만남|교사목록|교사건)$/
             `━━━━━━━━━━━━━━━━━━\n\n`;
 
         await sendChunkedList(ctx, header, teacherChats, (chat, idx) => {
-            const studentName = chat.matched_student_name
-                ? `👤 <b>${escapeHtml(chat.matched_student_name)}</b>`
-                : '미매칭';
             const feedbackBadge = chat.feedback_submitted ? '✅ 완료' : '❌ 미제출';
             const reportBadge = chat.report_submitted ? '✅ 완료' : '⏳ 대기';
             const stageBadge = chat.progress_stage ? ` [🏷 ${chat.progress_stage}]` : '';
@@ -4735,15 +4729,12 @@ bot.hears(/^(?:[\/!]?관리자\s+)(교사|교사만남|교사목록|교사건)$/
             }
 
             return (
-                `<b>${idx}. ${studentName}</b>${stageBadge} [${escapeHtml(chat.room_title || '대화방')}]\n` +
+                `${idx}. ${personLine(chat)}${stageBadge}\n` +
                 `   • 다음만남일: <b>${dateDisplay}</b>\n` +
                 `   • 누적 만남: <b>${chat.teacher_meeting_count ?? 0}회</b>${seopRoundText(
                     seopRounds.get(String(chat.chat_id)) ?? null
                 )}\n` +
-                `   • 사전피드백: ${feedbackBadge} / 만남보고서: ${reportBadge}\n` +
-                `   • 담당인도자: ${escapeHtml(chat.guide_name || '-')} (${escapeHtml(
-                    chat.guide_region || ''
-                )} ${escapeHtml(chat.guide_district || '')})\n\n`
+                `   • 사전피드백: ${feedbackBadge} / 만남보고서: ${reportBadge}\n\n`
             );
         });
     } catch (err: unknown) {
@@ -4782,7 +4773,6 @@ bot.hears(/^(?:[\/!]?관리자\s+)(동아리|동아리목록|동아리건|지역
             `━━━━━━━━━━━━━━━━━━\n\n`;
 
         await sendChunkedList(ctx, header, chats, (chat, idx) => {
-            const studentName = chat.matched_student_name ? `👤 <b>${escapeHtml(chat.matched_student_name)}</b>` : '미매칭';
             let dateDisplay = '미등록';
             if (chat.meeting_date === '미정') {
                 dateDisplay = '⚠️ 일정 미정';
@@ -4793,11 +4783,8 @@ bot.hears(/^(?:[\/!]?관리자\s+)(동아리|동아리목록|동아리건|지역
                 dateDisplay = `${formatMeetingWhen(mDate.format('YYYY-MM-DD'), chat.meeting_time)} (${dDayStr})`;
             }
             return (
-                `<b>${idx}. ${studentName}</b> [${escapeHtml(chat.room_title || '대화방')}]\n` +
-                `   • 다음 ${SCHEDULE_ONLY[kind].dateLabel}: <b>${dateDisplay}</b>\n` +
-                `   • 담당인도자: ${escapeHtml(chat.guide_name || '-')} (${escapeHtml(chat.guide_region || '')} ${escapeHtml(
-                    chat.guide_district || ''
-                )})\n\n`
+                `${idx}. ${personLine(chat)}\n` +
+                `   • 다음 ${SCHEDULE_ONLY[kind].dateLabel}: <b>${dateDisplay}</b>\n\n`
             );
         });
     } catch (err: unknown) {
@@ -4863,9 +4850,6 @@ bot.hears(
                     ? ` [${scheduleOnlyInfo(chat.meeting_type)!.icon} ${chat.meeting_type}]`
                     : ' [미선택]';
                 const stageBadge = chat.progress_stage ? ` [🏷 ${chat.progress_stage}]` : '';
-                const memberBadge = chat.matched_student_name
-                    ? ` (👤 ${escapeHtml(chat.matched_student_name)} / 인도자: ${escapeHtml(chat.guide_name || '-')})`
-                    : '';
 
                 let detailLine = '';
                 if (isInterview) {
@@ -4879,9 +4863,7 @@ bot.hears(
                 }
 
                 return (
-                    `<b>${idx}. ${escapeHtml(
-                        chat.room_title || '대화방'
-                    )}${memberBadge}${typeBadge}${stageBadge}</b>\n` +
+                    `${idx}. ${personLine(chat)}${typeBadge}${stageBadge}\n` +
                     (chat.meeting_time ? `   • 시간: <b>${escapeHtml(chat.meeting_time)}</b>\n` : '') +
                     detailLine +
                     `\n`
@@ -4935,11 +4917,10 @@ bot.hears(/^(?:[\/!]?관리자\s+)((?:만남\s*)?보고서\s*미제출|미제출
             const diffDays = today.diff(mDate, 'day');
 
             let delayBadge = diffDays === 0 ? '⏳ 당일 대기' : diffDays === 1 ? '⚠️ 1일 지연' : `🚨 ${diffDays}일 경과`;
-            const memberBadge = chat.matched_student_name ? ` (👤 ${escapeHtml(chat.matched_student_name)})` : '';
             const typeBadge = chat.meeting_type ? ` [${chat.meeting_type}]` : '';
 
             return (
-                `<b>${idx}. ${escapeHtml(chat.room_title || '대화방')}</b>${memberBadge}${typeBadge}\n` +
+                `${idx}. ${personLine(chat)}${typeBadge}\n` +
                 `   • 만남일: ${mDate.format('YYYY-MM-DD')} (${delayBadge})\n\n`
             );
         });
@@ -5098,12 +5079,10 @@ bot.hears(/^(?:[\/!]?관리자\s+)(미갱신\s*명단|미갱신|일정\s*미갱�
         await sendChunkedList(ctx, header, expiredChats, (chat, idx) => {
             const mDate = dayjs(chat.meeting_date).startOf('day');
             const diffDays = today.diff(mDate, 'day');
-            const memberBadge = chat.matched_student_name ? ` (👤 ${escapeHtml(chat.matched_student_name)})` : '';
             const typeBadge = chat.meeting_type ? ` [${chat.meeting_type}]` : '';
 
             return (
-                `<b>${idx}. ${escapeHtml(chat.room_title || '대화방')}</b>${memberBadge}${typeBadge}\n` +
-                `   • 교사: ${isOtherDeptTeacher(chat) && !chat.teacher_name ? '타부서 교사' : teacherText(chat)}\n` +
+                `${idx}. ${personLine(chat)}${typeBadge}${isOtherDeptTeacher(chat) && !chat.teacher_name ? ' (타부서 교사)' : ''}\n` +
                 `   • 지난 만남일: ${mDate.format('YYYY-MM-DD')} (${diffDays}일 경과)\n` +
                 `   • 마지막 대화: ${formatLastMessage(chat.last_message_at)}\n\n`
             );
@@ -5159,16 +5138,11 @@ bot.hears(/^(?:[\/!]?관리자\s+)(미초대|봇미초대|초대누락)$/i, asyn
             `━━━━━━━━━━━━━━━━━━\n\n`;
 
         await sendChunkedList(ctx, header, res.rows, (s: Record<string, any>, idx) => {
-            const guideInfo = s.guide_name
-                ? `${escapeHtml(s.guide_name)} (${escapeHtml(s.guide_region || '')} ${escapeHtml(s.guide_district || '')})`
-                : '미등록';
             // 현재 단계의 등록일 표시 (찾 → 찾_등록일, 합 → 합_등록일, 섭 → 섭_등록일)
             const stagePrefix = String(s['단계'] ?? '').trim().charAt(0);
             const regDate = getStageRegDate(s, stagePrefix);
             return (
-                `<b>${idx}. ${escapeHtml(s['이름'] || '이름 없음')}</b> [${escapeHtml(s['단계'] || '-')}]\n` +
-                `   • 인도자: ${guideInfo}\n` +
-                `   • 교사: ${teacherText(s)}\n` +
+                `${idx}. ${personLine({ ...s, matched_student_name: s['이름'] || '이름 없음', student_stage: s['단계'] })}\n` +
                 `   • ${escapeHtml(stagePrefix)}_등록일: ${regDate ? escapeHtml(regDate) : '미등록'}\n\n`
             );
         });
@@ -5274,8 +5248,7 @@ bot.hears(/^(?:[\/!]?관리자\s+)(인원\s*점검|필수\s*인원|방\s*인원|
             `• 개강 강사 (그 달 개강 합등 이상 방): ${lecturerText}\n` +
             `━━━━━━━━━━━━━━━━━━\n\n`;
         await sendChunkedList(ctx, header, problems, ({ chat, missing }, idx) =>
-            `<b>${idx}. ${escapeHtml(chat.room_title || chat.chat_id)}</b>` +
-            `${chat.matched_student_name ? ` · ${escapeHtml(chat.matched_student_name)} [${escapeHtml(chat.student_stage || '-')}] ${formatTargetMonth(chat.student_target)}` : ''}\n` +
+            `${idx}. ${personLine(chat)}${chat.matched_student_name ? ` · ${formatTargetMonth(chat.student_target)}` : ''}\n` +
             `   • 없음: ${missing.join(', ')}\n\n`
         );
     } catch (err: unknown) {
@@ -5321,9 +5294,8 @@ bot.hears(/^(?:[\/!]?관리자\s+)(중단\s*명단|중단|만남중단)$/i, asyn
             `━━━━━━━━━━━━━━━━━━\n\n`;
 
         await sendChunkedList(ctx, header, stoppedChats, (chat, idx) => {
-            const memberBadge = chat.matched_student_name ? ` (👤 ${escapeHtml(chat.matched_student_name)})` : '';
             return (
-                `<b>${idx}. ${escapeHtml(chat.room_title || '대화방')}</b>${memberBadge}\n` +
+                `${idx}. ${personLine(chat)}\n` +
                 `   • 중단 시점: <b>${escapeHtml(phaseOf(chat))}</b>\n` +
                 `   • 중단 사유: <b>${escapeHtml(chat.stop_reason || '사유 미입력')}</b>\n` +
                 `   • Chat ID: <code>${chat.chat_id}</code>\n\n`
@@ -5517,12 +5489,10 @@ bot.hears(/^(?:[\/!]?관리자\s+)(?:(\d{1,2})\s*월\s*)?(일반|일반방|미�
             let statusText = chat.meeting_date;
             if (!statusText) statusText = '미등록';
 
-            const memberBadge = chat.matched_student_name ? ` (👤 ${escapeHtml(chat.matched_student_name)})` : '';
-            const safeTitle = escapeHtml(chat.room_title || '대화방');
             const reportBadge = chat.report_submitted ? '✅ 완료' : '⏳ 대기';
 
             return (
-                `<b>${index}. ${safeTitle}</b>${memberBadge}\n` +
+                `${index}. ${personLine(chat)}\n` +
                 `   • 현재 상태: <b>${statusText}</b> (보고서: ${reportBadge})\n` +
                 (month ? '' : `   • 목표월: ${formatTargetMonth(chat.student_target)}\n`) +
                 `   • Chat ID: <code>${chat.chat_id}</code>\n\n`
