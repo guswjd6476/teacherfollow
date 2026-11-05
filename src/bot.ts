@@ -21,6 +21,17 @@ import {
     stripDatePart,
     weekDateOptions,
 } from './parse.js';
+import {
+    kindOfCode,
+    TARGET_CODES,
+    TARGET_KINDS,
+    targetAskText,
+    targetKindOfStage,
+    targetLine,
+    targetSummaryText,
+    type TargetKind,
+    type TargetPerson,
+} from './target.js';
 
 dayjs.extend(customParseFormat);
 dayjs.extend(utc);
@@ -109,6 +120,19 @@ async function initDb() {
             ALTER TABLE counseling_chats ADD COLUMN IF NOT EXISTS seop_meeting_base INTEGER DEFAULT 0;
             -- 마지막 만남 보고서의 진행 내역(누적), 다음 보고서 양식에 미리 채움
             ALTER TABLE counseling_chats ADD COLUMN IF NOT EXISTS progress_history TEXT;
+            -- 타겟 (단계별: 합등·섭등·복등). answer null = 물었지만 답 없음. target_month = 답할 때 목표월
+            CREATE TABLE IF NOT EXISTS student_targets (
+                student_id INTEGER NOT NULL,
+                kind VARCHAR(4) NOT NULL,
+                answer BOOLEAN,
+                target_month VARCHAR(20),
+                chat_id TEXT,
+                asked_at TIMESTAMPTZ,
+                ask_count INTEGER NOT NULL DEFAULT 0,
+                answered_at TIMESTAMPTZ,
+                answered_by TEXT,
+                PRIMARY KEY (student_id, kind)
+            );
             CREATE TABLE IF NOT EXISTS meeting_events (
                 id SERIAL PRIMARY KEY,
                 chat_id TEXT NOT NULL,
@@ -490,6 +514,7 @@ async function getChatRecord(chatId: string | number): Promise<ChatRecord | unde
         SELECT 
             c.*,
             s."이름" AS matched_student_name,
+            s.target AS student_target,
             s."단계" AS student_stage,
             s."탈락" AS student_dropped_at,
             to_char(s."합_완료일", 'YYYY-MM-DD') AS student_hab_date,
@@ -995,6 +1020,7 @@ bot.use(async (ctx, next) => {
 });
 
 bot.use(async (ctx, next) => {
+    maybeRunTargetChecks(); // 기다리지 않음 (3분에 한 번까지)
     const chat = ctx.chat;
     // 봇 초대/퇴장 이벤트는 my_chat_member 핸들러에서 초대한 사람을 직접 확인
     if (!chat || ctx.myChatMember) return next();
@@ -2472,6 +2498,7 @@ bot.hears(/^[\/!](start|help|도움말)(?:@\w+)?$/i, async (ctx) => {
             '• <b>만남 중단 처리</b>: <code>/만남중단 [상세 사유]</code> → 사유 버튼 선택\n' +
             '• <b>피드백 제출</b>: 메시지 내 <code>#피드백</code> 태그 포함\n' +
             '• <b>만남 보고서 양식</b>: <code>/만남보고서양식</code> 또는 <code>/교사만남양식</code>\n' +
+            '• <b>타겟</b>: <code>/타겟</code> (이 방 대상자의 합등·섭등·복등 타겟 상태 보기·정하기), 지역 담당방에서 <code>/타겟현황</code>\n' +
             '• <b>교사 만남 누적 회차</b>: <code>/교사만남회차</code> (보정: <code>/교사만남회차 총횟수</code>, 마지막 1회 취소: <code>/회차취소</code>)\n' +
             '• <b>섭등 후 회차</b>: <code>/섭등회차</code> (섭등일 만남 = 1회차, 보정: <code>/섭등회차 총횟수</code>)\n' +
             '   <i>(섭등 후 3회차부터 복등 전이면 보고서 반영 때 복등 안내, 3회차 때 지역 담당방에도 알림)</i>\n' +
@@ -6142,6 +6169,328 @@ bot.hears(/^[\/!](?:교사\s*만남\s*)?회차\s*취소(?:@\w+)?$/i, async (ctx)
     }
 });
 
+// ======================= 타겟 (합등·섭등·복등) =======================
+// - 행정 단계가 합·섭·복이 되면 상담방에 그 단계 타겟인지 한 번 묻는다 (기능을 켠 날 이후 그 단계가 된 학생만)
+// - 교사 만남 보고서가 새로 누적될 때마다 지금 단계 타겟이 아니면 다시 묻는다
+// - 목표월이 바뀌면 지역 담당방에 바뀐 건과 그 지역 현재 타겟 명단·건수를 알린다
+// 단계·목표월은 웹·봇 어디서 바꿔도 되도록 DB를 보고 찾는다 (봇에 업데이트가 올 때 3분에 한 번 + 오전·오후 10시)
+const REGION_NAMES = ['도봉', '성북', '노원', '중랑', '강북', '대학', '새신자', '이음'];
+const TARGET_PERSON_SQL = `
+    s.id AS student_id, s."이름" AS name, s."단계" AS stage, s.target AS target_month,
+    m."지역" AS guide_region, m."구역" AS guide_district, m."이름" AS guide_name,
+    t."지역" AS teacher_region, t."구역" AS teacher_district, t."이름" AS teacher_name`;
+
+const targetKeyboard = (kind: TargetKind, studentId: number | string) => ({
+    reply_markup: {
+        inline_keyboard: [
+            [
+                { text: `🎯 ${kind} 타겟으로`, callback_data: `tgt:y:${TARGET_CODES[kind]}:${studentId}` },
+                { text: '아니요', callback_data: `tgt:n:${TARGET_CODES[kind]}:${studentId}` },
+            ],
+        ],
+    },
+});
+
+async function getTargetAnswer(studentId: number | string, kind: TargetKind) {
+    const res = await neonPool.query(
+        `SELECT answer, asked_at FROM student_targets WHERE student_id = $1 AND kind = $2`,
+        [Number(studentId), kind]
+    );
+    return res.rows[0] as { answer: boolean | null; asked_at: Date | null } | undefined;
+}
+
+async function askTarget(
+    chatId: number | string,
+    p: { id: number | string; name: string | null; target: string | null },
+    kind: TargetKind,
+    reason: 'stage' | 'meeting' | 'manual',
+    previous?: boolean | null
+) {
+    await bot.telegram.sendMessage(
+        String(chatId),
+        targetAskText({ kind, name: p.name, targetMonth: formatTargetMonthOrNull(p.target), reason, previous }),
+        { parse_mode: 'HTML', ...targetKeyboard(kind, p.id) }
+    );
+    await neonPool.query(
+        `INSERT INTO student_targets (student_id, kind, chat_id, asked_at, ask_count) VALUES ($1, $2, $3, NOW(), 1)
+         ON CONFLICT (student_id, kind) DO UPDATE SET chat_id = EXCLUDED.chat_id, asked_at = NOW(),
+             ask_count = student_targets.ask_count + 1`,
+        [Number(p.id), kind, String(chatId)]
+    );
+}
+
+function formatTargetMonthOrNull(raw: unknown): string | null {
+    const v = formatTargetMonth(raw);
+    return v === '미설정' ? null : v;
+}
+
+// 만남 보고서가 새로 누적된 뒤: 지금 단계 타겟이 아니면 다시 묻는다 (방금 물었으면 건너뜀)
+async function askTargetAfterMeeting(chatId: number | string) {
+    try {
+        const record = await getChatRecord(chatId);
+        if (!record?.matched_member_id || record.student_dropped_at) return;
+        const kind = targetKindOfStage(record.student_stage);
+        if (!kind) return;
+        const prev = await getTargetAnswer(record.matched_member_id, kind);
+        if (prev?.answer === true) return;
+        if (prev?.asked_at && dayjs().diff(dayjs(prev.asked_at), 'minute') < 60 && prev.answer === null) return;
+        await askTarget(
+            chatId,
+            { id: record.matched_member_id, name: record.matched_student_name ?? null, target: record.student_target == null ? null : String(record.student_target) },
+            kind,
+            'meeting',
+            prev?.answer
+        );
+    } catch (err: unknown) {
+        console.error('[만남 후 타겟 확인 실패]:', getErrorMessage(err));
+    }
+}
+
+let targetChecksAt = 0;
+let targetChecksRunning = false;
+function maybeRunTargetChecks() {
+    if (targetChecksRunning || Date.now() - targetChecksAt < 3 * 60_000) return;
+    runTargetChecks().catch((err) => console.error('[타겟 점검 실패]:', getErrorMessage(err)));
+}
+
+async function runTargetChecks() {
+    if (targetChecksRunning) return;
+    targetChecksRunning = true;
+    targetChecksAt = Date.now();
+    try {
+        await checkStageTargets();
+        await checkTargetMonthChanges();
+    } finally {
+        targetChecksRunning = false;
+    }
+}
+
+// 합·섭·복이 막 된 학생에게 그 단계 타겟을 묻는다 (아직 묻지 않은 것만, 기능을 켠 날 이후 그 단계가 된 학생만)
+async function checkStageTargets() {
+    const since = await getOrInitMeta('target_since', () => dayjs().tz('Asia/Seoul').format('YYYY-MM-DD'));
+    const rows = (
+        await neonPool.query(
+            `SELECT DISTINCT ON (s.id) s.id, s."이름" AS name, s."단계" AS stage, s.target, c.chat_id,
+                    to_char(s."합_완료일", 'YYYY-MM-DD') AS "합등", to_char(s."섭_완료일", 'YYYY-MM-DD') AS "섭등",
+                    to_char(s."복_완료일", 'YYYY-MM-DD') AS "복등"
+             FROM students s
+             JOIN counseling_chats c ON c.matched_member_id = s.id
+             WHERE s."탈락" IS NULL AND left(s."단계", 1) IN ('합', '섭', '복')
+               AND c.chat_id::text LIKE '-%' AND c.meeting_date IS DISTINCT FROM '중단'
+               AND NOT EXISTS (SELECT 1 FROM student_targets st WHERE st.student_id = s.id AND st.kind = (
+                   CASE left(s."단계", 1) WHEN '합' THEN '합등' WHEN '섭' THEN '섭등' ELSE '복등' END))
+             ORDER BY s.id, c.updated_at DESC NULLS LAST`
+        )
+    ).rows;
+    for (const r of rows) {
+        const kind = targetKindOfStage(r.stage);
+        if (!kind || !r[kind] || r[kind] < since) continue;
+        try {
+            await askTarget(r.chat_id, { id: r.id, name: r.name, target: r.target }, kind, 'stage');
+        } catch (err: unknown) {
+            console.error(`[타겟 확인 발송 실패] ${r.chat_id}:`, getErrorMessage(err));
+        }
+    }
+}
+
+async function getOrInitMeta(key: string, init: () => string): Promise<string> {
+    const got = await neonPool.query(`SELECT value FROM bot_meta WHERE key = $1`, [key]);
+    if (got.rows[0]) return got.rows[0].value;
+    const value = init();
+    await neonPool.query(`INSERT INTO bot_meta (key, value) VALUES ($1, $2) ON CONFLICT (key) DO NOTHING`, [key, value]);
+    return value;
+}
+
+// 지금 단계의 타겟으로 정한 학생 (탈락 제외)
+async function loadCurrentTargets(): Promise<(TargetPerson & { kind: TargetKind })[]> {
+    const rows = (
+        await neonPool.query(
+            `SELECT ${TARGET_PERSON_SQL}, st.kind
+             FROM student_targets st
+             JOIN students s ON s.id = st.student_id
+             LEFT JOIN members m ON s."인도자_고유번호" = m."고유번호"
+             LEFT JOIN members t ON s."교사_고유번호" = t."고유번호"
+             WHERE st.answer AND s."탈락" IS NULL`
+        )
+    ).rows;
+    return rows
+        .filter((r) => targetKindOfStage(r.stage) === r.kind)
+        .map((r) => ({ ...r, target_month: formatTargetMonthOrNull(r.target_month) }));
+}
+
+const inRegion = (region: string, p: Pick<TargetPerson, 'guide_region' | 'teacher_region'>) =>
+    regionMatches(region, p.guide_region) || regionMatches(region, p.teacher_region);
+
+// 목표월이 바뀐 건 → 지역 담당방에 알림 + 그 지역 현재 타겟 명단·건수
+async function checkTargetMonthChanges() {
+    const init = await neonPool.query(`SELECT COALESCE(MAX(id), 0)::text AS id FROM student_target_history`);
+    const cursor = Number(await getOrInitMeta('target_history_cursor', () => init.rows[0].id));
+    const changes = (
+        await neonPool.query(
+            `SELECT h.id, h.target AS new_target, (
+                        SELECT p.target FROM student_target_history p
+                        WHERE p.student_id = h.student_id AND (p.created_at, p.id) < (h.created_at, h.id)
+                        ORDER BY p.created_at DESC, p.id DESC LIMIT 1) AS old_target,
+                    ${TARGET_PERSON_SQL},
+                    EXISTS (SELECT 1 FROM student_targets st WHERE st.student_id = s.id AND st.answer
+                            AND st.kind = CASE left(s."단계", 1) WHEN '합' THEN '합등' WHEN '섭' THEN '섭등' WHEN '복' THEN '복등' END) AS is_target
+             FROM student_target_history h
+             JOIN students s ON s.id = h.student_id
+             LEFT JOIN members m ON s."인도자_고유번호" = m."고유번호"
+             LEFT JOIN members t ON s."교사_고유번호" = t."고유번호"
+             WHERE h.id > $1 AND h.change_count > 0 AND s."탈락" IS NULL
+             ORDER BY h.id`,
+            [cursor]
+        )
+    ).rows;
+    const maxId = (await neonPool.query(`SELECT COALESCE(MAX(id), 0) AS id FROM student_target_history`)).rows[0].id;
+    if (!changes.length) {
+        if (Number(maxId) > cursor) await setMeta('target_history_cursor', String(maxId));
+        return;
+    }
+    const regionChats = await getRegionChats();
+    const targets = await loadCurrentTargets();
+    const byChat = new Map<string, string[]>();
+    for (const rc of regionChats) byChat.set(rc.chat_id, [...(byChat.get(rc.chat_id) ?? []), rc.region]);
+    for (const [chatId, regions] of byChat) {
+        const mine = changes.filter((c) => regions.some((r) => inRegion(r, c)));
+        if (!mine.length) continue;
+        const lines = mine.map(
+            (c) =>
+                `• ${targetLine({ ...c, target_month: null }, [
+                    `${formatTargetMonthOrNull(c.old_target) ?? '없음'}→${formatTargetMonthOrNull(c.new_target) ?? '없음'}`,
+                    c.is_target ? '현재 타겟 (다시 확인 필요)' : null,
+                ])}`
+        );
+        const summaries = regions.map((r) => targetSummaryText(r, targets.filter((p) => inRegion(r, p))));
+        const text =
+            `📅 <b>[목표월 변경 ${mine.length}건]</b>\n` +
+            lines.slice(0, 40).join('\n') +
+            (lines.length > 40 ? `\n…외 ${lines.length - 40}건` : '') +
+            `\n\n` +
+            summaries.join('\n\n');
+        try {
+            await sendLong(chatId, text);
+        } catch (err: unknown) {
+            console.error(`[목표월 변경 알림 실패] ${chatId}:`, getErrorMessage(err));
+        }
+    }
+    await setMeta('target_history_cursor', String(maxId));
+}
+
+async function setMeta(key: string, value: string) {
+    await neonPool.query(
+        `INSERT INTO bot_meta (key, value) VALUES ($1, $2) ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value`,
+        [key, value]
+    );
+}
+
+// 텔레그램 한 메시지 4096자 제한: 줄 단위로 나눠 보낸다
+async function sendLong(chatId: string, text: string) {
+    const parts: string[] = [];
+    let cur = '';
+    for (const line of text.split('\n')) {
+        if (cur.length + line.length + 1 > 3800) {
+            parts.push(cur);
+            cur = '';
+        }
+        cur += (cur ? '\n' : '') + line;
+    }
+    if (cur) parts.push(cur);
+    for (const p of parts) await bot.telegram.sendMessage(chatId, p, { parse_mode: 'HTML' });
+}
+
+// 버튼: 타겟으로 / 아니요 (방에 있는 누구나, 누른 사람을 남긴다)
+bot.action(/^tgt:(y|n):(hab|seop|bok):(\d+)$/, async (ctx) => {
+    try {
+        const yes = ctx.match[1] === 'y';
+        const kind = kindOfCode(ctx.match[2])!;
+        const studentId = Number(ctx.match[3]);
+        const record = ctx.chat ? await getChatRecord(ctx.chat.id) : undefined;
+        if (!record || Number(record.matched_member_id) !== studentId) {
+            await ctx.answerCbQuery('이 방의 대상자가 아닙니다.');
+            return;
+        }
+        const by = `${displayName(ctx.from)} (${ctx.from?.id ?? ''})`;
+        await neonPool.query(
+            `INSERT INTO student_targets (student_id, kind, answer, target_month, chat_id, answered_at, answered_by)
+             VALUES ($1, $2, $3, $4, $5, NOW(), $6)
+             ON CONFLICT (student_id, kind) DO UPDATE SET answer = EXCLUDED.answer, target_month = EXCLUDED.target_month,
+                 chat_id = EXCLUDED.chat_id, answered_at = NOW(), answered_by = EXCLUDED.answered_by`,
+            [studentId, kind, yes, formatTargetMonthOrNull(record.student_target), String(ctx.chat!.id), by]
+        );
+        await ctx.answerCbQuery(yes ? `${kind} 타겟으로 정했습니다.` : '타겟이 아닌 것으로 기록했습니다.');
+        const result = yes
+            ? `✅ <b>${kind} 타겟</b>으로 정했습니다 (${escapeHtml(displayName(ctx.from))}, ${dayjs().tz('Asia/Seoul').format('MM/DD HH:mm')})`
+            : `➖ ${kind} 타겟 아님으로 기록했습니다 (${escapeHtml(displayName(ctx.from))}). 다음 만남 보고서 때 다시 여쭤볼게요.`;
+        await ctx.editMessageReplyMarkup(undefined).catch(() => {});
+        await ctx.reply(result, { parse_mode: 'HTML' });
+    } catch (err: unknown) {
+        console.error('[타겟 버튼 처리 실패]:', getErrorMessage(err));
+        await ctx.answerCbQuery('저장하지 못했습니다. 잠시 뒤 다시 눌러주세요.').catch(() => {});
+    }
+});
+
+// /타겟: 이 방 대상자의 단계별 타겟 상태 + 지금 단계 타겟 묻기
+bot.hears(/^[\/!]타겟(?:@\w+)?$/i, async (ctx) => {
+    try {
+        const record = await getChatRecord(ctx.chat.id);
+        if (!record?.matched_member_id) {
+            await ctx.reply('⚠️ 먼저 <code>/최초등록</code>으로 대상자를 매칭해주세요.', { parse_mode: 'HTML' });
+            return;
+        }
+        const rows = (
+            await neonPool.query(
+                `SELECT kind, answer, target_month, to_char(answered_at AT TIME ZONE 'Asia/Seoul', 'MM/DD') AS at
+                 FROM student_targets WHERE student_id = $1`,
+                [Number(record.matched_member_id)]
+            )
+        ).rows;
+        const state = TARGET_KINDS.map((k) => {
+            const r = rows.find((x) => x.kind === k);
+            const v = !r || r.answer === null ? '미정' : r.answer ? `✅ 타겟${r.target_month ? ` (${escapeHtml(r.target_month)})` : ''}` : '➖ 아님';
+            return `• ${k}: ${v}${r?.at ? ` · ${r.at}` : ''}`;
+        }).join('\n');
+        const kind = targetKindOfStage(record.student_stage);
+        await ctx.reply(
+            `🎯 <b>타겟 상태</b> (👤 ${escapeHtml(record.matched_student_name ?? '')} · 행정 ${escapeHtml(record.student_stage ?? '-')})\n${state}` +
+                (kind ? '' : '\n\n합·섭·복 단계일 때 타겟을 정할 수 있습니다.'),
+            { parse_mode: 'HTML' }
+        );
+        if (kind)
+            await askTarget(
+                ctx.chat.id,
+                { id: record.matched_member_id, name: record.matched_student_name ?? null, target: record.student_target == null ? null : String(record.student_target) },
+                kind,
+                'manual',
+                rows.find((x) => x.kind === kind)?.answer
+            );
+    } catch (err: unknown) {
+        console.error('[/타겟 처리 실패]:', getErrorMessage(err));
+        await ctx.reply('⚠️ 타겟 상태를 불러오지 못했습니다.');
+    }
+});
+
+// /타겟현황: 지역 담당방이면 그 지역, 관리자 개인 대화면 지역별 전체 — 현재 타겟 명단·건수
+bot.hears(/^[\/!]타겟\s*현황(?:@\w+)?$/i, async (ctx) => {
+    try {
+        const own = (await getRegionChats()).filter((rc) => rc.chat_id === String(ctx.chat.id)).map((rc) => rc.region);
+        const regions = own.length ? own : ctx.chat.type === 'private' && isAdmin(ctx.from?.id) ? REGION_NAMES : [];
+        if (!regions.length) {
+            await ctx.reply('ℹ️ 지역 담당방이나 관리자 개인 대화에서 쓸 수 있습니다.');
+            return;
+        }
+        const targets = await loadCurrentTargets();
+        await sendLong(
+            String(ctx.chat.id),
+            regions.map((r) => targetSummaryText(r, targets.filter((p) => inRegion(r, p)))).join('\n\n')
+        );
+    } catch (err: unknown) {
+        console.error('[/타겟현황 처리 실패]:', getErrorMessage(err));
+        await ctx.reply('⚠️ 타겟 현황을 불러오지 못했습니다.');
+    }
+});
+
 // 교사 만남 회차 확인·보정 (/교사만남회차 → 기록 보기, /교사만남회차 n → 현재까지 총 n회로 보정)
 bot.hears(/^[\/!](?:교사\s*만남\s*회차|만남\s*회차|회차)(?:@\w+)?(?:\s+(\d{1,3})\s*회?)?$/i, async (ctx) => {
     try {
@@ -6505,6 +6854,8 @@ async function handleIncomingText(ctx: any, rawText: string, source: 'text' | 'c
             if (meeting?.added && meeting.seop && meeting.seop.round >= BOK_REMIND_ROUND) {
                 await sendBokReminder(chatId, meeting.seop);
             }
+            // 새 만남이 누적됐는데 아직 지금 단계 타겟이 아니면 다시 묻는다
+            if (meeting?.added) await askTargetAfterMeeting(chatId);
         };
         const roundText = !meeting
             ? ''
@@ -6953,6 +7304,7 @@ const server = http.createServer(async (req, res) => {
     const cronJobs: Record<string, [() => Promise<void>, string]> = {
         '/cron-10am': [
             async () => {
+                await runTargetChecks();
                 await triggerMorningReminder();
                 await sendWeeklySummaryIfMonday();
                 await sendRegionWeeklyRecaps();
@@ -6962,6 +7314,7 @@ const server = http.createServer(async (req, res) => {
         ],
         '/cron-10pm': [
             async () => {
+                await runTargetChecks();
                 await triggerNightReminder();
                 await sendRegionDailySummaries('night');
             },
