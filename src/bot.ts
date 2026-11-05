@@ -24,10 +24,10 @@ import {
 import {
     kindOfCode,
     TARGET_CODES,
-    TARGET_KINDS,
     targetAskText,
     targetKindOfStage,
     targetLine,
+    targetMonthKey,
     targetSummaryText,
     type TargetKind,
     type TargetPerson,
@@ -120,19 +120,31 @@ async function initDb() {
             ALTER TABLE counseling_chats ADD COLUMN IF NOT EXISTS seop_meeting_base INTEGER DEFAULT 0;
             -- 마지막 만남 보고서의 진행 내역(누적), 다음 보고서 양식에 미리 채움
             ALTER TABLE counseling_chats ADD COLUMN IF NOT EXISTS progress_history TEXT;
-            -- 타겟 (단계별: 합등·섭등·복등). answer null = 물었지만 답 없음. target_month = 답할 때 목표월
+            -- 타겟 (목표월별·단계별: 11월 합등 타겟 등). answer null = 물었지만 답 없음. target_month = 'n월'
             CREATE TABLE IF NOT EXISTS student_targets (
                 student_id INTEGER NOT NULL,
                 kind VARCHAR(4) NOT NULL,
+                target_month VARCHAR(20) NOT NULL DEFAULT '',
                 answer BOOLEAN,
-                target_month VARCHAR(20),
                 chat_id TEXT,
                 asked_at TIMESTAMPTZ,
                 ask_count INTEGER NOT NULL DEFAULT 0,
                 answered_at TIMESTAMPTZ,
                 answered_by TEXT,
-                PRIMARY KEY (student_id, kind)
+                PRIMARY KEY (student_id, kind, target_month)
             );
+            -- 처음 버전(학생+단계만 키)에서 목표월을 키에 넣는다 (여러 번 실행돼도 한 번만 바뀜)
+            UPDATE student_targets SET target_month = '' WHERE target_month IS NULL;
+            ALTER TABLE student_targets ALTER COLUMN target_month SET DEFAULT '', ALTER COLUMN target_month SET NOT NULL;
+            DO $$ BEGIN
+                IF NOT EXISTS (
+                    SELECT 1 FROM pg_index i JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = ANY(i.indkey)
+                    WHERE i.indrelid = 'student_targets'::regclass AND i.indisprimary AND a.attname = 'target_month'
+                ) THEN
+                    ALTER TABLE student_targets DROP CONSTRAINT IF EXISTS student_targets_pkey;
+                    ALTER TABLE student_targets ADD PRIMARY KEY (student_id, kind, target_month);
+                END IF;
+            END $$;
             CREATE TABLE IF NOT EXISTS meeting_events (
                 id SERIAL PRIMARY KEY,
                 chat_id TEXT NOT NULL,
@@ -6169,74 +6181,81 @@ bot.hears(/^[\/!](?:교사\s*만남\s*)?회차\s*취소(?:@\w+)?$/i, async (ctx)
     }
 });
 
-// ======================= 타겟 (합등·섭등·복등) =======================
+// ======================= 타겟 (합등·섭등·복등, 목표월별) =======================
+// - 타겟은 목표월별: 목표월이 11월이면 '11월 합등 타겟'. 지금 단계·지금 목표월에 맞는 것이 현재 타겟
 // - 행정 단계가 합·섭·복이 되면 상담방에 그 단계 타겟인지 한 번 묻는다 (기능을 켠 날 이후 그 단계가 된 학생만)
-// - 교사 만남 보고서가 새로 누적될 때마다 지금 단계 타겟이 아니면 다시 묻는다
-// - 목표월이 바뀌면 지역 담당방에 바뀐 건과 그 지역 현재 타겟 명단·건수를 알린다
+// - 교사 만남 보고서가 새로 누적될 때마다 지금 목표월·단계 타겟이 아니면 다시 묻는다
+// - 목표월이 바뀌면 새 목표월 타겟을 상담방에 묻고, 지역 담당방에 바뀐 건과 그 지역 현재 타겟(목표월별) 명단·건수를 알린다
+// - 목표월이 없거나 월이 아니면(장기 등) 묻지 않는다
 // 단계·목표월은 웹·봇 어디서 바꿔도 되도록 DB를 보고 찾는다 (봇에 업데이트가 올 때 3분에 한 번 + 오전·오후 10시)
 const REGION_NAMES = ['도봉', '성북', '노원', '중랑', '강북', '대학', '새신자', '이음'];
+// SQL: 지금 단계의 타겟 종류, 목표월 키('n월', 월이 아니면 NULL)
+const KIND_SQL = `CASE left(s."단계", 1) WHEN '합' THEN '합등' WHEN '섭' THEN '섭등' WHEN '복' THEN '복등' END`;
+const monthKeySql = (col: string) =>
+    `CASE WHEN btrim(${col}::text) ~ '^\\d{1,2}\\s*월?$' AND substring(btrim(${col}::text) from '^\\d{1,2}')::int BETWEEN 1 AND 12
+          THEN substring(btrim(${col}::text) from '^\\d{1,2}')::int::text || '월' END`;
 const TARGET_PERSON_SQL = `
-    s.id AS student_id, s."이름" AS name, s."단계" AS stage, s.target AS target_month,
+    s.id AS student_id, s."이름" AS name, s."단계" AS stage, ${monthKeySql('s.target')} AS target_month,
     m."지역" AS guide_region, m."구역" AS guide_district, m."이름" AS guide_name,
     t."지역" AS teacher_region, t."구역" AS teacher_district, t."이름" AS teacher_name`;
+const thisMonth = () => dayjs().tz('Asia/Seoul').month() + 1;
 
-const targetKeyboard = (kind: TargetKind, studentId: number | string) => ({
-    reply_markup: {
-        inline_keyboard: [
-            [
-                { text: `🎯 ${kind} 타겟으로`, callback_data: `tgt:y:${TARGET_CODES[kind]}:${studentId}` },
-                { text: '아니요', callback_data: `tgt:n:${TARGET_CODES[kind]}:${studentId}` },
+const targetKeyboard = (kind: TargetKind, month: string, studentId: number | string) => {
+    const m = month.replace('월', '');
+    return {
+        reply_markup: {
+            inline_keyboard: [
+                [
+                    { text: `🎯 ${month} ${kind} 타겟으로`, callback_data: `tgt:y:${TARGET_CODES[kind]}:${m}:${studentId}` },
+                    { text: '아니요', callback_data: `tgt:n:${TARGET_CODES[kind]}:${m}:${studentId}` },
+                ],
             ],
-        ],
-    },
-});
+        },
+    };
+};
 
-async function getTargetAnswer(studentId: number | string, kind: TargetKind) {
+async function getTargetAnswer(studentId: number | string, kind: TargetKind, month: string) {
     const res = await neonPool.query(
-        `SELECT answer, asked_at FROM student_targets WHERE student_id = $1 AND kind = $2`,
-        [Number(studentId), kind]
+        `SELECT answer, asked_at FROM student_targets WHERE student_id = $1 AND kind = $2 AND target_month = $3`,
+        [Number(studentId), kind, month]
     );
     return res.rows[0] as { answer: boolean | null; asked_at: Date | null } | undefined;
 }
 
 async function askTarget(
     chatId: number | string,
-    p: { id: number | string; name: string | null; target: string | null },
+    p: { id: number | string; name: string | null; month: string },
     kind: TargetKind,
-    reason: 'stage' | 'meeting' | 'manual',
+    reason: 'stage' | 'meeting' | 'month' | 'manual',
     previous?: boolean | null
 ) {
     await bot.telegram.sendMessage(
         String(chatId),
-        targetAskText({ kind, name: p.name, targetMonth: formatTargetMonthOrNull(p.target), reason, previous }),
-        { parse_mode: 'HTML', ...targetKeyboard(kind, p.id) }
+        targetAskText({ kind, name: p.name, targetMonth: p.month, reason, previous }),
+        { parse_mode: 'HTML', ...targetKeyboard(kind, p.month, p.id) }
     );
     await neonPool.query(
-        `INSERT INTO student_targets (student_id, kind, chat_id, asked_at, ask_count) VALUES ($1, $2, $3, NOW(), 1)
-         ON CONFLICT (student_id, kind) DO UPDATE SET chat_id = EXCLUDED.chat_id, asked_at = NOW(),
+        `INSERT INTO student_targets (student_id, kind, target_month, chat_id, asked_at, ask_count) VALUES ($1, $2, $3, $4, NOW(), 1)
+         ON CONFLICT (student_id, kind, target_month) DO UPDATE SET chat_id = EXCLUDED.chat_id, asked_at = NOW(),
              ask_count = student_targets.ask_count + 1`,
-        [Number(p.id), kind, String(chatId)]
+        [Number(p.id), kind, p.month, String(chatId)]
     );
 }
 
-function formatTargetMonthOrNull(raw: unknown): string | null {
-    const v = formatTargetMonth(raw);
-    return v === '미설정' ? null : v;
-}
-
-// 만남 보고서가 새로 누적된 뒤: 지금 단계 타겟이 아니면 다시 묻는다 (방금 물었으면 건너뜀)
+// 만남 보고서가 새로 누적된 뒤: 지금 목표월·단계 타겟이 아니면 다시 묻는다 (방금 물었으면 건너뜀)
 async function askTargetAfterMeeting(chatId: number | string) {
     try {
         const record = await getChatRecord(chatId);
         if (!record?.matched_member_id || record.student_dropped_at) return;
         const kind = targetKindOfStage(record.student_stage);
-        if (!kind) return;
-        const prev = await getTargetAnswer(record.matched_member_id, kind);
+        const month = targetMonthKey(record.student_target);
+        if (!kind || !month) return;
+        const prev = await getTargetAnswer(record.matched_member_id, kind, month);
         if (prev?.answer === true) return;
         if (prev?.asked_at && dayjs().diff(dayjs(prev.asked_at), 'minute') < 60 && prev.answer === null) return;
         await askTarget(
             chatId,
-            { id: record.matched_member_id, name: record.matched_student_name ?? null, target: record.student_target == null ? null : String(record.student_target) },
+            { id: record.matched_member_id, name: record.matched_student_name ?? null, month },
             kind,
             'meeting',
             prev?.answer
@@ -6265,30 +6284,46 @@ async function runTargetChecks() {
     }
 }
 
-// 합·섭·복이 막 된 학생에게 그 단계 타겟을 묻는다 (아직 묻지 않은 것만, 기능을 켠 날 이후 그 단계가 된 학생만)
+// 진행 중인 상담방이 있는 학생의 가장 최근 방 (학생 id → chat_id)
+async function activeChatsOf(studentIds: number[]): Promise<Map<number, string>> {
+    if (!studentIds.length) return new Map();
+    const rows = (
+        await neonPool.query(
+            `SELECT DISTINCT ON (matched_member_id) matched_member_id AS id, chat_id
+             FROM counseling_chats
+             WHERE matched_member_id = ANY($1::int[]) AND chat_id::text LIKE '-%' AND meeting_date IS DISTINCT FROM '중단'
+             ORDER BY matched_member_id, updated_at DESC NULLS LAST`,
+            [studentIds]
+        )
+    ).rows;
+    return new Map(rows.map((r) => [Number(r.id), String(r.chat_id)]));
+}
+
+// 합·섭·복이 막 된 학생에게 지금 목표월의 그 단계 타겟을 묻는다 (아직 묻지 않은 것만, 기능을 켠 날 이후 그 단계가 된 학생만)
 async function checkStageTargets() {
     const since = await getOrInitMeta('target_since', () => dayjs().tz('Asia/Seoul').format('YYYY-MM-DD'));
     const rows = (
         await neonPool.query(
-            `SELECT DISTINCT ON (s.id) s.id, s."이름" AS name, s."단계" AS stage, s.target, c.chat_id,
+            `SELECT s.id, s."이름" AS name, s."단계" AS stage, ${monthKeySql('s.target')} AS month,
                     to_char(s."합_완료일", 'YYYY-MM-DD') AS "합등", to_char(s."섭_완료일", 'YYYY-MM-DD') AS "섭등",
                     to_char(s."복_완료일", 'YYYY-MM-DD') AS "복등"
              FROM students s
-             JOIN counseling_chats c ON c.matched_member_id = s.id
-             WHERE s."탈락" IS NULL AND left(s."단계", 1) IN ('합', '섭', '복')
-               AND c.chat_id::text LIKE '-%' AND c.meeting_date IS DISTINCT FROM '중단'
-               AND NOT EXISTS (SELECT 1 FROM student_targets st WHERE st.student_id = s.id AND st.kind = (
-                   CASE left(s."단계", 1) WHEN '합' THEN '합등' WHEN '섭' THEN '섭등' ELSE '복등' END))
-             ORDER BY s.id, c.updated_at DESC NULLS LAST`
+             WHERE s."탈락" IS NULL AND left(s."단계", 1) IN ('합', '섭', '복') AND ${monthKeySql('s.target')} IS NOT NULL
+               AND NOT EXISTS (SELECT 1 FROM student_targets st WHERE st.student_id = s.id AND st.kind = ${KIND_SQL}
+                               AND st.target_month = ${monthKeySql('s.target')})`
         )
-    ).rows;
-    for (const r of rows) {
+    ).rows.filter((r) => {
         const kind = targetKindOfStage(r.stage);
-        if (!kind || !r[kind] || r[kind] < since) continue;
+        return kind && r[kind] && r[kind] >= since;
+    });
+    const chats = await activeChatsOf(rows.map((r) => Number(r.id)));
+    for (const r of rows) {
+        const chatId = chats.get(Number(r.id));
+        if (!chatId) continue;
         try {
-            await askTarget(r.chat_id, { id: r.id, name: r.name, target: r.target }, kind, 'stage');
+            await askTarget(chatId, { id: r.id, name: r.name, month: r.month }, targetKindOfStage(r.stage)!, 'stage');
         } catch (err: unknown) {
-            console.error(`[타겟 확인 발송 실패] ${r.chat_id}:`, getErrorMessage(err));
+            console.error(`[타겟 확인 발송 실패] ${chatId}:`, getErrorMessage(err));
         }
     }
 }
@@ -6301,39 +6336,41 @@ async function getOrInitMeta(key: string, init: () => string): Promise<string> {
     return value;
 }
 
-// 지금 단계의 타겟으로 정한 학생 (탈락 제외)
+async function setMeta(key: string, value: string) {
+    await neonPool.query(
+        `INSERT INTO bot_meta (key, value) VALUES ($1, $2) ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value`,
+        [key, value]
+    );
+}
+
+// 현재 타겟: 지금 단계·지금 목표월 타겟으로 정한 학생 (탈락 제외). target_month = 'n월'
 async function loadCurrentTargets(): Promise<(TargetPerson & { kind: TargetKind })[]> {
-    const rows = (
+    return (
         await neonPool.query(
             `SELECT ${TARGET_PERSON_SQL}, st.kind
              FROM student_targets st
              JOIN students s ON s.id = st.student_id
              LEFT JOIN members m ON s."인도자_고유번호" = m."고유번호"
              LEFT JOIN members t ON s."교사_고유번호" = t."고유번호"
-             WHERE st.answer AND s."탈락" IS NULL`
+             WHERE st.answer AND s."탈락" IS NULL AND st.kind = ${KIND_SQL} AND st.target_month = ${monthKeySql('s.target')}`
         )
     ).rows;
-    return rows
-        .filter((r) => targetKindOfStage(r.stage) === r.kind)
-        .map((r) => ({ ...r, target_month: formatTargetMonthOrNull(r.target_month) }));
 }
 
 const inRegion = (region: string, p: Pick<TargetPerson, 'guide_region' | 'teacher_region'>) =>
     regionMatches(region, p.guide_region) || regionMatches(region, p.teacher_region);
 
-// 목표월이 바뀐 건 → 지역 담당방에 알림 + 그 지역 현재 타겟 명단·건수
+// 목표월이 바뀐 건 → 상담방에 새 목표월 타겟을 묻고, 지역 담당방에 알림 + 그 지역 현재 타겟(목표월별) 명단·건수
 async function checkTargetMonthChanges() {
     const init = await neonPool.query(`SELECT COALESCE(MAX(id), 0)::text AS id FROM student_target_history`);
     const cursor = Number(await getOrInitMeta('target_history_cursor', () => init.rows[0].id));
     const changes = (
         await neonPool.query(
-            `SELECT h.id, h.target AS new_target, (
+            `SELECT h.id, ${monthKeySql('h.target')} AS new_month, ${monthKeySql(`(
                         SELECT p.target FROM student_target_history p
                         WHERE p.student_id = h.student_id AND (p.created_at, p.id) < (h.created_at, h.id)
-                        ORDER BY p.created_at DESC, p.id DESC LIMIT 1) AS old_target,
-                    ${TARGET_PERSON_SQL},
-                    EXISTS (SELECT 1 FROM student_targets st WHERE st.student_id = s.id AND st.answer
-                            AND st.kind = CASE left(s."단계", 1) WHEN '합' THEN '합등' WHEN '섭' THEN '섭등' WHEN '복' THEN '복등' END) AS is_target
+                        ORDER BY p.created_at DESC, p.id DESC LIMIT 1)`)} AS old_month,
+                    h.target AS new_raw, ${TARGET_PERSON_SQL}, ${KIND_SQL} AS kind
              FROM student_target_history h
              JOIN students s ON s.id = h.student_id
              LEFT JOIN members m ON s."인도자_고유번호" = m."고유번호"
@@ -6344,45 +6381,68 @@ async function checkTargetMonthChanges() {
         )
     ).rows;
     const maxId = (await neonPool.query(`SELECT COALESCE(MAX(id), 0) AS id FROM student_target_history`)).rows[0].id;
-    if (!changes.length) {
-        if (Number(maxId) > cursor) await setMeta('target_history_cursor', String(maxId));
-        return;
-    }
-    const regionChats = await getRegionChats();
-    const targets = await loadCurrentTargets();
-    const byChat = new Map<string, string[]>();
-    for (const rc of regionChats) byChat.set(rc.chat_id, [...(byChat.get(rc.chat_id) ?? []), rc.region]);
-    for (const [chatId, regions] of byChat) {
-        const mine = changes.filter((c) => regions.some((r) => inRegion(r, c)));
-        if (!mine.length) continue;
-        const lines = mine.map(
-            (c) =>
-                `• ${targetLine({ ...c, target_month: null }, [
-                    `${formatTargetMonthOrNull(c.old_target) ?? '없음'}→${formatTargetMonthOrNull(c.new_target) ?? '없음'}`,
-                    c.is_target ? '현재 타겟 (다시 확인 필요)' : null,
-                ])}`
-        );
-        const summaries = regions.map((r) => targetSummaryText(r, targets.filter((p) => inRegion(r, p))));
-        const text =
-            `📅 <b>[목표월 변경 ${mine.length}건]</b>\n` +
-            lines.slice(0, 40).join('\n') +
-            (lines.length > 40 ? `\n…외 ${lines.length - 40}건` : '') +
-            `\n\n` +
-            summaries.join('\n\n');
-        try {
-            await sendLong(chatId, text);
-        } catch (err: unknown) {
-            console.error(`[목표월 변경 알림 실패] ${chatId}:`, getErrorMessage(err));
+    // 한 학생이 여러 번 바꿨으면 마지막 것만 (지금 목표월과 같은 것)
+    const last = new Map<number, (typeof changes)[number]>();
+    for (const c of changes) last.set(Number(c.student_id), c);
+    const list = [...last.values()].filter((c) => c.new_month === c.target_month);
+    if (list.length) {
+        // 이전 목표월에 타겟이었는지
+        const was = (
+            await neonPool.query(
+                `SELECT student_id, kind, target_month FROM student_targets WHERE answer AND student_id = ANY($1::int[])`,
+                [list.map((c) => Number(c.student_id))]
+            )
+        ).rows;
+        const wasTarget = (c: (typeof list)[number]) =>
+            was.some((w) => Number(w.student_id) === Number(c.student_id) && w.kind === c.kind && w.target_month === c.old_month);
+        const isTarget = (c: (typeof list)[number]) =>
+            was.some((w) => Number(w.student_id) === Number(c.student_id) && w.kind === c.kind && w.target_month === c.new_month);
+
+        // 상담방: 새 목표월 타겟을 묻는다 (합·섭·복이고 아직 정하지 않았으면)
+        const chats = await activeChatsOf(list.map((c) => Number(c.student_id)));
+        for (const c of list) {
+            const chatId = chats.get(Number(c.student_id));
+            if (!chatId || !c.kind || !c.new_month || isTarget(c)) continue;
+            try {
+                await askTarget(chatId, { id: c.student_id, name: c.name, month: c.new_month }, c.kind, 'month');
+            } catch (err: unknown) {
+                console.error(`[목표월 변경 타겟 확인 실패] ${chatId}:`, getErrorMessage(err));
+            }
+        }
+
+        // 지역 담당방
+        const regionChats = await getRegionChats();
+        const targets = await loadCurrentTargets();
+        const byChat = new Map<string, string[]>();
+        for (const rc of regionChats) byChat.set(rc.chat_id, [...(byChat.get(rc.chat_id) ?? []), rc.region]);
+        for (const [chatId, regions] of byChat) {
+            const mine = list.filter((c) => regions.some((r) => inRegion(r, c)));
+            if (!mine.length) continue;
+            const lines = mine.map(
+                (c) =>
+                    `• ${targetLine(c, [
+                        `${c.old_month ?? '없음'}→${c.new_month ?? (String(c.new_raw ?? '').trim() || '없음')}`,
+                        wasTarget(c) ? `${c.old_month} ${c.kind} 타겟이었음` : null,
+                        c.kind && c.new_month ? (isTarget(c) ? `${c.new_month} 타겟` : `${c.new_month} 타겟 확인 필요`) : null,
+                    ])}`
+            );
+            const summaries = regions.map((r) =>
+                targetSummaryText(r, targets.filter((p) => inRegion(r, p)), thisMonth())
+            );
+            const text =
+                `📅 <b>[목표월 변경 ${mine.length}건]</b>\n` +
+                lines.slice(0, 40).join('\n') +
+                (lines.length > 40 ? `\n…외 ${lines.length - 40}건` : '') +
+                `\n\n` +
+                summaries.join('\n\n');
+            try {
+                await sendLong(chatId, text);
+            } catch (err: unknown) {
+                console.error(`[목표월 변경 알림 실패] ${chatId}:`, getErrorMessage(err));
+            }
         }
     }
-    await setMeta('target_history_cursor', String(maxId));
-}
-
-async function setMeta(key: string, value: string) {
-    await neonPool.query(
-        `INSERT INTO bot_meta (key, value) VALUES ($1, $2) ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value`,
-        [key, value]
-    );
+    if (Number(maxId) > cursor) await setMeta('target_history_cursor', String(maxId));
 }
 
 // 텔레그램 한 메시지 4096자 제한: 줄 단위로 나눠 보낸다
@@ -6400,29 +6460,40 @@ async function sendLong(chatId: string, text: string) {
     for (const p of parts) await bot.telegram.sendMessage(chatId, p, { parse_mode: 'HTML' });
 }
 
-// 버튼: 타겟으로 / 아니요 (방에 있는 누구나, 누른 사람을 남긴다)
-bot.action(/^tgt:(y|n):(hab|seop|bok):(\d+)$/, async (ctx) => {
+// 버튼: n월 ○○ 타겟으로 / 아니요 (방에 있는 누구나, 누른 사람을 남긴다)
+// 예전 버튼(월이 없는 tgt:y:hab:학생)은 지금 목표월로 저장한다
+bot.action(/^tgt:(y|n):(hab|seop|bok):(?:(\d{1,2}):)?(\d+)$/, async (ctx) => {
     try {
         const yes = ctx.match[1] === 'y';
         const kind = kindOfCode(ctx.match[2])!;
-        const studentId = Number(ctx.match[3]);
+        const studentId = Number(ctx.match[4]);
         const record = ctx.chat ? await getChatRecord(ctx.chat.id) : undefined;
         if (!record || Number(record.matched_member_id) !== studentId) {
             await ctx.answerCbQuery('이 방의 대상자가 아닙니다.');
             return;
         }
+        const nowMonth = targetMonthKey(record.student_target);
+        const month = ctx.match[3] ? `${Number(ctx.match[3])}월` : nowMonth;
+        if (!month) {
+            await ctx.answerCbQuery('목표월이 없습니다. 행정에 목표월을 먼저 정해주세요.', { show_alert: true });
+            return;
+        }
+        if (month !== nowMonth) {
+            await ctx.answerCbQuery(`목표월이 ${nowMonth ?? '없음'}(으)로 바뀌었습니다. /타겟 으로 다시 정해주세요.`, { show_alert: true });
+            return;
+        }
         const by = `${displayName(ctx.from)} (${ctx.from?.id ?? ''})`;
         await neonPool.query(
-            `INSERT INTO student_targets (student_id, kind, answer, target_month, chat_id, answered_at, answered_by)
+            `INSERT INTO student_targets (student_id, kind, target_month, answer, chat_id, answered_at, answered_by)
              VALUES ($1, $2, $3, $4, $5, NOW(), $6)
-             ON CONFLICT (student_id, kind) DO UPDATE SET answer = EXCLUDED.answer, target_month = EXCLUDED.target_month,
+             ON CONFLICT (student_id, kind, target_month) DO UPDATE SET answer = EXCLUDED.answer,
                  chat_id = EXCLUDED.chat_id, answered_at = NOW(), answered_by = EXCLUDED.answered_by`,
-            [studentId, kind, yes, formatTargetMonthOrNull(record.student_target), String(ctx.chat!.id), by]
+            [studentId, kind, month, yes, String(ctx.chat!.id), by]
         );
-        await ctx.answerCbQuery(yes ? `${kind} 타겟으로 정했습니다.` : '타겟이 아닌 것으로 기록했습니다.');
+        await ctx.answerCbQuery(yes ? `${month} ${kind} 타겟으로 정했습니다.` : '타겟이 아닌 것으로 기록했습니다.');
         const result = yes
-            ? `✅ <b>${kind} 타겟</b>으로 정했습니다 (${escapeHtml(displayName(ctx.from))}, ${dayjs().tz('Asia/Seoul').format('MM/DD HH:mm')})`
-            : `➖ ${kind} 타겟 아님으로 기록했습니다 (${escapeHtml(displayName(ctx.from))}). 다음 만남 보고서 때 다시 여쭤볼게요.`;
+            ? `✅ <b>${month} ${kind} 타겟</b>으로 정했습니다 (${escapeHtml(displayName(ctx.from))}, ${dayjs().tz('Asia/Seoul').format('MM/DD HH:mm')})`
+            : `➖ ${month} ${kind} 타겟 아님으로 기록했습니다 (${escapeHtml(displayName(ctx.from))}). 다음 만남 보고서 때 다시 여쭤볼게요.`;
         await ctx.editMessageReplyMarkup(undefined).catch(() => {});
         await ctx.reply(result, { parse_mode: 'HTML' });
     } catch (err: unknown) {
@@ -6431,7 +6502,7 @@ bot.action(/^tgt:(y|n):(hab|seop|bok):(\d+)$/, async (ctx) => {
     }
 });
 
-// /타겟: 이 방 대상자의 단계별 타겟 상태 + 지금 단계 타겟 묻기
+// /타겟: 이 방 대상자의 목표월별·단계별 타겟 기록 + 지금 목표월·단계 타겟 묻기
 bot.hears(/^[\/!]타겟(?:@\w+)?$/i, async (ctx) => {
     try {
         const record = await getChatRecord(ctx.chat.id);
@@ -6442,28 +6513,28 @@ bot.hears(/^[\/!]타겟(?:@\w+)?$/i, async (ctx) => {
         const rows = (
             await neonPool.query(
                 `SELECT kind, answer, target_month, to_char(answered_at AT TIME ZONE 'Asia/Seoul', 'MM/DD') AS at
-                 FROM student_targets WHERE student_id = $1`,
+                 FROM student_targets WHERE student_id = $1 AND answer IS NOT NULL
+                 ORDER BY answered_at DESC LIMIT 10`,
                 [Number(record.matched_member_id)]
             )
         ).rows;
-        const state = TARGET_KINDS.map((k) => {
-            const r = rows.find((x) => x.kind === k);
-            const v = !r || r.answer === null ? '미정' : r.answer ? `✅ 타겟${r.target_month ? ` (${escapeHtml(r.target_month)})` : ''}` : '➖ 아님';
-            return `• ${k}: ${v}${r?.at ? ` · ${r.at}` : ''}`;
-        }).join('\n');
         const kind = targetKindOfStage(record.student_stage);
+        const month = targetMonthKey(record.student_target);
+        const history = rows.length
+            ? rows.map((r) => `• ${escapeHtml(r.target_month)} ${r.kind}: ${r.answer ? '✅ 타겟' : '➖ 아님'} · ${r.at}`).join('\n')
+            : '• 정한 기록 없음';
         await ctx.reply(
-            `🎯 <b>타겟 상태</b> (👤 ${escapeHtml(record.matched_student_name ?? '')} · 행정 ${escapeHtml(record.student_stage ?? '-')})\n${state}` +
-                (kind ? '' : '\n\n합·섭·복 단계일 때 타겟을 정할 수 있습니다.'),
+            `🎯 <b>타겟</b> (👤 ${escapeHtml(record.matched_student_name ?? '')} · 행정 ${escapeHtml(record.student_stage ?? '-')} · 목표월 ${escapeHtml(month ?? formatTargetMonth(record.student_target))})\n${history}` +
+                (!kind ? '\n\n합·섭·복 단계일 때 타겟을 정할 수 있습니다.' : !month ? '\n\n목표월(n월)이 있어야 타겟을 정할 수 있습니다.' : ''),
             { parse_mode: 'HTML' }
         );
-        if (kind)
+        if (kind && month)
             await askTarget(
                 ctx.chat.id,
-                { id: record.matched_member_id, name: record.matched_student_name ?? null, target: record.student_target == null ? null : String(record.student_target) },
+                { id: record.matched_member_id, name: record.matched_student_name ?? null, month },
                 kind,
                 'manual',
-                rows.find((x) => x.kind === kind)?.answer
+                (await getTargetAnswer(record.matched_member_id, kind, month))?.answer
             );
     } catch (err: unknown) {
         console.error('[/타겟 처리 실패]:', getErrorMessage(err));
@@ -6471,8 +6542,8 @@ bot.hears(/^[\/!]타겟(?:@\w+)?$/i, async (ctx) => {
     }
 });
 
-// /타겟현황: 지역 담당방이면 그 지역, 관리자 개인 대화면 지역별 전체 — 현재 타겟 명단·건수
-bot.hears(/^[\/!]타겟\s*현황(?:@\w+)?$/i, async (ctx) => {
+// /타겟현황 [n월]: 지역 담당방이면 그 지역, 관리자 개인 대화면 지역별 전체 — 현재 타겟 목표월별 명단·건수
+bot.hears(/^[\/!]타겟\s*현황(?:@\w+)?(?:\s+(\d{1,2})\s*월?)?$/i, async (ctx) => {
     try {
         const own = (await getRegionChats()).filter((rc) => rc.chat_id === String(ctx.chat.id)).map((rc) => rc.region);
         const regions = own.length ? own : ctx.chat.type === 'private' && isAdmin(ctx.from?.id) ? REGION_NAMES : [];
@@ -6480,10 +6551,13 @@ bot.hears(/^[\/!]타겟\s*현황(?:@\w+)?$/i, async (ctx) => {
             await ctx.reply('ℹ️ 지역 담당방이나 관리자 개인 대화에서 쓸 수 있습니다.');
             return;
         }
-        const targets = await loadCurrentTargets();
+        const month = ctx.match[1] ? targetMonthKey(ctx.match[1]) : null;
+        const targets = (await loadCurrentTargets()).filter((p) => !month || p.target_month === month);
         await sendLong(
             String(ctx.chat.id),
-            regions.map((r) => targetSummaryText(r, targets.filter((p) => inRegion(r, p)))).join('\n\n')
+            regions
+                .map((r) => targetSummaryText(month ? `${r} ${month}` : r, targets.filter((p) => inRegion(r, p)), thisMonth()))
+                .join('\n\n')
         );
     } catch (err: unknown) {
         console.error('[/타겟현황 처리 실패]:', getErrorMessage(err));

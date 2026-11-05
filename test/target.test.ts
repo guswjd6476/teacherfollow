@@ -1,6 +1,15 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { kindOfCode, TARGET_CODES, targetAskText, targetKindOfStage, targetLine, targetSummaryText } from '../src/target.ts';
+import {
+    kindOfCode,
+    monthOrder,
+    TARGET_CODES,
+    targetAskText,
+    targetKindOfStage,
+    targetLine,
+    targetMonthKey,
+    targetSummaryText,
+} from '../src/target.ts';
 
 const person = {
     student_id: 1,
@@ -31,18 +40,35 @@ test('버튼 코드 ↔ 타겟', () => {
 
 test('묻는 글에 기준과 목표월이 들어간다', () => {
     const t = targetAskText({ kind: '섭등', name: '<홍>', targetMonth: '11월', reason: 'stage' });
-    assert.match(t, /섭등 타겟 확인/);
+    assert.match(t, /11월 섭등 타겟 확인/);
     assert.match(t, /주2회 센터요일/);
     assert.match(t, /11월/);
     assert.match(t, /&lt;홍&gt;/);
 });
 
-test('명단 한 줄 형식과 지역 현황', () => {
-    assert.equal(targetLine(person, ['합등 타겟', '11월']), '합/홍길동/도봉/1-2/김인도////합등 타겟/11월');
-    const text = targetSummaryText('도봉', [
-        { ...person, kind: '섭등', stage: '섭' },
-        { ...person, kind: '합등' },
-    ]);
-    assert.match(text, /현재 타겟 2명 \(합등 1 · 섭등 1 · 복등 0\)/);
-    assert.ok(text.indexOf('합등 타겟') < text.indexOf('섭등 타겟')); // 단계 순서
+test('목표월 키: n월만, 장기·빈 값은 없음', () => {
+    assert.equal(targetMonthKey('11월'), '11월');
+    assert.equal(targetMonthKey(' 3 '), '3월');
+    assert.equal(targetMonthKey('장기'), null);
+    assert.equal(targetMonthKey(null), null);
+    assert.equal(targetMonthKey('13월'), null);
+    assert.ok(monthOrder('11월', 11) < monthOrder('12월', 11));
+    assert.ok(monthOrder('1월', 11) < monthOrder('10월', 11)); // 이번 달부터 앞으로
+});
+
+test('명단 한 줄 형식과 지역 현황 (목표월별)', () => {
+    assert.equal(targetLine(person, ['11월 합등 타겟']), '합/홍길동/도봉/1-2/김인도////11월 합등 타겟');
+    const text = targetSummaryText(
+        '도봉',
+        [
+            { ...person, kind: '섭등', stage: '섭', target_month: '12월' },
+            { ...person, kind: '합등' },
+            { ...person, kind: '섭등', stage: '섭' },
+        ],
+        11,
+    );
+    assert.match(text, /현재 타겟 3명/);
+    assert.match(text, /\[11월 타겟 2명\]<\/b> 합등 1 · 섭등 1 · 복등 0/);
+    assert.match(text, /\[12월 타겟 1명\]/);
+    assert.ok(text.indexOf('[11월') < text.indexOf('[12월')); // 이번 달부터
 });

@@ -1,6 +1,18 @@
 // 타겟 (합등·섭등·복등 타겟): 봇 서버와 분리한 순수 함수 (테스트용)
-// - 학생마다 단계별로 '이 단계 타겟이 맞는지'를 따로 둔다 (student_targets: student_id + kind)
-// - 지금 단계(합·섭·복)에 맞는 타겟이 '현재 타겟'이다. 단계가 오르면 다음 타겟을 다시 묻는다
+// - 타겟은 목표월별이다: 목표월이 11월이면 '11월 합등 타겟' (student_targets: student_id + kind + target_month)
+// - 지금 단계(합·섭·복)와 지금 목표월에 맞는 타겟이 '현재 타겟'이다. 단계가 오르거나 목표월이 바뀌면 다시 묻는다
+// - 목표월이 없거나 월이 아니면(장기 등) 타겟을 정하지 않는다
+
+// 목표월 값 → 'n월' (없거나 월이 아니면 null)
+export function targetMonthKey(raw: unknown): string | null {
+    const m = String(raw ?? '').trim().match(/^(\d{1,2})\s*월?$/);
+    const n = m ? Number(m[1]) : 0;
+    return n >= 1 && n <= 12 ? `${n}월` : null;
+}
+
+// 목표월 정렬: 이번 달부터 앞으로 (이번 달 0, 다음 달 1 …)
+export const monthOrder = (key: string | null, currentMonth: number) =>
+    key ? (Number(key.replace('월', '')) - currentMonth + 12) % 12 : 99;
 
 export const TARGET_KINDS = ['합등', '섭등', '복등'] as const;
 export type TargetKind = (typeof TARGET_KINDS)[number];
@@ -27,12 +39,12 @@ export function targetKindOfStage(stage: unknown): TargetKind | null {
 const esc = (t?: string | null) => String(t ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 
 // 상담방에 묻는 글 (HTML)
-// reason: stage = 그 단계가 막 됨, meeting = 만남 보고서가 올라왔는데 아직 타겟이 아님, manual = /타겟
+// reason: stage = 그 단계가 막 됨, meeting = 만남 보고서가 올라왔는데 아직 타겟이 아님, month = 목표월이 바뀜, manual = /타겟
 export function targetAskText(o: {
     kind: TargetKind;
     name: string | null;
-    targetMonth: string | null;
-    reason: 'stage' | 'meeting' | 'manual';
+    targetMonth: string; // 'n월'
+    reason: 'stage' | 'meeting' | 'month' | 'manual';
     previous?: boolean | null; // 전에 답한 값 (false = 아니라고 했음)
 }): string {
     const who = o.name ? ` (👤 ${esc(o.name)})` : '';
@@ -40,13 +52,15 @@ export function targetAskText(o: {
         o.reason === 'stage'
             ? `${o.kind.slice(0, 1)} 등록이 확인되었습니다.`
             : o.reason === 'meeting'
-              ? `아직 <b>${o.kind} 타겟</b>으로 정하지 않은 대상자입니다.${o.previous === false ? ' (지난번: 아님)' : ''}`
-              : `지금 단계의 타겟 여부를 정해 주세요.`;
+              ? `아직 <b>${esc(o.targetMonth)} ${o.kind} 타겟</b>으로 정하지 않은 대상자입니다.${o.previous === false ? ' (지난번: 아님)' : ''}`
+              : o.reason === 'month'
+                ? `목표월이 <b>${esc(o.targetMonth)}</b>로 바뀌었습니다.`
+                : `지금 단계의 타겟 여부를 정해 주세요.`;
     return (
-        `🎯 <b>[${o.kind} 타겟 확인]</b>${who}\n` +
+        `🎯 <b>[${esc(o.targetMonth)} ${o.kind} 타겟 확인]</b>${who}\n` +
         `${head}\n\n` +
         `<b>${o.kind} 타겟 기준</b>\n${TARGET_CRITERIA[o.kind]}\n\n` +
-        `목표월 <b>${esc(o.targetMonth) || '미설정'}</b> · 이 대상자를 <b>${o.kind} 타겟</b>으로 할까요?`
+        `이 대상자를 <b>${esc(o.targetMonth)} ${o.kind} 타겟</b>으로 할까요?`
     );
 }
 
@@ -78,17 +92,30 @@ export function targetLine(p: TargetPerson, extras: (string | null | undefined)[
     return [...cells, ...extras.filter((x): x is string => !!x).map(esc)].join('/');
 }
 
-// 지역(인도자 또는 교사 지역) 안의 현재 타겟 현황 글: 단계별 건수 + 명단 (maxLines 넘으면 '…외 n명')
+// 지역(인도자 또는 교사 지역) 안의 현재 타겟 현황 글: 목표월마다 단계별 건수 + 명단 (maxLines 넘으면 '…외 n명')
+// currentMonth: 이번 달 (목표월을 이번 달부터 앞으로 순서로)
 export function targetSummaryText(
     title: string,
     people: (TargetPerson & { kind: TargetKind })[],
+    currentMonth: number,
     maxLines = 40,
 ): string {
-    const counts = TARGET_KINDS.map((k) => `${k} ${people.filter((p) => p.kind === k).length}`).join(' · ');
-    const sorted = [...people].sort(
-        (a, b) => TARGET_KINDS.indexOf(a.kind) - TARGET_KINDS.indexOf(b.kind) || String(a.name).localeCompare(String(b.name)),
+    const months = [...new Set(people.map((p) => p.target_month))].sort(
+        (a, b) => monthOrder(a, currentMonth) - monthOrder(b, currentMonth),
     );
-    const lines = sorted.slice(0, maxLines).map((p) => `• ${targetLine(p, [`${p.kind} 타겟`, p.target_month])}`);
-    if (sorted.length > maxLines) lines.push(`…외 ${sorted.length - maxLines}명`);
-    return `🎯 <b>${esc(title)}</b> 현재 타겟 ${people.length}명 (${counts})\n` + (lines.length ? lines.join('\n') : '• 없음');
+    const head = `🎯 <b>${esc(title)}</b> 현재 타겟 ${people.length}명`;
+    if (!people.length) return `${head}\n• 없음`;
+    let left = maxLines;
+    const blocks = months.map((m) => {
+        const mine = people
+            .filter((p) => p.target_month === m)
+            .sort((a, b) => TARGET_KINDS.indexOf(a.kind) - TARGET_KINDS.indexOf(b.kind) || String(a.name).localeCompare(String(b.name)));
+        const counts = TARGET_KINDS.map((k) => `${k} ${mine.filter((p) => p.kind === k).length}`).join(' · ');
+        const shown = mine.slice(0, Math.max(0, left));
+        left -= shown.length;
+        const lines = shown.map((p) => `• ${targetLine(p, [`${p.target_month} ${p.kind} 타겟`])}`);
+        if (mine.length > shown.length) lines.push(`…외 ${mine.length - shown.length}명`);
+        return `<b>[${esc(m)} 타겟 ${mine.length}명]</b> ${counts}\n${lines.join('\n')}`;
+    });
+    return `${head}\n${blocks.join('\n')}`;
 }
