@@ -8,6 +8,7 @@ import {
     targetKindOfStage,
     targetLine,
     targetMonthKey,
+    targetStatusText,
     targetSummaryText,
 } from '../src/target.ts';
 
@@ -71,4 +72,22 @@ test('명단 한 줄 형식과 지역 현황 (목표월별)', () => {
     assert.match(text, /\[11월 타겟 2명\]<\/b> 합등 1 · 섭등 1 · 복등 0/);
     assert.match(text, /\[12월 타겟 1명\]/);
     assert.ok(text.indexOf('[11월') < text.indexOf('[12월')); // 이번 달부터
+});
+
+test('/타겟현황: 목표월마다 타겟·미정·아님, 목표월 없음은 끝', () => {
+    const text = targetStatusText(
+        '도봉',
+        [
+            { ...person, kind: '합등', answer: true },
+            { ...person, kind: '합등', answer: null, name: '미정이' },
+            { ...person, kind: '섭등', answer: false, stage: '섭', name: '아님이' },
+            { ...person, kind: '합등', answer: null, target_month: null, name: '없음이' },
+        ],
+        11,
+    );
+    assert.match(text, /합·섭·복 4명, 타겟 1명/);
+    assert.match(text, /\[11월\] 타겟 1 · 미정 1 · 아님 1/);
+    assert.match(text, /❔ 미정 1명[^\n]*\n• 합\/미정이\/[^\n]*11월 합등 미정/);
+    assert.match(text, /➖ 아님 1명/);
+    assert.ok(text.indexOf('[11월]') < text.indexOf('[목표월 없음 1명]'));
 });

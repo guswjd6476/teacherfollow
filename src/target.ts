@@ -119,3 +119,46 @@ export function targetSummaryText(
     });
     return `${head}\n${blocks.join('\n')}`;
 }
+
+// /타겟현황: 합·섭·복 진행 중 전원을 목표월마다 타겟·미정·아님으로 나눈 글 (목표월 없음은 끝, maxLines 넘으면 '…외 n명')
+// answer: 지금 목표월·단계 타겟 답 (true 타겟, false 아님, null 미정). target_month가 null이면 목표월 없음
+export function targetStatusText(
+    title: string,
+    people: (TargetPerson & { kind: TargetKind; answer: boolean | null })[],
+    currentMonth: number,
+    maxLines = 60,
+): string {
+    const head = `🎯 <b>${esc(title)}</b> 타겟 현황 (합·섭·복 ${people.length}명, 타겟 ${people.filter((p) => p.target_month && p.answer === true).length}명)`;
+    if (!people.length) return `${head}\n• 없음`;
+    const months = [...new Set(people.map((p) => p.target_month))].sort(
+        (a, b) => monthOrder(a, currentMonth) - monthOrder(b, currentMonth),
+    );
+    const byKind = (a: { kind: TargetKind; name: string | null }, b: { kind: TargetKind; name: string | null }) =>
+        TARGET_KINDS.indexOf(a.kind) - TARGET_KINDS.indexOf(b.kind) || String(a.name).localeCompare(String(b.name));
+    let left = maxLines;
+    const listOf = (rows: typeof people, extra: (p: (typeof people)[number]) => string) => {
+        const shown = rows.slice(0, Math.max(0, left));
+        left -= shown.length;
+        const lines = shown.map((p) => `• ${targetLine(p, [extra(p)])}`);
+        if (rows.length > shown.length) lines.push(`…외 ${rows.length - shown.length}명`);
+        return lines;
+    };
+    const kinds = (rows: typeof people) => TARGET_KINDS.map((k) => `${k} ${rows.filter((p) => p.kind === k).length}`).join(' · ');
+    const blocks = months.map((m) => {
+        const mine = people.filter((p) => p.target_month === m).sort(byKind);
+        if (!m) return [`<b>[목표월 없음 ${mine.length}명]</b> 목표월(n월)을 정해야 타겟을 정할 수 있음`, ...listOf(mine, () => '목표월 없음')].join('\n');
+        const groups: [string, typeof mine][] = [
+            ['✅ 타겟', mine.filter((p) => p.answer === true)],
+            ['❔ 미정', mine.filter((p) => p.answer === null || p.answer === undefined)],
+            ['➖ 아님', mine.filter((p) => p.answer === false)],
+        ];
+        const status = (p: (typeof mine)[number]) => (p.answer === true ? '타겟' : p.answer === false ? '아님' : '미정');
+        return [
+            `<b>[${esc(m)}] 타겟 ${groups[0][1].length} · 미정 ${groups[1][1].length} · 아님 ${groups[2][1].length}</b>`,
+            ...groups
+                .filter(([, rows]) => rows.length)
+                .flatMap(([label, rows]) => [`${label} ${rows.length}명 (${kinds(rows)})`, ...listOf(rows, (p) => `${m} ${p.kind} ${status(p)}`)]),
+        ].join('\n');
+    });
+    return `${head}\n${blocks.join('\n\n')}`;
+}

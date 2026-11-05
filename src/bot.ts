@@ -28,6 +28,7 @@ import {
     targetKindOfStage,
     targetLine,
     targetMonthKey,
+    targetStatusText,
     targetSummaryText,
     type TargetKind,
     type TargetPerson,
@@ -6357,6 +6358,21 @@ async function loadCurrentTargets(): Promise<(TargetPerson & { kind: TargetKind 
     ).rows;
 }
 
+// /타겟현황용: 합·섭·복 진행 중 전원 + 지금 목표월·단계 타겟 답 (없으면 미정)
+async function loadTargetStatus(): Promise<(TargetPerson & { kind: TargetKind; answer: boolean | null })[]> {
+    return (
+        await neonPool.query(
+            `SELECT ${TARGET_PERSON_SQL}, ${KIND_SQL} AS kind, st.answer
+             FROM students s
+             LEFT JOIN members m ON s."인도자_고유번호" = m."고유번호"
+             LEFT JOIN members t ON s."교사_고유번호" = t."고유번호"
+             LEFT JOIN student_targets st ON st.student_id = s.id AND st.kind = ${KIND_SQL}
+                  AND st.target_month = ${monthKeySql('s.target')}
+             WHERE s."탈락" IS NULL AND left(s."단계", 1) IN ('합', '섭', '복')`
+        )
+    ).rows.map((r) => ({ ...r, answer: r.answer ?? null }));
+}
+
 const inRegion = (region: string, p: Pick<TargetPerson, 'guide_region' | 'teacher_region'>) =>
     regionMatches(region, p.guide_region) || regionMatches(region, p.teacher_region);
 
@@ -6542,7 +6558,7 @@ bot.hears(/^[\/!]타겟(?:@\w+)?$/i, async (ctx) => {
     }
 });
 
-// /타겟현황 [n월]: 지역 담당방이면 그 지역, 관리자 개인 대화면 지역별 전체 — 현재 타겟 목표월별 명단·건수
+// /타겟현황 [n월]: 지역 담당방이면 그 지역, 관리자 개인 대화면 지역별 전체 — 목표월별 타겟·미정·아님 명단·건수
 bot.hears(/^[\/!]타겟\s*현황(?:@\w+)?(?:\s+(\d{1,2})\s*월?)?$/i, async (ctx) => {
     try {
         const own = (await getRegionChats()).filter((rc) => rc.chat_id === String(ctx.chat.id)).map((rc) => rc.region);
@@ -6552,11 +6568,11 @@ bot.hears(/^[\/!]타겟\s*현황(?:@\w+)?(?:\s+(\d{1,2})\s*월?)?$/i, async (ctx
             return;
         }
         const month = ctx.match[1] ? targetMonthKey(ctx.match[1]) : null;
-        const targets = (await loadCurrentTargets()).filter((p) => !month || p.target_month === month);
+        const people = (await loadTargetStatus()).filter((p) => !month || p.target_month === month);
         await sendLong(
             String(ctx.chat.id),
             regions
-                .map((r) => targetSummaryText(month ? `${r} ${month}` : r, targets.filter((p) => inRegion(r, p)), thisMonth()))
+                .map((r) => targetStatusText(month ? `${r} ${month}` : r, people.filter((p) => inRegion(r, p)), thisMonth()))
                 .join('\n\n')
         );
     } catch (err: unknown) {
