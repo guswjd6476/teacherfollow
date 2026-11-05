@@ -6199,6 +6199,10 @@ const TARGET_PERSON_SQL = `
     s.id AS student_id, s."이름" AS name, s."단계" AS stage, ${monthKeySql('s.target')} AS target_month,
     m."지역" AS guide_region, m."구역" AS guide_district, m."이름" AS guide_name,
     t."지역" AS teacher_region, t."구역" AS teacher_district, t."이름" AS teacher_name`;
+// SQL: 만남 중단 = 매칭된 상담방이 있는데 진행 중인 방이 하나도 없음 → 타겟에서 뺀다 (웹 lib/targets STOPPED_SQL과 같음)
+const STOPPED_SQL = `(EXISTS (SELECT 1 FROM counseling_chats c WHERE c.matched_member_id = s.id)
+    AND NOT EXISTS (SELECT 1 FROM counseling_chats c WHERE c.matched_member_id = s.id
+        AND c.meeting_date IS DISTINCT FROM '중단' AND btrim(COALESCE(c.stop_reason, '')) = ''))`;
 const thisMonth = () => dayjs().tz('Asia/Seoul').month() + 1;
 
 const targetKeyboard = (kind: TargetKind, month: string, studentId: number | string) => {
@@ -6344,7 +6348,7 @@ async function setMeta(key: string, value: string) {
     );
 }
 
-// 현재 타겟: 지금 단계·지금 목표월 타겟으로 정한 학생 (탈락 제외). target_month = 'n월'
+// 현재 타겟: 지금 단계·지금 목표월 타겟으로 정한 학생 (탈락·만남 중단 제외). target_month = 'n월'
 async function loadCurrentTargets(): Promise<(TargetPerson & { kind: TargetKind })[]> {
     return (
         await neonPool.query(
@@ -6353,12 +6357,13 @@ async function loadCurrentTargets(): Promise<(TargetPerson & { kind: TargetKind 
              JOIN students s ON s.id = st.student_id
              LEFT JOIN members m ON s."인도자_고유번호" = m."고유번호"
              LEFT JOIN members t ON s."교사_고유번호" = t."고유번호"
-             WHERE st.answer AND s."탈락" IS NULL AND st.kind = ${KIND_SQL} AND st.target_month = ${monthKeySql('s.target')}`
+             WHERE st.answer AND s."탈락" IS NULL AND st.kind = ${KIND_SQL} AND st.target_month = ${monthKeySql('s.target')}
+               AND NOT ${STOPPED_SQL}`
         )
     ).rows;
 }
 
-// /타겟현황용: 합·섭·복 진행 중 전원 + 지금 목표월·단계 타겟 답 (없으면 미정)
+// /타겟현황용: 합·섭·복 진행 중 전원 (탈락·만남 중단 제외) + 지금 목표월·단계 타겟 답 (없으면 미정)
 async function loadTargetStatus(): Promise<(TargetPerson & { kind: TargetKind; answer: boolean | null })[]> {
     return (
         await neonPool.query(
@@ -6368,7 +6373,7 @@ async function loadTargetStatus(): Promise<(TargetPerson & { kind: TargetKind; a
              LEFT JOIN members t ON s."교사_고유번호" = t."고유번호"
              LEFT JOIN student_targets st ON st.student_id = s.id AND st.kind = ${KIND_SQL}
                   AND st.target_month = ${monthKeySql('s.target')}
-             WHERE s."탈락" IS NULL AND left(s."단계", 1) IN ('합', '섭', '복')`
+             WHERE s."탈락" IS NULL AND left(s."단계", 1) IN ('합', '섭', '복') AND NOT ${STOPPED_SQL}`
         )
     ).rows.map((r) => ({ ...r, answer: r.answer ?? null }));
 }
