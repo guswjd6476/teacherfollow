@@ -6448,7 +6448,7 @@ async function checkTargetMonthChanges() {
                     ])}`
             );
             const summaries = regions.map((r) =>
-                targetSummaryText(r, targets.filter((p) => inRegion(r, p)), thisMonth())
+                targetSummaryText(r, targets.filter((p) => inRegion(r, p)), thisMonth(), 40, (v) => regionMatches(r, v))
             );
             const text =
                 `📅 <b>[목표월 변경 ${mine.length}건]</b>\n` +
@@ -6577,7 +6577,7 @@ bot.hears(/^[\/!]타겟\s*현황(?:@\w+)?(?:\s+(\d{1,2})\s*월?)?$/i, async (ctx
         await sendLong(
             String(ctx.chat.id),
             regions
-                .map((r) => targetStatusText(month ? `${r} ${month}` : r, people.filter((p) => inRegion(r, p)), thisMonth()))
+                .map((r) => targetStatusText(month ? `${r} ${month}` : r, people.filter((p) => inRegion(r, p)), thisMonth(), 60, (v) => regionMatches(r, v)))
                 .join('\n\n')
         );
     } catch (err: unknown) {

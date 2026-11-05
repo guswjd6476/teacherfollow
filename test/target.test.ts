@@ -8,6 +8,8 @@ import {
     targetKindOfStage,
     targetLine,
     targetMonthKey,
+    targetScore,
+    targetScoreText,
     targetStatusText,
     targetSummaryText,
 } from '../src/target.ts';
@@ -68,8 +70,8 @@ test('명단 한 줄 형식과 지역 현황 (목표월별)', () => {
         ],
         11,
     );
-    assert.match(text, /현재 타겟 3명/);
-    assert.match(text, /\[11월 타겟 2명\]<\/b> 합등 1 · 섭등 1 · 복등 0/);
+    assert.match(text, /현재 타겟 3명 \(합등 1건 · 섭등 2점 · 복등 0점\)/);
+    assert.match(text, /\[11월 타겟 2명\]<\/b> 합등 1건 · 섭등 1점 · 복등 0점/);
     assert.match(text, /\[12월 타겟 1명\]/);
     assert.ok(text.indexOf('[11월') < text.indexOf('[12월')); // 이번 달부터
 });
@@ -90,4 +92,17 @@ test('/타겟현황: 목표월마다 타겟·미정·아님, 목표월 없음은
     assert.match(text, /❔ 미정 1명[^\n]*\n• 합\/미정이\/[^\n]*11월 합등 미정/);
     assert.match(text, /➖ 아님 1명/);
     assert.ok(text.indexOf('[11월]') < text.indexOf('[목표월 없음 1명]'));
+});
+
+test('타겟 건수·점수: 합등은 인도자 지역 1건, 섭등·복등은 인도자 0.5 + 교사 0.5', () => {
+    const inDobong = (v: string | null) => v === '도봉';
+    const hab = { ...person, kind: '합등' as const, guide_region: '성북', teacher_region: '도봉' };
+    const seop = { ...person, kind: '섭등' as const, stage: '섭', teacher_region: '성북' };
+    assert.equal(targetScore(hab, inDobong), 0);
+    assert.equal(targetScore(seop, inDobong), 0.5);
+    assert.equal(targetScoreText([hab, seop], inDobong), '합등 0건 · 섭등 0.5점 · 복등 0점');
+    // 도봉 현황: 교사만 도봉인 합등은 빠진다
+    const text = targetStatusText('도봉', [{ ...hab, answer: true }, { ...seop, answer: true }], 11, 60, inDobong);
+    assert.match(text, /합·섭·복 1명/);
+    assert.match(text, /✅ 타겟 1명 \(합등 0건 · 섭등 0.5점 · 복등 0점\)/);
 });

@@ -92,6 +92,23 @@ export function targetLine(p: TargetPerson, extras: (string | null | undefined)[
     return [...cells, ...extras.filter((x): x is string => !!x).map(esc)].join('/');
 }
 
+// 타겟 건수·점수: 실적 점수와 같은 규칙 (웹 lib/targets targetScore와 같음)
+// - 합등: 인도자 지역에 1건  - 섭등·복등: 인도자 지역 0.5 + 교사 지역 0.5점
+// inRg: 그 지역인지 (봇은 regionMatches). 기본은 모든 지역 → 합등 1건, 섭등·복등 1점
+export type InRegion = (region: string | null) => boolean;
+const ANY_REGION: InRegion = () => true;
+export function targetScore(p: Pick<TargetPerson, 'guide_region' | 'teacher_region'> & { kind: TargetKind }, inRg: InRegion = ANY_REGION) {
+    if (p.kind === '합등') return inRg(p.guide_region) ? 1 : 0;
+    return (inRg(p.guide_region) ? 0.5 : 0) + (inRg(p.teacher_region) ? 0.5 : 0);
+}
+// '합등 2건 · 섭등 1.5점 · 복등 0.5점'
+export function targetScoreText(rows: (Pick<TargetPerson, 'guide_region' | 'teacher_region'> & { kind: TargetKind })[], inRg: InRegion = ANY_REGION) {
+    return TARGET_KINDS.map((k) => {
+        const n = rows.filter((p) => p.kind === k).reduce((sum, p) => sum + targetScore(p, inRg), 0);
+        return `${k} ${Math.round(n * 10) / 10}${k === '합등' ? '건' : '점'}`;
+    }).join(' · ');
+}
+
 // 지역(인도자 또는 교사 지역) 안의 현재 타겟 현황 글: 목표월마다 단계별 건수 + 명단 (maxLines 넘으면 '…외 n명')
 // currentMonth: 이번 달 (목표월을 이번 달부터 앞으로 순서로)
 export function targetSummaryText(
@@ -99,18 +116,20 @@ export function targetSummaryText(
     people: (TargetPerson & { kind: TargetKind })[],
     currentMonth: number,
     maxLines = 40,
+    inRg: InRegion = ANY_REGION,
 ): string {
+    people = people.filter((p) => targetScore(p, inRg) > 0); // 합등은 인도자 지역에만
     const months = [...new Set(people.map((p) => p.target_month))].sort(
         (a, b) => monthOrder(a, currentMonth) - monthOrder(b, currentMonth),
     );
-    const head = `🎯 <b>${esc(title)}</b> 현재 타겟 ${people.length}명`;
+    const head = `🎯 <b>${esc(title)}</b> 현재 타겟 ${people.length}명 (${targetScoreText(people, inRg)})`;
     if (!people.length) return `${head}\n• 없음`;
     let left = maxLines;
     const blocks = months.map((m) => {
         const mine = people
             .filter((p) => p.target_month === m)
             .sort((a, b) => TARGET_KINDS.indexOf(a.kind) - TARGET_KINDS.indexOf(b.kind) || String(a.name).localeCompare(String(b.name)));
-        const counts = TARGET_KINDS.map((k) => `${k} ${mine.filter((p) => p.kind === k).length}`).join(' · ');
+        const counts = targetScoreText(mine, inRg);
         const shown = mine.slice(0, Math.max(0, left));
         left -= shown.length;
         const lines = shown.map((p) => `• ${targetLine(p, [`${p.target_month} ${p.kind} 타겟`])}`);
@@ -127,7 +146,9 @@ export function targetStatusText(
     people: (TargetPerson & { kind: TargetKind; answer: boolean | null })[],
     currentMonth: number,
     maxLines = 60,
+    inRg: InRegion = ANY_REGION,
 ): string {
+    people = people.filter((p) => targetScore(p, inRg) > 0); // 합등은 인도자 지역에만
     const head = `🎯 <b>${esc(title)}</b> 타겟 현황 (합·섭·복 ${people.length}명, 타겟 ${people.filter((p) => p.target_month && p.answer === true).length}명)`;
     if (!people.length) return `${head}\n• 없음`;
     const months = [...new Set(people.map((p) => p.target_month))].sort(
@@ -143,7 +164,7 @@ export function targetStatusText(
         if (rows.length > shown.length) lines.push(`…외 ${rows.length - shown.length}명`);
         return lines;
     };
-    const kinds = (rows: typeof people) => TARGET_KINDS.map((k) => `${k} ${rows.filter((p) => p.kind === k).length}`).join(' · ');
+    const kinds = (rows: typeof people) => targetScoreText(rows, inRg);
     const blocks = months.map((m) => {
         const mine = people.filter((p) => p.target_month === m).sort(byKind);
         if (!m) return [`<b>[목표월 없음 ${mine.length}명]</b> 목표월(n월)을 정해야 타겟을 정할 수 있음`, ...listOf(mine, () => '목표월 없음')].join('\n');
