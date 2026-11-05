@@ -33,6 +33,7 @@ import {
     type TargetKind,
     type TargetPerson,
 } from './target.js';
+import { campaignKey, campaignsInChakCheck, chakAskText, nextMonthOf } from './chakCheck.js';
 
 dayjs.extend(customParseFormat);
 dayjs.extend(utc);
@@ -121,6 +122,17 @@ async function initDb() {
             ALTER TABLE counseling_chats ADD COLUMN IF NOT EXISTS seop_meeting_base INTEGER DEFAULT 0;
             -- 마지막 만남 보고서의 진행 내역(누적), 다음 보고서 양식에 미리 채움
             ALTER TABLE counseling_chats ADD COLUMN IF NOT EXISTS progress_history TEXT;
+            -- 개강 5주차 찾기 확인 (campaign = 'YYYYMM' 개강). answer null = 물었지만 답 없음, '잔존' / '탈락'
+            CREATE TABLE IF NOT EXISTS chak_checks (
+                student_id INTEGER NOT NULL,
+                campaign VARCHAR(6) NOT NULL,
+                chat_id TEXT,
+                asked_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                answer VARCHAR(4),
+                answered_at TIMESTAMPTZ,
+                answered_by TEXT,
+                PRIMARY KEY (student_id, campaign)
+            );
             -- 타겟 (목표월별·단계별: 11월 합등 타겟 등). answer null = 물었지만 답 없음. target_month = 'n월'
             CREATE TABLE IF NOT EXISTS student_targets (
                 student_id INTEGER NOT NULL,
@@ -6586,6 +6598,167 @@ bot.hears(/^[\/!]타겟\s*현황(?:@\w+)?(?:\s+(\d{1,2})\s*월?)?$/i, async (ctx
     }
 });
 
+// ======================= 개강 5주차 찾기 확인 (잔존/탈락) =======================
+// 개강이 5주차가 되면, 목표월이 그 개강 월인데 아직 찾인 학생의 진행 중 상담방(봇이 있는 방)에 한 번 묻는다 (오전 10시)
+// - 잔존 → 목표월을 다음 달로   - 탈락 → 다시 한 번 확인 뒤 오늘 날짜로 행정 탈락 (단계 '탈락', 탈락일 = 지금, 행정 등록 찾탈과 같음)
+// 바꾼 것은 학생 변경 이력(student_changes)에 봇·누른 사람으로 남긴다
+// 기능을 켠 날(bot_meta chak_since) 전에 5주차가 시작된 개강은 묻지 않는다 (11월 개강은 이미 정리함)
+async function checkChakRemain() {
+    const today = dayjs().tz('Asia/Seoul');
+    const since = await getOrInitMeta('chak_since', () => today.format('YYYY-MM-DD'));
+    const months = Array.from({ length: 4 }, (_, i) => today.startOf('month').add(i - 1, 'month'));
+    const res = await neonPool.query(
+        `SELECT year, month, week_count, to_char(week1_start, 'YYYY-MM-DD') AS week1_start
+         FROM month_settings WHERE (year, month) IN (${months.map((_, i) => `($${i * 2 + 1}::int, $${i * 2 + 2}::int)`).join(', ')})`,
+        months.flatMap((m) => [m.year(), m.month() + 1])
+    );
+    const settings = months.map((m) => {
+        const year = m.year();
+        const month = m.month() + 1;
+        const row = res.rows.find((r) => r.year === year && r.month === month);
+        return {
+            year,
+            month,
+            weekCount: (row?.week_count as number | null) ?? defaultWeekCount(year, month),
+            week1Start: (row?.week1_start as string | null) ?? defaultWeek1Start(year, month),
+        };
+    });
+    for (const c of campaignsInChakCheck(settings, today.format('YYYY-MM-DD')).filter((x) => x.week5Start >= since)) {
+        const key = campaignKey(c.year, c.month);
+        const students = (
+            await neonPool.query(
+                `SELECT s.id, s."이름" AS name FROM students s
+                 WHERE s."탈락" IS NULL AND left(s."단계", 1) = '찾' AND ${monthKeySql('s.target')} = $1
+                   AND NOT EXISTS (SELECT 1 FROM chak_checks k WHERE k.student_id = s.id AND k.campaign = $2)`,
+                [`${c.month}월`, key]
+            )
+        ).rows;
+        const chats = await activeChatsOf(students.map((s) => Number(s.id)));
+        for (const s of students) {
+            const chatId = chats.get(Number(s.id));
+            if (!chatId) continue;
+            try {
+                await bot.telegram.sendMessage(chatId, chakAskText({ name: s.name, month: c.month, week5Start: c.week5Start }), {
+                    parse_mode: 'HTML',
+                    ...chakKeyboard(Number(s.id), key, c.month),
+                });
+                await neonPool.query(
+                    `INSERT INTO chak_checks (student_id, campaign, chat_id) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING`,
+                    [Number(s.id), key, chatId]
+                );
+            } catch (err: unknown) {
+                // 봇이 방에서 나갔으면 실패 → 다음 날 다시 시도
+                console.error(`[찾기 확인 발송 실패] ${chatId}:`, getErrorMessage(err));
+            }
+        }
+    }
+}
+
+const chakKeyboard = (studentId: number, key: string, month: number) => ({
+    reply_markup: {
+        inline_keyboard: [
+            [
+                { text: `잔존 (목표월 ${nextMonthOf(month)}월로)`, callback_data: `chak:keep:${key}:${studentId}` },
+                { text: '탈락', callback_data: `chak:drop:${key}:${studentId}` },
+            ],
+        ],
+    },
+});
+
+// 학생 변경 이력 (웹 lib/changeLog와 같은 표·모양)
+async function recordBotStudentChange(
+    studentId: number,
+    name: string | null,
+    action: '행정 등록' | '목표월 변경',
+    actor: string,
+    before: Record<string, unknown>,
+    after: Record<string, unknown>
+) {
+    await neonPool
+        .query(
+            `INSERT INTO student_changes (student_id, student_name, action, source, actor, before, after)
+             VALUES ($1, $2, $3, 'bot', $4, $5::jsonb, $6::jsonb)`,
+            [studentId, name, action, actor, JSON.stringify(before), JSON.stringify(after)]
+        )
+        .catch((err) => console.error('[학생 변경 이력 저장 실패]:', getErrorMessage(err)));
+}
+
+// 버튼: keep 잔존 / drop 탈락(확인 버튼으로 바꿈) / dropok 탈락 확정 / back 취소(처음 버튼으로)
+bot.action(/^chak:(keep|drop|dropok|back):(\d{6}):(\d+)$/, async (ctx) => {
+    try {
+        const [, act, key, sid] = ctx.match;
+        const studentId = Number(sid);
+        const month = Number(key.slice(4));
+        const record = ctx.chat ? await getChatRecord(ctx.chat.id) : undefined;
+        if (!record || Number(record.matched_member_id) !== studentId) {
+            await ctx.answerCbQuery('이 방의 대상자가 아닙니다.');
+            return;
+        }
+        if (act === 'drop') {
+            await ctx.editMessageReplyMarkup({
+                inline_keyboard: [
+                    [
+                        { text: '⚠️ 탈락 확정 (오늘 날짜로 행정 탈락)', callback_data: `chak:dropok:${key}:${studentId}` },
+                        { text: '취소', callback_data: `chak:back:${key}:${studentId}` },
+                    ],
+                ],
+            });
+            await ctx.answerCbQuery('한 번 더 눌러 탈락을 확정해 주세요.');
+            return;
+        }
+        if (act === 'back') {
+            await ctx.editMessageReplyMarkup(chakKeyboard(studentId, key, month).reply_markup);
+            await ctx.answerCbQuery();
+            return;
+        }
+        // 그사이 행정이 바뀌었으면 아무것도 하지 않는다
+        const s = (
+            await neonPool.query(
+                `SELECT "이름" AS name, "단계" AS stage, target, "탈락" AS dropped FROM students WHERE id = $1`,
+                [studentId]
+            )
+        ).rows[0];
+        if (!s || s.dropped || String(s.stage ?? '').trim().charAt(0) !== '찾' || targetMonthKey(s.target) !== `${month}월`) {
+            await ctx.editMessageReplyMarkup(undefined).catch(() => {});
+            await ctx.answerCbQuery(
+                `이미 바뀌었습니다 (지금 행정 ${s?.dropped ? '탈락' : (s?.stage ?? '-')} · 목표월 ${formatTargetMonth(s?.target)}).`,
+                { show_alert: true }
+            );
+            return;
+        }
+        const who = `${displayName(ctx.from)} (${ctx.from?.id ?? ''})`;
+        const now = dayjs().tz('Asia/Seoul').format('YYYY-MM-DD HH:mm:ss');
+        let result: string;
+        if (act === 'keep') {
+            const next = `${nextMonthOf(month)}월`;
+            await neonPool.query(`UPDATE students SET target = $1 WHERE id = $2`, [next, studentId]);
+            await recordBotStudentChange(studentId, s.name, '목표월 변경', who, { target: s.target }, { target: next });
+            result = `✅ <b>잔존</b>: 목표월을 <b>${next}</b>로 바꿨습니다 (${escapeHtml(displayName(ctx.from))})`;
+        } else {
+            const upd = await neonPool.query(
+                `UPDATE students SET "단계" = '탈락', "탈락" = $1 WHERE id = $2 AND "탈락" IS NULL AND left("단계", 1) = '찾'`,
+                [now, studentId]
+            );
+            if (!upd.rowCount) {
+                await ctx.answerCbQuery('이미 바뀌었습니다.', { show_alert: true });
+                return;
+            }
+            await recordBotStudentChange(studentId, s.name, '행정 등록', who, { 단계: s.stage, 탈락: null }, { 단계: '탈락', 탈락: now });
+            result = `➖ <b>행정 탈락</b> 처리했습니다 (탈락일 ${now.slice(5, 10).replace('-', '/')}, ${escapeHtml(displayName(ctx.from))})`;
+        }
+        await neonPool.query(
+            `UPDATE chak_checks SET answer = $1, answered_at = NOW(), answered_by = $2 WHERE student_id = $3 AND campaign = $4`,
+            [act === 'keep' ? '잔존' : '탈락', who, studentId, key]
+        );
+        await ctx.editMessageReplyMarkup(undefined).catch(() => {});
+        await ctx.answerCbQuery(act === 'keep' ? '잔존으로 처리했습니다.' : '탈락으로 처리했습니다.');
+        await ctx.reply(result, { parse_mode: 'HTML' });
+    } catch (err: unknown) {
+        console.error('[찾기 확인 버튼 처리 실패]:', getErrorMessage(err));
+        await ctx.answerCbQuery('저장하지 못했습니다. 잠시 뒤 다시 눌러주세요.').catch(() => {});
+    }
+});
+
 // 교사 만남 회차 확인·보정 (/교사만남회차 → 기록 보기, /교사만남회차 n → 현재까지 총 n회로 보정)
 bot.hears(/^[\/!](?:교사\s*만남\s*회차|만남\s*회차|회차)(?:@\w+)?(?:\s+(\d{1,3})\s*회?)?$/i, async (ctx) => {
     try {
@@ -7400,6 +7573,7 @@ const server = http.createServer(async (req, res) => {
         '/cron-10am': [
             async () => {
                 await runTargetChecks();
+                await checkChakRemain().catch((err) => console.error('[찾기 확인 실패]:', getErrorMessage(err)));
                 await triggerMorningReminder();
                 await sendWeeklySummaryIfMonday();
                 await sendRegionWeeklyRecaps();
