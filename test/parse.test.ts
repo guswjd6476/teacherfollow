@@ -6,6 +6,7 @@ import {
     parseFlexibleDate,
     parseFlexibleTime,
     stripDatePart,
+    suggestCommands,
     weekDateOptions,
 } from '../src/parse.ts';
 
@@ -91,4 +92,11 @@ test('진행 내역(누적): 보고서에서 꺼내 다음 양식에 이어 씀'
     const tpl = `▶️ 진행 내역(누적)\n1. \n2. \n\n▶️ 단계향상 목표 및 달성여부`;
     assert.equal(fillProgressHistory(tpl, h!), `▶️ 진행 내역(누적)\n1. 10/3 인터뷰\n2. 10/10 1과\n3. \n\n▶️ 단계향상 목표 및 달성여부`);
     assert.equal(extractProgressHistory(`▶️ 진행 내역(누적)\n1. \n2. \n▶️ 진행내용\n- 복습`), null);
+});
+
+test('비슷한 명령어 추천', () => {
+    const cmds = ['만남일', '만남중단', '만남보고서양식', '상태확인', '행정확인'];
+    assert.equal(suggestCommands('만남일자', cmds)[0], '만남일');
+    assert.equal(suggestCommands('상태', cmds)[0], '상태확인');
+    assert.deepEqual(suggestCommands('ㅋㅋㅋ', cmds), []);
 });

@@ -19,6 +19,7 @@ import {
     extractProgressHistory,
     fillProgressHistory,
     stripDatePart,
+    suggestCommands,
     weekDateOptions,
 } from './parse.js';
 import {
@@ -2497,81 +2498,143 @@ bot.on('my_chat_member', async (ctx) => {
 });
 
 // 종합 도움말 (/start, /help, /도움말)
+// 도움말: 항목 버튼으로 나눠서 필요한 것만 펼침 (관리자 항목은 관리자에게만)
+const HELP_SECTIONS: Record<string, { label: string; text: string }> = {
+    reg: {
+        label: '📝 등록·기본',
+        text:
+        '<b>1. 기본 설정 및 등록</b>\n' +
+        '• <b>대상자 최초 등록</b>: <code>/최초등록 섭외자/지역/팀/인도자</code>\n' +
+        '• <b>첫 만남 유형 바꾸기</b>: <code>/유형변경</code> (잘못 고른 경우, 인터뷰 결과 보고서·교사 만남 회차 전까지)\n' +
+        '• <b>자주 쓰는 기능 버튼</b>: <code>/메뉴</code> (이 방 상황에 맞는 기능 버튼)\n' +
+        '• <b>만남 전 피드백 양식</b>: <code>/피드백양식</code>\n' +
+        '• <b>현재 방 상태 확인</b>: <code>/상태확인</code>\n' +
+        '• <b>행정 등록 확인</b>: <code>/행정확인</code>\n' +
+        '• <b>목표월 수정</b>: <code>/목표월수정 n월</code>\n' +
+        '• <b>단계향상표 보기</b>: <code>/단계향상표</code>\n\n',
+    },
+    interview: {
+        label: '🎙️ 인터뷰',
+        text:
+        '<b>2. 인터뷰 만남 단계</b>\n' +
+        '• <b>사전 보고서 등록</b>: 채팅방에 <code>[인터뷰 사전 보고서]</code> 양식 전송\n' +
+        '• <b>사전 보고서 양식</b>: <code>/인터뷰사전양식</code>\n' +
+        '• <b>인터뷰 항목 개별 수정</b>:\n' +
+        '   - 인터뷰어: <code>/인터뷰어 강북 1팀 귀요미</code>\n' +
+        '   - 타이퍼: <code>/타이퍼 강북 1팀 김공주</code> (해제: <code>/타이퍼 없음</code>)\n' +
+        '   - 예정일: <code>/인터뷰일 MM-DD</code>\n' +
+        '• <b>결과 보고서 양식</b>: <code>/인터뷰사후양식</code>\n' +
+        '   <i>(결과 보고서에서 [신청] 시 교사 만남으로 자동 전환, [행사참석] 시 행사 참석으로 따로 기록 → 이후 <code>/교사전환</code>)</i>\n' +
+        '• <b>인터뷰 전 연락두절·거절</b>: <code>/만남중단</code> → <b>인터뷰 전 중단</b>으로 구분 기록\n' +
+        '\n',
+    },
+    teacher: {
+        label: '👨‍🏫 교사 만남',
+        text:
+        '<b>3. 교사 만남 및 일정 관리</b>\n' +
+        '• <b>만남일 설정</b>: <code>/만남일 MM-DD</code> 또는 <code>/만남일 미정</code>\n' +
+        '• <b>만남 중단 처리</b>: <code>/만남중단 [상세 사유]</code> → 사유 버튼 선택\n' +
+        '• <b>피드백 제출</b>: 메시지 내 <code>#피드백</code> 태그 포함\n' +
+        '• <b>만남 보고서 양식</b>: <code>/만남보고서양식</code> 또는 <code>/교사만남양식</code>\n' +
+        '• <b>타겟</b>: <code>/타겟</code> (이 방 대상자의 합등·섭등·복등 타겟 상태 보기·정하기), 지역 담당방에서 <code>/타겟현황</code>\n' +
+        '• <b>교사 만남 누적 회차</b>: <code>/교사만남회차</code> (보정: <code>/교사만남회차 총횟수</code>, 마지막 1회 취소: <code>/회차취소</code>)\n' +
+        '• <b>섭등 후 회차</b>: <code>/섭등회차</code> (섭등일 만남 = 1회차, 보정: <code>/섭등회차 총횟수</code>)\n' +
+        '   <i>(섭등 후 3회차부터 복등 전이면 보고서 반영 때 복등 안내, 3회차 때 지역 담당방에도 알림)</i>\n' +
+        '• <b>만남 보고서 제출</b>: 양식 내 <code>다음만남일: MM-DD</code> 포함\n' +
+        '   <i>(사진 설명글로 올려도 인식됩니다. 이미 보낸 메시지를 편집하면 반영되지 않으니 다시 올려 주세요)</i>\n\n',
+    },
+    schedule: {
+        label: '🎉 일정만 관리',
+        text:
+        '<b>4. 지역행사 · 동아리 · 지인 만남 · 당터뷰 (일정만 관리)</b>\n' +
+        '• <b>지정</b>: <code>/최초등록</code> 후 [🎉 지역행사] · [🧩 동아리] · [🤝 지인 만남] · [🗣️ 당터뷰] · [💬 온라인친분] 중 선택 → <code>/만남일 MM-DD</code>로 일정 등록\n' +
+        '• <b>교사 만남으로 전환</b>: <code>/교사전환</code>\n\n',
+    },
+    stage: {
+        label: '📌 진행 단계·자동 안내',
+        text:
+        '<b>5. 방 진행 단계 (특수 구분)</b>\n' +
+        '• <b>단계 설정</b>: <code>/섭등목표 MM-DD</code>, <code>/예정목표 MM-DD</code>, <code>/가능목표 MM-DD</code>, <code>/확정목표 MM-DD</code> (날짜만 입력)\n' +
+        '• <b>단계 해제</b>: <code>/구분해제</code> (일반 상태로 복귀)\n\n' +
+        '⏸ <b>진행이 멈춘 방 안내</b>: 최초등록·유형 선택·사전/사후 보고서·만남일·다음 일정이 비어 있거나 행정 탈락이면 오전 10시에 방으로 안내\n' +
+        '   <i>(방마다 하루 하나, 상황별 최대 3번 → 그래도 그대로면 지역 담당방에 요약)</i>\n\n',
+    },
+    date: {
+        label: '📅 날짜 입력',
+        text:
+        '📅 <b>날짜 입력 형식</b>: <code>10-08</code>, <code>10/8</code>, <code>10.8(목)</code>, <code>10월 8일</code>, <code>2026.10.8</code>, <code>내일</code>\n' +
+        '   시간도 함께 적으면 저장됩니다: <code>/만남일 10.8(목) 오후 7시</code>, <code>10/8 19:30</code>\n' +
+        '   <i>(요일이 실제와 다르거나 지난 날짜면 안내해 드립니다)</i>\n\n',
+    },
+    admin: {
+        label: '👑 관리자',
+        text:
+        '👑 <b>관리자 전용 명령어</b>\n' +
+        '• <b>관리자 메뉴 (버튼)</b>: <code>관리자 메뉴</code>\n' +
+        '• <b>인터뷰 예정건 모아보기</b>: <code>관리자 인터뷰</code>\n' +
+        '• <b>교사 만남 진행건 모아보기</b>: <code>관리자 교사</code>\n' +
+        '• <b>지역행사·동아리·지인 진행건 모아보기</b>: <code>관리자 지역행사</code>, <code>관리자 동아리</code>, <code>관리자 지인</code>, <code>관리자 당터뷰</code> (인터뷰 후속 행사: <code>관리자 행사</code>)\n' +
+        '• <b>만남 명단 조회</b>: <code>관리자 오늘만남</code>, <code>관리자 내일만남</code>, <code>관리자 일자만남 MM-DD</code>\n' +
+        '• <b>보고서 미제출 명단</b>: <code>관리자 미제출</code> (일괄 독촉: <code>관리자 미제출 알림</code>)\n' +
+        '• <b>미등록 및 미정 방 조회</b>: <code>관리자 미등록</code>\n' +
+        '• <b>만남일 경과 미갱신 방</b>: <code>관리자 미갱신</code> (타부서 교사 제외, 포함: <code>관리자 미갱신 타부서포함</code>)\n' +
+        '   일괄 독촉: <code>관리자 미갱신 알림</code>, <code>관리자 미갱신 타부서포함 알림</code>\n' +
+        '• <b>찾등 이상 봇 미초대 명단</b>: <code>관리자 미초대</code>\n' +
+        '• <b>만남 중단 방 목록</b>: <code>관리자 중단</code>\n' +
+        '• <b>필수 인원 방 참여 점검</b>: <code>관리자 인원점검</code> (모든 방 / 섭등 이상 방 / 개강 강사, 탈락·중단 제외)\n' +
+        '   개강 강사만: <code>관리자 강사점검</code>, 목표월만: <code>관리자 강사점검 11월</code>\n' +
+        '• <b>특수 구분 현황 (3가지 종합)</b>: <code>관리자 구분</code>\n' +
+        '• <b>구분별 단독 조회</b>: <code>관리자 n월 섭등목표</code>, <code>관리자 n월 예정목표</code>, <code>관리자 n월 가능목표</code>, <code>관리자 n월 확정목표</code>\n' +
+        '• <b>일반방 조회 (특수 3종 및 중단 제외)</b>: <code>관리자 n월 일반</code>\n' +
+        '   <i>(n월 = 대상자 목표월, 생략 시 전체)</i>\n' +
+        '• <b>전체 종합 관리 현황</b>: <code>관리자 점검</code>\n' +
+        '• <b>주간 요약</b>: <code>관리자 주간요약</code> (매주 월요일 오전 관리자에게 자동 발송)\n' +
+        '• <b>봇 사용 인증 현황</b>: <code>관리자 인증목록</code> (해제: <code>관리자 인증해제 ID</code>, 승인: <code>관리자 인증승인 ID</code>)\n' +
+        '• <b>지역 담당방 등록</b>: 담당방에서 <code>/담당방등록 강북</code> (해제: <code>/담당방해제</code>, 목록: <code>관리자 담당방</code>)\n' +
+        '   <i>(보고서 지연·만남 중단·매일 오전 10시/밤 10시 지역 요약이 담당방으로 자동 발송)</i>\n' +
+        '• <b>신규 만남 발생</b>: <code>관리자 신규</code> (기간: <code>오늘</code>, <code>어제</code>, <code>이번주</code>, <code>지난주</code>, <code>10월</code>)\n' +
+        '   <i>(상담 이하 = 인터뷰 매칭 / 지역행사 / 동아리 / 지인 만남 · 상담 1회차 = 교사 매칭, 밤 10시 지역 요약에도 포함)</i>\n' +
+        '• <b>담당방 공지</b>: <code>/담당방공지 내용</code> (특정 지역만: <code>/담당방공지 [강북,강남] 내용</code>)\n' +
+        '• <b>봇 상태 점검</b>: <code>관리자 봇상태</code> (설정·DB·웹훅 오류 확인)\n' +
+        '• <b>채팅방 ID 확인</b>: <code>/방ID</code>\n' +
+        '• <b>상담방 찾기</b>: <code>관리자 찾기 이름</code> (대상자·인도자·교사 이름, 방 이름, 방 ID)',
+    },
+};
+
+function helpHome(isAdminUser: boolean) {
+    const keys = Object.keys(HELP_SECTIONS).filter((k) => k !== 'admin' || isAdminUser);
+    const rows = [];
+    for (let i = 0; i < keys.length; i += 2) {
+        rows.push(keys.slice(i, i + 2).map((k) => ({ text: HELP_SECTIONS[k].label, callback_data: `help:${k}` })));
+    }
+    return {
+        text:
+            '📌 <b>[상담/복음방 일정 관리 봇 안내]</b>\n\n' +
+            '궁금한 항목을 눌러 주세요.\n' +
+            '💡 자주 쓰는 기능은 <code>/메뉴</code> 에서 버튼으로 바로 쓸 수 있어요.',
+        reply_markup: { inline_keyboard: rows },
+    };
+}
+
 bot.hears(/^[\/!](start|help|도움말)(?:@\w+)?$/i, async (ctx) => {
-    await ctx.reply(
-        '📌 <b>[상담/복음방 일정 관리 봇 안내]</b>\n\n' +
-            '<b>1. 기본 설정 및 등록</b>\n' +
-            '• <b>대상자 최초 등록</b>: <code>/최초등록 섭외자/지역/팀/인도자</code>\n' +
-            '• <b>첫 만남 유형 바꾸기</b>: <code>/유형변경</code> (잘못 고른 경우, 인터뷰 결과 보고서·교사 만남 회차 전까지)\n' +
-            '• <b>자주 쓰는 기능 버튼</b>: <code>/메뉴</code> (만남일 · 보고서 양식 · 상태 확인 · 만남 중단)\n' +
-            '• <b>만남 전 피드백 양식</b>: <code>/피드백양식</code>\n' +
-            '• <b>현재 방 상태 확인</b>: <code>/상태확인</code>\n' +
-            '• <b>행정 등록 확인</b>: <code>/행정확인</code>\n' +
-            '• <b>목표월 수정</b>: <code>/목표월수정 n월</code>\n' +
-            '• <b>단계향상표 보기</b>: <code>/단계향상표</code>\n\n' +
-            '<b>2. 인터뷰 만남 단계</b>\n' +
-            '• <b>사전 보고서 등록</b>: 채팅방에 <code>[인터뷰 사전 보고서]</code> 양식 전송\n' +
-            '• <b>사전 보고서 양식</b>: <code>/인터뷰사전양식</code>\n' +
-            '• <b>인터뷰 항목 개별 수정</b>:\n' +
-            '   - 인터뷰어: <code>/인터뷰어 강북 1팀 귀요미</code>\n' +
-            '   - 타이퍼: <code>/타이퍼 강북 1팀 김공주</code> (해제: <code>/타이퍼 없음</code>)\n' +
-            '   - 예정일: <code>/인터뷰일 MM-DD</code>\n' +
-            '• <b>결과 보고서 양식</b>: <code>/인터뷰사후양식</code>\n' +
-            '   <i>(결과 보고서에서 [신청] 시 교사 만남으로 자동 전환, [행사참석] 시 행사 참석으로 따로 기록 → 이후 <code>/교사전환</code>)</i>\n' +
-            '• <b>인터뷰 전 연락두절·거절</b>: <code>/만남중단</code> → <b>인터뷰 전 중단</b>으로 구분 기록\n' +
-            '\n' +
-            '<b>3. 교사 만남 및 일정 관리</b>\n' +
-            '• <b>만남일 설정</b>: <code>/만남일 MM-DD</code> 또는 <code>/만남일 미정</code>\n' +
-            '• <b>만남 중단 처리</b>: <code>/만남중단 [상세 사유]</code> → 사유 버튼 선택\n' +
-            '• <b>피드백 제출</b>: 메시지 내 <code>#피드백</code> 태그 포함\n' +
-            '• <b>만남 보고서 양식</b>: <code>/만남보고서양식</code> 또는 <code>/교사만남양식</code>\n' +
-            '• <b>타겟</b>: <code>/타겟</code> (이 방 대상자의 합등·섭등·복등 타겟 상태 보기·정하기), 지역 담당방에서 <code>/타겟현황</code>\n' +
-            '• <b>교사 만남 누적 회차</b>: <code>/교사만남회차</code> (보정: <code>/교사만남회차 총횟수</code>, 마지막 1회 취소: <code>/회차취소</code>)\n' +
-            '• <b>섭등 후 회차</b>: <code>/섭등회차</code> (섭등일 만남 = 1회차, 보정: <code>/섭등회차 총횟수</code>)\n' +
-            '   <i>(섭등 후 3회차부터 복등 전이면 보고서 반영 때 복등 안내, 3회차 때 지역 담당방에도 알림)</i>\n' +
-            '• <b>만남 보고서 제출</b>: 양식 내 <code>다음만남일: MM-DD</code> 포함\n' +
-            '   <i>(사진 설명글로 올려도 인식됩니다. 이미 보낸 메시지를 편집하면 반영되지 않으니 다시 올려 주세요)</i>\n\n' +
-            '<b>4. 지역행사 · 동아리 · 지인 만남 · 당터뷰 (일정만 관리)</b>\n' +
-            '• <b>지정</b>: <code>/최초등록</code> 후 [🎉 지역행사] · [🧩 동아리] · [🤝 지인 만남] · [🗣️ 당터뷰] · [💬 온라인친분] 중 선택 → <code>/만남일 MM-DD</code>로 일정 등록\n' +
-            '• <b>교사 만남으로 전환</b>: <code>/교사전환</code>\n\n' +
-            '<b>5. 방 진행 단계 (특수 구분)</b>\n' +
-            '• <b>단계 설정</b>: <code>/섭등목표 MM-DD</code>, <code>/예정목표 MM-DD</code>, <code>/가능목표 MM-DD</code>, <code>/확정목표 MM-DD</code> (날짜만 입력)\n' +
-            '• <b>단계 해제</b>: <code>/구분해제</code> (일반 상태로 복귀)\n\n' +
-            '⏸ <b>진행이 멈춘 방 안내</b>: 최초등록·유형 선택·사전/사후 보고서·만남일·다음 일정이 비어 있거나 행정 탈락이면 오전 10시에 방으로 안내\n' +
-            '   <i>(방마다 하루 하나, 상황별 최대 3번 → 그래도 그대로면 지역 담당방에 요약)</i>\n\n' +
-            '📅 <b>날짜 입력 형식</b>: <code>10-08</code>, <code>10/8</code>, <code>10.8(목)</code>, <code>10월 8일</code>, <code>2026.10.8</code>, <code>내일</code>\n' +
-            '   시간도 함께 적으면 저장됩니다: <code>/만남일 10.8(목) 오후 7시</code>, <code>10/8 19:30</code>\n' +
-            '   <i>(요일이 실제와 다르거나 지난 날짜면 안내해 드립니다)</i>\n\n' +
-            '👑 <b>관리자 전용 명령어</b>\n' +
-            '• <b>인터뷰 예정건 모아보기</b>: <code>관리자 인터뷰</code>\n' +
-            '• <b>교사 만남 진행건 모아보기</b>: <code>관리자 교사</code>\n' +
-            '• <b>지역행사·동아리·지인 진행건 모아보기</b>: <code>관리자 지역행사</code>, <code>관리자 동아리</code>, <code>관리자 지인</code>, <code>관리자 당터뷰</code> (인터뷰 후속 행사: <code>관리자 행사</code>)\n' +
-            '• <b>만남 명단 조회</b>: <code>관리자 오늘만남</code>, <code>관리자 내일만남</code>, <code>관리자 일자만남 MM-DD</code>\n' +
-            '• <b>보고서 미제출 명단</b>: <code>관리자 미제출</code> (일괄 독촉: <code>관리자 미제출 알림</code>)\n' +
-            '• <b>미등록 및 미정 방 조회</b>: <code>관리자 미등록</code>\n' +
-            '• <b>만남일 경과 미갱신 방</b>: <code>관리자 미갱신</code> (타부서 교사 제외, 포함: <code>관리자 미갱신 타부서포함</code>)\n' +
-            '   일괄 독촉: <code>관리자 미갱신 알림</code>, <code>관리자 미갱신 타부서포함 알림</code>\n' +
-            '• <b>찾등 이상 봇 미초대 명단</b>: <code>관리자 미초대</code>\n' +
-            '• <b>만남 중단 방 목록</b>: <code>관리자 중단</code>\n' +
-            '• <b>필수 인원 방 참여 점검</b>: <code>관리자 인원점검</code> (모든 방 / 섭등 이상 방 / 개강 강사, 탈락·중단 제외)\n' +
-            '   개강 강사만: <code>관리자 강사점검</code>, 목표월만: <code>관리자 강사점검 11월</code>\n' +
-            '• <b>특수 구분 현황 (3가지 종합)</b>: <code>관리자 구분</code>\n' +
-            '• <b>구분별 단독 조회</b>: <code>관리자 n월 섭등목표</code>, <code>관리자 n월 예정목표</code>, <code>관리자 n월 가능목표</code>, <code>관리자 n월 확정목표</code>\n' +
-            '• <b>일반방 조회 (특수 3종 및 중단 제외)</b>: <code>관리자 n월 일반</code>\n' +
-            '   <i>(n월 = 대상자 목표월, 생략 시 전체)</i>\n' +
-            '• <b>전체 종합 관리 현황</b>: <code>관리자 점검</code>\n' +
-            '• <b>주간 요약</b>: <code>관리자 주간요약</code> (매주 월요일 오전 관리자에게 자동 발송)\n' +
-            '• <b>봇 사용 인증 현황</b>: <code>관리자 인증목록</code> (해제: <code>관리자 인증해제 ID</code>, 승인: <code>관리자 인증승인 ID</code>)\n' +
-            '• <b>지역 담당방 등록</b>: 담당방에서 <code>/담당방등록 강북</code> (해제: <code>/담당방해제</code>, 목록: <code>관리자 담당방</code>)\n' +
-            '   <i>(보고서 지연·만남 중단·매일 오전 10시/밤 10시 지역 요약이 담당방으로 자동 발송)</i>\n' +
-            '• <b>신규 만남 발생</b>: <code>관리자 신규</code> (기간: <code>오늘</code>, <code>어제</code>, <code>이번주</code>, <code>지난주</code>, <code>10월</code>)\n' +
-            '   <i>(상담 이하 = 인터뷰 매칭 / 지역행사 / 동아리 / 지인 만남 · 상담 1회차 = 교사 매칭, 밤 10시 지역 요약에도 포함)</i>\n' +
-            '• <b>담당방 공지</b>: <code>/담당방공지 내용</code> (특정 지역만: <code>/담당방공지 [강북,강남] 내용</code>)\n' +
-            '• <b>봇 상태 점검</b>: <code>관리자 봇상태</code> (설정·DB·웹훅 오류 확인)\n' +
-            '• <b>채팅방 ID 확인</b>: <code>/방ID</code>\n' +
-            '• <b>상담방 찾기</b>: <code>관리자 찾기 이름</code> (대상자·인도자·교사 이름, 방 이름, 방 ID)',
-        { parse_mode: 'HTML' }
-    );
+    const home = helpHome(isAdmin(ctx.from?.id));
+    await ctx.reply(home.text, { parse_mode: 'HTML', reply_markup: home.reply_markup });
+});
+
+bot.action(/^help:(\w+)$/, async (ctx) => {
+    const key = ctx.match[1];
+    const admin = isAdmin(ctx.from?.id);
+    if (key === 'admin' && !admin) return ctx.answerCbQuery('⛔ 관리자만 볼 수 있습니다.').catch(() => {});
+    await ctx.answerCbQuery().catch(() => {});
+    if (key === 'home') {
+        const home = helpHome(admin);
+        return ctx.editMessageText(home.text, { parse_mode: 'HTML', reply_markup: home.reply_markup }).catch(() => {});
+    }
+    const sec = HELP_SECTIONS[key];
+    if (!sec) return;
+    const back = [{ text: '⬅️ 목록', callback_data: 'help:home' }];
+    const rows = key === 'admin' ? [[{ text: '👑 관리자 메뉴', callback_data: 'run:관리자 메뉴' }], back] : [back];
+    await ctx.editMessageText(sec.text, { parse_mode: 'HTML', reply_markup: { inline_keyboard: rows } }).catch(() => {});
 });
 
 // 관리자: 채팅방·내 텔레그램 ID 확인 (/방ID, /내ID, /chatid)
@@ -3774,22 +3837,87 @@ const REPORT_REMINDER_KEYBOARD = {
 };
 
 // /메뉴: 자주 쓰는 기능을 버튼으로 (명령어를 몰라도 사용)
+const runBtn = (text: string, command: string) => ({ text, callback_data: `run:${command}` });
+
 bot.hears(/^[\/!](메뉴|menu)(?:@\w+)?$/i, async (ctx) => {
-    await ctx.reply('📋 <b>무엇을 할까요?</b>', {
-        parse_mode: 'HTML',
-        reply_markup: {
-            inline_keyboard: [
-                [
-                    { text: '📅 다음 만남일', callback_data: 'menu:date' },
+    try {
+        const helpRow = [{ text: '📖 도움말', callback_data: 'help:home' }];
+        if (ctx.chat.type === 'private') {
+            const rows = isAdmin(ctx.from?.id) ? [[runBtn('👑 관리자 메뉴', '관리자 메뉴')], helpRow] : [helpRow];
+            await ctx.reply('📋 <b>무엇을 할까요?</b>\n<i>(상담방 기능은 각 상담방에서 /메뉴 를 입력하세요)</i>', {
+                parse_mode: 'HTML',
+                reply_markup: { inline_keyboard: rows },
+            });
+            return;
+        }
+        const c = await getChatRecord(ctx.chat.id);
+        const rows: { text: string; callback_data: string }[][] = [];
+        if (!c?.matched_member_id) {
+            rows.push([runBtn('🆕 대상자 최초등록 방법', '/최초등록')]);
+        } else {
+            // 방의 만남 유형에 맞는 양식만
+            if (c.meeting_type === '인터뷰') {
+                rows.push([runBtn('📋 인터뷰 사전 양식', '/인터뷰사전양식'), runBtn('📋 인터뷰 결과 양식', '/인터뷰사후양식')]);
+            } else if (c.meeting_type === '교사') {
+                rows.push([
+                    { text: '📝 피드백 양식', callback_data: 'menu:feedback' },
                     { text: '📝 보고서 양식', callback_data: 'menu:form' },
-                ],
-                [
-                    { text: '📊 상태 확인', callback_data: 'menu:status' },
-                    { text: '🛑 만남 중단', callback_data: 'menu:stop' },
-                ],
-            ],
-        },
+                ]);
+            } else if (!c.meeting_type) {
+                rows.push([runBtn('🔀 첫 만남 유형 고르기', '/유형변경')]);
+            }
+            rows.push([
+                { text: '📅 다음 만남일', callback_data: 'menu:date' },
+                { text: '📊 상태 확인', callback_data: 'menu:status' },
+            ]);
+            rows.push([runBtn('🏛 행정 확인', '/행정확인'), runBtn('🎯 타겟', '/타겟')]);
+            rows.push([runBtn('🗓 목표월 수정', '/목표월수정'), { text: '🛑 만남 중단', callback_data: 'menu:stop' }]);
+        }
+        rows.push(helpRow);
+        await ctx.reply('📋 <b>무엇을 할까요?</b>', { parse_mode: 'HTML', reply_markup: { inline_keyboard: rows } });
+    } catch (err: unknown) {
+        console.error('[/메뉴 에러]:', getErrorMessage(err));
+        await replyError(ctx, '메뉴', err);
+    }
+});
+
+// 관리자 메뉴: 자주 쓰는 관리자 조회를 버튼으로 ('관리자' 로 시작하는 다른 명령보다 먼저 등록해야 함)
+const ADMIN_MENU = [
+    [['📊 종합 점검', '점검'], ['🧭 특수 구분', '구분']],
+    [['🎙️ 인터뷰 예정', '인터뷰'], ['👨‍🏫 교사 만남', '교사']],
+    [['📅 오늘 만남', '오늘만남'], ['📅 내일 만남', '내일만남']],
+    [['📝 보고서 미제출', '미제출'], ['⏰ 일정 미갱신', '미갱신']],
+    [['❓ 미등록·미정', '미등록'], ['🛑 만남 중단', '중단']],
+    [['🆕 신규 (이번 주)', '신규 이번주'], ['📈 주간 요약', '주간요약']],
+    [['🤖 봇 미초대', '미초대'], ['👥 인원 점검', '인원점검']],
+    [['🔐 인증 목록', '인증목록'], ['🏢 담당방', '담당방']],
+    [['🩺 봇 상태', '봇상태']],
+];
+bot.hears(/^[\/!]?관리자\s*메뉴(?:@\w+)?$/i, async (ctx) => {
+    if (!isAdmin(ctx.from?.id)) {
+        await ctx.reply('⛔ <b>접근 권한이 없습니다.</b> 관리자만 사용할 수 있습니다.', { parse_mode: 'HTML' });
+        return;
+    }
+    await ctx.reply('👑 <b>관리자 메뉴</b>\n<i>(기간·월을 정하려면 직접 입력: 예) <code>관리자 신규 10월</code>, <code>관리자 11월 섭등목표</code>)</i>', {
+        parse_mode: 'HTML',
+        reply_markup: { inline_keyboard: ADMIN_MENU.map((row) => row.map(([label, cmd]) => runBtn(label, `관리자 ${cmd}`))) },
     });
+});
+
+// 메뉴 버튼 → 그 명령어를 직접 입력한 것처럼 처리 (인증·관리자 확인도 그대로 거침)
+bot.action(/^run:(.+)$/, async (ctx) => {
+    await ctx.answerCbQuery().catch(() => {});
+    const message = ctx.callbackQuery.message;
+    if (!message) return;
+    try {
+        await bot.handleUpdate({
+            update_id: ctx.update.update_id,
+            message: { message_id: message.message_id, date: Math.floor(Date.now() / 1000), chat: message.chat, from: ctx.from, text: ctx.match[1] },
+        } as any);
+    } catch (err: unknown) {
+        console.error('[메뉴 버튼 에러]:', getErrorMessage(err));
+        await replyError(ctx, '메뉴', err);
+    }
 });
 
 bot.action(/^menu:(date|form|status|stop|feedback|ok)$/, async (ctx) => {
@@ -6818,6 +6946,25 @@ bot.hears(/^[\/!](?:교사\s*만남\s*회차|만남\s*회차|회차)(?:@\w+)?(?:
 
 // 10. 일반 텍스트 수신 (사전 보고서, 결과 보고서, 만남 보고서 및 #피드백 감지)
 // source: 'text' 일반 메시지 / 'caption' 사진·파일 설명글
+const KNOWN_COMMANDS = [
+    '메뉴', '도움말', '최초등록', '유형변경', '교사전환', '인터뷰사전양식', '인터뷰사후양식', '만남보고서양식', '피드백양식',
+    '인터뷰어', '타이퍼', '인터뷰일', '매칭해제', '행정확인', '목표월수정', '단계향상표', '상태확인', '만남중단', '만남일',
+    '구분해제', '섭등회차', '회차취소', '타겟', '타겟현황', '교사만남회차', ...PROGRESS_STAGES, '담당방등록', '담당방해제', '담당방공지',
+];
+
+async function replyUnknownCommand(ctx: any, text: string) {
+    // 글자로 시작하는 명령어 모양만 (예: '!!', '/ ' 는 대화로 봄), 다른 봇을 부른 명령어는 무시
+    const m = text.match(/^[!/]([가-힣A-Za-z][^\s@]*)(?:@(\w+))?/);
+    if (!m || (m[2] && m[2].toLowerCase() !== ctx.botInfo?.username?.toLowerCase())) return;
+    const similar = suggestCommands(m[1], KNOWN_COMMANDS);
+    await ctx.reply(
+        `🤔 <code>${escapeHtml(text.split(/\s/)[0])}</code> 명령어를 알아듣지 못했어요.\n` +
+            (similar.length ? `이걸 찾으셨나요? ${similar.map((c) => `<code>/${c}</code>`).join(' · ')}\n` : '') +
+            `\n버튼으로 고르려면 <code>/메뉴</code>, 전체 안내는 <code>/도움말</code>`,
+        { parse_mode: 'HTML' }
+    );
+}
+
 async function handleIncomingText(ctx: any, rawText: string, source: 'text' | 'caption') {
     const text = rawText.trim();
     const chatId = ctx.chat.id;
@@ -6830,10 +6977,12 @@ async function handleIncomingText(ctx: any, rawText: string, source: 'text' | 'c
 
     await ensureChatRecord(chatId, roomTitle);
 
-    // 슬래시(/)나 느낌표(!)로 시작하는 정식 명령어 텍스트는 무시
-    if (/^[!/]/i.test(text) || /^관리자\s+/i.test(text)) {
+    // 슬래시(/)나 느낌표(!)로 시작하는 텍스트가 여기까지 왔으면 모르는 명령어 → 비슷한 명령어 안내
+    if (/^[!/]/i.test(text)) {
+        await replyUnknownCommand(ctx, text);
         return;
     }
+    if (/^관리자\s+/i.test(text)) return;
 
     // [다음 만남일 다시 입력] 버튼으로 띄운 질문에 답장한 경우
     const repliedTo = ctx.message?.reply_to_message;
@@ -7622,15 +7771,8 @@ server.listen(PORT, async () => {
             secret_token: WEBHOOK_SECRET,
         });
         console.log(`Telegram Webhook 등록 완료: ${webhookUrl}`);
-        // 입력창에서 / 를 누르면 보이는 명령어 목록 (텔레그램은 영문 소문자 명령어만 등록 가능 → 영문 별칭)
-        await bot.telegram.setMyCommands([
-            { command: 'menu', description: '자주 쓰는 기능 버튼 (/메뉴)' },
-            { command: 'date', description: '다음 만남일 등록 (/만남일)' },
-            { command: 'report', description: '만남 보고서 양식 (/만남보고서양식)' },
-            { command: 'feedback', description: '만남 전 피드백 양식 (/피드백양식)' },
-            { command: 'status', description: '현재 방 상태 확인 (/상태확인)' },
-            { command: 'help', description: '도움말' },
-        ]);
+        // 입력창의 / 명령어 추천이 대화에 방해돼서 끔 (텔레그램에 저장된 목록이라 지워야 사라짐). 명령어는 직접 쳐도 그대로 동작
+        await bot.telegram.deleteMyCommands();
     } catch (e: unknown) {
         console.error('Webhook 등록 에러:', getErrorMessage(e));
     }

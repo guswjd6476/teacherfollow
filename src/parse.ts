@@ -210,3 +210,22 @@ export function weekDateOptions(todayYmd: string): { thisWeek: string[]; nextWee
         Array.from({ length: n }, (_, i) => start.add(i, 'day').format('YYYY-MM-DD'));
     return { thisWeek: days(today, daysToSunday + 1), nextWeek: days(today.add(daysToSunday + 1, 'day'), 7) };
 }
+
+// 잘못 친 명령어와 비슷한 명령어 (글자 두 개씩 겹치는 정도, 비슷한 순서로 최대 3개)
+export function suggestCommands(input: string, commands: string[]): string[] {
+    const pairs = (s: string) => {
+        const t = s.replace(/\s+/g, '').toLowerCase();
+        return t.length < 2 ? [t] : Array.from({ length: t.length - 1 }, (_, i) => t.slice(i, i + 2));
+    };
+    const a = pairs(input);
+    return commands
+        .map((cmd) => {
+            const b = pairs(cmd);
+            const common = a.filter((p) => b.includes(p)).length;
+            return { cmd, score: (2 * common) / (a.length + b.length) };
+        })
+        .filter((x) => x.score >= 0.3)
+        .sort((x, y) => y.score - x.score)
+        .slice(0, 3)
+        .map((x) => x.cmd);
+}
