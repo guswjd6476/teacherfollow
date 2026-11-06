@@ -11,7 +11,6 @@ import {
     targetScore,
     targetScoreText,
     targetStatusText,
-    targetSummaryText,
 } from '../src/target.ts';
 
 const person = {
@@ -59,21 +58,8 @@ test('목표월 키: n월만, 장기·빈 값은 없음', () => {
     assert.ok(monthOrder('1월', 11) < monthOrder('10월', 11)); // 이번 달부터 앞으로
 });
 
-test('명단 한 줄 형식과 지역 현황 (목표월별)', () => {
+test('명단 한 줄 형식', () => {
     assert.equal(targetLine(person, ['11월 합등 타겟']), '합/홍길동/도봉/1-2/김인도////11월 합등 타겟');
-    const text = targetSummaryText(
-        '도봉',
-        [
-            { ...person, kind: '섭등', stage: '섭', target_month: '12월' },
-            { ...person, kind: '합등' },
-            { ...person, kind: '섭등', stage: '섭' },
-        ],
-        11,
-    );
-    assert.match(text, /현재 타겟 3명 \(합등 1건 · 섭등 2점 · 복등 0점\)/);
-    assert.match(text, /\[11월 타겟 2명\]<\/b> 합등 1건 · 섭등 1점 · 복등 0점/);
-    assert.match(text, /\[12월 타겟 1명\]/);
-    assert.ok(text.indexOf('[11월') < text.indexOf('[12월')); // 이번 달부터
 });
 
 test('/타겟현황: 목표월마다 타겟·미정·아님, 목표월 없음은 끝', () => {

@@ -29,7 +29,6 @@ import {
     targetLine,
     targetMonthKey,
     targetStatusText,
-    targetSummaryText,
     type TargetKind,
     type TargetPerson,
 } from './target.js';
@@ -6368,21 +6367,6 @@ async function setMeta(key: string, value: string) {
     );
 }
 
-// 현재 타겟: 지금 단계·지금 목표월 타겟으로 정한 학생 (탈락·만남 중단 제외). target_month = 'n월'
-async function loadCurrentTargets(): Promise<(TargetPerson & { kind: TargetKind })[]> {
-    return (
-        await neonPool.query(
-            `SELECT ${TARGET_PERSON_SQL}, st.kind
-             FROM student_targets st
-             JOIN students s ON s.id = st.student_id
-             LEFT JOIN members m ON s."인도자_고유번호" = m."고유번호"
-             LEFT JOIN members t ON s."교사_고유번호" = t."고유번호"
-             WHERE st.answer AND s."탈락" IS NULL AND st.kind = ${KIND_SQL} AND st.target_month = ${monthKeySql('s.target')}
-               AND NOT ${STOPPED_SQL}`
-        )
-    ).rows;
-}
-
 // /타겟현황용: 합·섭·복 진행 중 전원 (탈락·만남 중단 제외) + 지금 목표월·단계 타겟 답 (없으면 미정)
 async function loadTargetStatus(): Promise<(TargetPerson & { kind: TargetKind; answer: boolean | null })[]> {
     return (
@@ -6401,7 +6385,7 @@ async function loadTargetStatus(): Promise<(TargetPerson & { kind: TargetKind; a
 const inRegion = (region: string, p: Pick<TargetPerson, 'guide_region' | 'teacher_region'>) =>
     regionMatches(region, p.guide_region) || regionMatches(region, p.teacher_region);
 
-// 목표월이 바뀐 건 → 상담방에 새 목표월 타겟을 묻고, 지역 담당방에 알림 + 그 지역 현재 타겟(목표월별) 명단·건수
+// 목표월이 바뀐 건 → 상담방에 새 목표월 타겟을 묻고, 지역 담당방에 알림 + 그 지역 목표월별 타겟·미정·아님 명단·건수
 async function checkTargetMonthChanges() {
     const init = await neonPool.query(`SELECT COALESCE(MAX(id), 0)::text AS id FROM student_target_history`);
     const cursor = Number(await getOrInitMeta('target_history_cursor', () => init.rows[0].id));
@@ -6453,7 +6437,7 @@ async function checkTargetMonthChanges() {
 
         // 지역 담당방
         const regionChats = await getRegionChats();
-        const targets = await loadCurrentTargets();
+        const people = await loadTargetStatus(); // 목표월마다 타겟·미정·아님
         const byChat = new Map<string, string[]>();
         for (const rc of regionChats) byChat.set(rc.chat_id, [...(byChat.get(rc.chat_id) ?? []), rc.region]);
         for (const [chatId, regions] of byChat) {
@@ -6468,7 +6452,7 @@ async function checkTargetMonthChanges() {
                     ])}`
             );
             const summaries = regions.map((r) =>
-                targetSummaryText(r, targets.filter((p) => inRegion(r, p)), thisMonth(), 40, (v) => regionMatches(r, v))
+                targetStatusText(r, people.filter((p) => inRegion(r, p)), thisMonth(), 40, (v) => regionMatches(r, v))
             );
             const text =
                 `📅 <b>[목표월 변경 ${mine.length}건]</b>\n` +

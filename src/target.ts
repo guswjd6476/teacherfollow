@@ -109,36 +109,6 @@ export function targetScoreText(rows: (Pick<TargetPerson, 'guide_region' | 'teac
     }).join(' · ');
 }
 
-// 지역(인도자 또는 교사 지역) 안의 현재 타겟 현황 글: 목표월마다 단계별 건수 + 명단 (maxLines 넘으면 '…외 n명')
-// currentMonth: 이번 달 (목표월을 이번 달부터 앞으로 순서로)
-export function targetSummaryText(
-    title: string,
-    people: (TargetPerson & { kind: TargetKind })[],
-    currentMonth: number,
-    maxLines = 40,
-    inRg: InRegion = ANY_REGION,
-): string {
-    people = people.filter((p) => targetScore(p, inRg) > 0); // 합등은 인도자 지역에만
-    const months = [...new Set(people.map((p) => p.target_month))].sort(
-        (a, b) => monthOrder(a, currentMonth) - monthOrder(b, currentMonth),
-    );
-    const head = `🎯 <b>${esc(title)}</b> 현재 타겟 ${people.length}명 (${targetScoreText(people, inRg)})`;
-    if (!people.length) return `${head}\n• 없음`;
-    let left = maxLines;
-    const blocks = months.map((m) => {
-        const mine = people
-            .filter((p) => p.target_month === m)
-            .sort((a, b) => TARGET_KINDS.indexOf(a.kind) - TARGET_KINDS.indexOf(b.kind) || String(a.name).localeCompare(String(b.name)));
-        const counts = targetScoreText(mine, inRg);
-        const shown = mine.slice(0, Math.max(0, left));
-        left -= shown.length;
-        const lines = shown.map((p) => `• ${targetLine(p, [`${p.target_month} ${p.kind} 타겟`])}`);
-        if (mine.length > shown.length) lines.push(`…외 ${mine.length - shown.length}명`);
-        return `<b>[${esc(m)} 타겟 ${mine.length}명]</b> ${counts}\n${lines.join('\n')}`;
-    });
-    return `${head}\n${blocks.join('\n')}`;
-}
-
 // /타겟현황: 합·섭·복 진행 중 전원을 목표월마다 타겟·미정·아님으로 나눈 글 (목표월 없음은 끝, maxLines 넘으면 '…외 n명')
 // answer: 지금 목표월·단계 타겟 답 (true 타겟, false 아님, null 미정). target_month가 null이면 목표월 없음
 export function targetStatusText(
