@@ -31,12 +31,45 @@ export interface TeacherCandidate {
 // 웹 '배정 가능한 교사'와 같은 기준: 지금 맡은 학생이 이만큼이면 바쁨
 export const BUSY_LOAD = 3;
 
-export const isTeacherRequest = (text: string) =>
-    /교사\s*(?:를\s*)?구합니다/.test(text) || (/섭외자\s*정보/.test(text) && /원하는\s*교사/.test(text));
+// 지역 담당방에 올리는 교사 매칭 양식 (/교사매칭양식). 이 양식으로 통일해서 쓴다
+export const TEACHER_REQUEST_TEMPLATE = `💙 교사 구합니다 💙
 
-// 양식의 '* 항목: 값' 줄에서 값 (줄 앞 기호·공백은 무시)
+* 지역:
+* 팀-구역(구역장이름):
+* 인도자 이름:
+
+🍎섭외자 정보
+* 이름:
+* 나이/성별:
+* 인도자 오픈 여부(공개/비공개):
+
+* 영,육정보:
+✔️영
+- 종교 (기,불,천,무신앙) :
+- 추가 내용 :
+
+✔️육
+- mbti / 에니어 :
+- 직업 / 학교 :
+- 추가 내용 :
+
+* 전도진행상황 :
+
+* 원하는교사유형:
+
+
+* 만남가능 시간대:
+
+* 문의처: `;
+
+export const isTeacherRequest = (text: string) =>
+    /교사\s*(?:를\s*)?구합니다|교사님?을\s*찾습니다/.test(text) || (/섭외자\s*정보/.test(text) && /원하는\s*교사/.test(text));
+
+// 양식의 '* 항목: 값' 줄에서 값 (줄 앞 기호·공백은 무시, 빈칸이면 null — 다음 줄로 넘어가지 않게 [ \t]*)
 const field = (text: string, label: string) =>
-    text.match(new RegExp(`^[\\s*•▪️\\-]*${label}\\s*[:：]\\s*(.*)$`, 'm'))?.[1].trim() || null;
+    text.match(new RegExp(`^[ \\t*•▪️\\-]*${label}[ \\t]*[:：][ \\t]*(.*)$`, 'mi'))?.[1].trim() || null;
+
+const MBTI_RE = /(?<![A-Za-z])([EI][NS][FT][JP])(?![A-Za-z])/i;
 
 const DAYS = ['평일', '주말'];
 const TIMES = ['오전', '오후', '저녁'];
@@ -61,20 +94,25 @@ export function parseTeacherRequest(rawText: string): TeacherRequest {
     const text = rawText.normalize('NFKC');
     const ageGender = field(text, '나이\\s*/\\s*성별');
     const enneaMatch = text.match(/(?<!\d)([1-9])\s*[wW]\s*([1-9])(?!\d)/);
-    const enneaOnly = text.match(/[에애]니어\S*\s*[:：]?\s*([1-9])(?!\d)/);
+    // '- mbti / 에니어 : ISFJ / 9' 처럼 날개 없이 번호만 적은 경우, 또는 '에니어 9번'
+    const mbtiEnnea = field(text, 'mbti\\s*/\\s*[에애]니어\\S*')?.replace(MBTI_RE, '');
+    const enneaOnly = mbtiEnnea?.match(/(?<!\d)([1-9])(?!\d)/) ?? text.match(/[에애]니어\S*[ \t]*[:：]?[ \t]*([1-9])(?!\d)/);
     return {
         region: field(text, '지역'),
         name: field(text, '이름'),
         age: Number(ageGender?.match(/\d{1,2}/)?.[0]) || Number(field(text, '나이')?.match(/\d{1,2}/)?.[0]) || null,
         gender: ((ageGender ?? field(text, '성별'))?.match(/남|여/)?.[0] as '남' | '여' | undefined) ?? null,
-        mbti: text.match(/(?<![A-Za-z])([EI][NS][FT][JP])(?![A-Za-z])/i)?.[1].toUpperCase() ?? null,
+        mbti: text.match(MBTI_RE)?.[1].toUpperCase() ?? null,
         ennea: Number(enneaMatch?.[1] ?? enneaOnly?.[1]) || null,
         enneaText: enneaMatch ? `${enneaMatch[1]}W${enneaMatch[2]}` : (enneaOnly?.[1] ?? null),
         slots: parseSlots(field(text, '만남\\s*가능\\s*시간대?')),
     };
 }
 
-const sameLetters = (a: string, b: string) => [...a].filter((ch, i) => ch === b[i]).length;
+// 빈 양식을 그대로 올린 경우 (추천하지 않음)
+export const isBlankRequest = (r: TeacherRequest) => !r.name && !r.age && !r.mbti && !r.ennea;
+
+const sameLetters =(a: string, b: string) => [...a].filter((ch, i) => ch === b[i]).length;
 
 export function ageOf(birthYear: string | null, thisYear: number): number | null {
     const y = Number(String(birthYear ?? '').trim());

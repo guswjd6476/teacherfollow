@@ -1,6 +1,14 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { isTeacherRequest, parseSlots, parseTeacherRequest, recommendTeachers, type TeacherCandidate } from '../src/teacherMatch.ts';
+import {
+    isBlankRequest,
+    isTeacherRequest,
+    parseSlots,
+    parseTeacherRequest,
+    recommendTeachers,
+    TEACHER_REQUEST_TEMPLATE,
+    type TeacherCandidate,
+} from '../src/teacherMatch.ts';
 
 // 지역 담당방에 실제로 올라온 양식 (연락처는 지움)
 const FORM = `#만국소성 #생명나무잎사귀 #중랑
@@ -58,6 +66,31 @@ test('양식 인식과 항목 읽기', () => {
         enneaText: '9W1',
         slots: ['주말 오후', '주말 저녁'],
     });
+});
+
+test('새 양식 (/교사매칭양식): 채운 양식은 읽고, 빈 양식은 추천 안 함', () => {
+    const filled = TEACHER_REQUEST_TEMPLATE.replace('* 지역:', '* 지역: 중랑')
+        .replace('* 이름:', '* 이름: 남예지')
+        .replace('* 나이/성별:', '* 나이/성별: 20/여')
+        .replace('- mbti / 에니어 :', '- mbti / 에니어 : isfj / 9')
+        .replace('* 만남가능 시간대:', '* 만남가능 시간대: 평일 저녁');
+    assert.equal(isTeacherRequest(filled), true);
+    assert.deepEqual(parseTeacherRequest(filled), {
+        region: '중랑',
+        name: '남예지',
+        age: 20,
+        gender: '여',
+        mbti: 'ISFJ',
+        ennea: 9,
+        enneaText: '9',
+        slots: ['평일 저녁'],
+    });
+    // 빈칸 다음 줄을 값으로 읽지 않는다
+    const blank = parseTeacherRequest(TEACHER_REQUEST_TEMPLATE);
+    assert.equal(blank.name, null);
+    assert.equal(blank.region, null);
+    assert.equal(isBlankRequest(blank), true);
+    assert.equal(isTeacherRequest('💙 교사님을 찾습니다 💙'), true);
 });
 
 test('만남 가능 시간', () => {

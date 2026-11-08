@@ -34,7 +34,7 @@ import {
     type TargetPerson,
 } from './target.js';
 import { campaignKey, campaignsInChakCheck, chakAskText, nextMonthOf } from './chakCheck.js';
-import { isTeacherRequest, parseTeacherRequest, recommendTeachers, type TeacherCandidate } from './teacherMatch.js';
+import { isBlankRequest, isTeacherRequest, parseTeacherRequest, recommendTeachers, TEACHER_REQUEST_TEMPLATE, type TeacherCandidate } from './teacherMatch.js';
 
 dayjs.extend(customParseFormat);
 dayjs.extend(utc);
@@ -1369,6 +1369,7 @@ async function isRegionChat(chatId: number | string): Promise<boolean> {
 // 대상: 탈락하지 않은 교사 중 프로필을 쓴 교사, 학생과 같은 성별
 async function replyTeacherRecommendation(ctx: any, text: string) {
     const req = parseTeacherRequest(text);
+    if (isBlankRequest(req)) return; // 빈 양식을 그대로 올린 경우
     const res = await neonPool.query(
         `SELECT t.uid, m.이름 AS name, m.지역 AS region, m.구역 AS team,
                 tp.gender, tp.birth_year AS "birthYear", tp.mbti, tp.enneagram, tp.preferences,
@@ -2630,6 +2631,7 @@ const HELP_SECTIONS: Record<string, { label: string; text: string }> = {
         '• <b>전체 종합 관리 현황</b>: <code>관리자 점검</code>\n' +
         '• <b>주간 요약</b>: <code>관리자 주간요약</code> (매주 월요일 오전 관리자에게 자동 발송)\n' +
         '• <b>봇 사용 인증 현황</b>: <code>관리자 인증목록</code> (해제: <code>관리자 인증해제 ID</code>, 승인: <code>관리자 인증승인 ID</code>)\n' +
+        '• <b>교사 매칭 양식</b>: 지역 담당방에서 <code>/교사매칭양식</code> (작성해서 올리면 추천 교사를 답장)\n' +
         '• <b>지역 담당방 등록</b>: 담당방에서 <code>/담당방등록 강북</code> (해제: <code>/담당방해제</code>, 목록: <code>관리자 담당방</code>)\n' +
         '   <i>(보고서 지연·만남 중단·매일 오전 10시/밤 10시 지역 요약이 담당방으로 자동 발송)</i>\n' +
         '• <b>신규 만남 발생</b>: <code>관리자 신규</code> (기간: <code>오늘</code>, <code>어제</code>, <code>이번주</code>, <code>지난주</code>, <code>10월</code>)\n' +
@@ -3665,6 +3667,19 @@ bot.hears(/^[\/!]교사\s*전환(?:@\w+)?$/i, async (ctx) => {
         console.error('[/교사전환 에러]:', err);
         await replyError(ctx, '교사 전환', err);
     }
+});
+
+// 교사 매칭 양식 출력 (/교사매칭양식). 지역 담당방에 작성해 올리면 추천 교사를 답한다 (replyTeacherRecommendation)
+bot.hears(/^[\/!](교사매칭양식|매칭양식|교사구함양식)(?:@\w+)?$/i, async (ctx) => {
+    await ctx.reply(
+        `📋 <b>[교사 매칭 양식]</b>\n\n` +
+            `👇 <b>아래 양식을 눌러 복사</b>한 뒤 작성하여 지역 담당방에 올려주세요.\n` +
+            `<code>${escapeHtml(TEACHER_REQUEST_TEMPLATE)}</code>\n\n` +
+            `💡 <b>안내:</b>\n` +
+            `• <b>나이/성별</b>은 <code>20/여</code>, <b>mbti / 에니어</b>는 <code>ISFJ / 9W1</code> 처럼 적어주세요.\n` +
+            `• 올리면 봇이 교사 프로필(선호 MBTI·에니어그램, 나이, 만남 시간)로 추천 교사를 답장합니다. 같은 지역 교사가 먼저 나옵니다.`,
+        { parse_mode: 'HTML' }
+    );
 });
 
 // 인터뷰 사전 보고서 양식 출력 (/인터뷰사전양식)
@@ -6989,7 +7004,7 @@ bot.hears(/^[\/!](?:교사\s*만남\s*회차|만남\s*회차|회차)(?:@\w+)?(?:
 const KNOWN_COMMANDS = [
     '메뉴', '도움말', '최초등록', '유형변경', '교사전환', '인터뷰사전양식', '인터뷰사후양식', '만남보고서양식', '피드백양식',
     '인터뷰어', '타이퍼', '인터뷰일', '매칭해제', '행정확인', '목표월수정', '단계향상표', '상태확인', '만남중단', '만남일',
-    '구분해제', '섭등회차', '회차취소', '타겟', '타겟현황', '교사만남회차', ...PROGRESS_STAGES, '담당방등록', '담당방해제', '담당방공지',
+    '구분해제', '섭등회차', '회차취소', '타겟', '타겟현황', '교사매칭양식', '교사만남회차', ...PROGRESS_STAGES, '담당방등록', '담당방해제', '담당방공지',
 ];
 
 async function replyUnknownCommand(ctx: any, text: string) {
