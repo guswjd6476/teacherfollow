@@ -17,6 +17,7 @@ export interface TeacherCandidate {
     name: string;
     region: string | null;
     team: string | null;
+    type: string | null; // 교사 구분 (정교사·교사·예비교사)
     gender: string | null;
     birthYear: string | null;
     mbti: string | null;
@@ -161,12 +162,19 @@ export function scoreTeacher(req: TeacherRequest, t: TeacherCandidate, thisYear:
     return { score, reasons, age };
 }
 
-// 같은 지역 교사로 먼저 최대 sameMax명, 나머지 자리는 다른 지역 교사로 (각각 점수 순)
-export function recommendTeachers(req: TeacherRequest, teachers: TeacherCandidate[], thisYear: number, limit = 5, sameMax = 3) {
+// 정교사 → 교사 → 예비교사 순 (구분이 같으면 점수 순)
+export const TEACHER_TYPES = ['정교사', '교사', '예비교사'];
+const typeRank = (type: string | null) => {
+    const i = TEACHER_TYPES.indexOf(String(type ?? '').trim());
+    return i < 0 ? TEACHER_TYPES.length : i;
+};
+
+// 같은 지역 교사 최대 sameMax명 + 다른 지역 교사 최대 otherMax명 (각각 정교사부터, 같은 구분 안에서는 점수 순)
+export function recommendTeachers(req: TeacherRequest, teachers: TeacherCandidate[], thisYear: number, sameMax = 5, otherMax = 3) {
     const ranked = teachers
         .filter((t) => !req.gender || !t.gender || t.gender === req.gender)
         .map((t) => ({ teacher: t, sameRegion: !!req.region && t.region === req.region, ...scoreTeacher(req, t, thisYear) }))
-        .sort((a, b) => b.score - a.score || a.teacher.load - b.teacher.load || a.teacher.name.localeCompare(b.teacher.name, 'ko'));
+        .sort((a, b) => typeRank(a.teacher.type) - typeRank(b.teacher.type) || b.score - a.score || a.teacher.load - b.teacher.load || a.teacher.name.localeCompare(b.teacher.name, 'ko'));
     const same = ranked.filter((r) => r.sameRegion).slice(0, sameMax);
-    return [...same, ...ranked.filter((r) => !r.sameRegion).slice(0, limit - same.length)];
+    return [...same, ...ranked.filter((r) => !r.sameRegion).slice(0, otherMax)];
 }

@@ -1371,7 +1371,7 @@ async function replyTeacherRecommendation(ctx: any, text: string) {
     const req = parseTeacherRequest(text);
     if (isBlankRequest(req)) return; // 빈 양식을 그대로 올린 경우
     const res = await neonPool.query(
-        `SELECT t.uid, m.이름 AS name, m.지역 AS region, m.구역 AS team,
+        `SELECT t.uid, m.이름 AS name, m.지역 AS region, m.구역 AS team, t.type,
                 tp.gender, tp.birth_year AS "birthYear", tp.mbti, tp.enneagram, tp.preferences,
                 tp.available_times AS "availableTimes", tp.major, tp.occupation,
                 (SELECT COUNT(*)::int FROM students s
@@ -1389,7 +1389,7 @@ async function replyTeacherRecommendation(ctx: any, text: string) {
         .join(' · ');
     const missing = [!req.mbti && 'MBTI', !req.ennea && '에니어그램', !req.age && '나이', !req.gender && '성별'].filter(Boolean);
     let msg = `🧑‍🏫 <b>${escapeHtml(req.name ?? '섭외자')}${who ? ` (${escapeHtml(who)})` : ''} 추천 교사</b>\n`;
-    msg += `<i>교사 프로필 기준 · 선호 MBTI·에니어그램, 나이, 만남 시간, 관리건수 순 · 같은 지역 먼저${req.gender ? ` · ${req.gender} 교사만` : ''}</i>\n`;
+    msg += `<i>교사 프로필 기준 · 선호 MBTI·에니어그램, 나이, 만남 시간, 관리건수 · 정교사부터 · 같은 지역 먼저${req.gender ? ` · ${req.gender} 교사만` : ''}</i>\n`;
     if (missing.length) msg += `⚠️ 양식에서 ${missing.join('·')}을(를) 찾지 못해 빼고 계산했습니다.\n`;
     if (!list.length) msg += '\n추천할 교사가 없습니다. (프로필을 쓴 교사가 없거나 조건이 맞지 않음)';
     list.forEach(({ teacher: t, reasons, age, sameRegion }, i) => {
@@ -1398,7 +1398,7 @@ async function replyTeacherRecommendation(ctx: any, text: string) {
             msg += sameRegion ? `\n📍 <b>같은 지역 (${escapeHtml(req.region)})</b>\n` : `\n🌐 <b>다른 지역</b>\n`;
         const info = [age !== null ? `${age}/${t.gender ?? '-'}` : t.gender, t.mbti, t.enneagram].filter(Boolean).join(' · ');
         const job = [t.major && `전공 ${t.major}`, t.occupation && `직업 ${t.occupation}`].filter(Boolean).join(' · ');
-        msg += `${i + 1}. <b>${escapeHtml([t.region, t.team, t.name].filter(Boolean).join(' '))}</b> (${escapeHtml(info)}) · 관리 ${t.load}건\n`;
+        msg += `${i + 1}. <b>${escapeHtml([t.region, t.team, t.name].filter(Boolean).join(' '))}</b> (${escapeHtml(info)}) · ${escapeHtml(t.type ?? '구분 없음')} · 관리 ${t.load}건\n`;
         if (reasons.length) msg += `   └ ${escapeHtml(reasons.join(', '))}\n`;
         if (job) msg += `   └ ${escapeHtml(job)}\n`;
     });

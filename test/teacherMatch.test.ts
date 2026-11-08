@@ -41,6 +41,7 @@ const teacher = (over: Partial<TeacherCandidate>): TeacherCandidate => ({
     name: '교사',
     region: '중랑',
     team: '1',
+    type: '교사',
     gender: '여',
     birthYear: '2002',
     mbti: 'INFJ',
@@ -93,6 +94,21 @@ test('새 양식 (/교사매칭양식): 채운 양식은 읽고, 빈 양식은 �
     assert.equal(isTeacherRequest('💙 교사님을 찾습니다 💙'), true);
 });
 
+test('정교사부터 (점수가 낮아도), 같은 구분 안에서는 점수 순', () => {
+    const req = parseTeacherRequest(FORM);
+    const best = { preferences: [{ mbti: 'ISFJ', ennea: '9' }] };
+    const list = recommendTeachers(
+        req,
+        [
+            teacher({ uid: 'pre', name: '예비', type: '예비교사', ...best }),
+            teacher({ uid: 'mid', name: '교사', ...best }),
+            teacher({ uid: 'full', name: '정교사', type: '정교사' }),
+        ],
+        2026,
+    );
+    assert.deepEqual(list.map((r) => r.teacher.uid), ['full', 'mid', 'pre']);
+});
+
 test('만남 가능 시간', () => {
     assert.deepEqual(parseSlots('평일 저녁'), ['평일 저녁']);
     assert.deepEqual(parseSlots('주말'), ['주말 오전', '주말 오후', '주말 저녁']);
@@ -116,7 +132,7 @@ test('선호 유형·나이·바쁨 순으로 추천, 성별 다른 교사는 �
     assert.equal(list[0].score, 3 + 2 + 2 + 1);
 });
 
-test('같은 지역 먼저 3명까지, 남은 자리는 다른 지역 (점수가 더 높아도 다른 지역은 뒤)', () => {
+test('같은 지역 5명까지 먼저, 다른 지역 3명까지 (점수가 더 높아도 다른 지역은 뒤)', () => {
     const req = parseTeacherRequest(FORM);
     const best = { preferences: [{ mbti: 'ISFJ', ennea: '9' }] };
     const list = recommendTeachers(
@@ -129,8 +145,11 @@ test('같은 지역 먼저 3명까지, 남은 자리는 다른 지역 (점수가
             teacher({ uid: 's2', name: '같은2' }),
             teacher({ uid: 's3', name: '같은3' }),
             teacher({ uid: 's4', name: '같은4' }),
+            teacher({ uid: 's5', name: '같은5' }),
+            teacher({ uid: 's6', name: '같은6' }),
+            teacher({ uid: 'o4', name: '다른4', region: '중구', ...best }),
         ],
         2026,
     );
-    assert.deepEqual(list.map((r) => r.teacher.uid), ['s1', 's2', 's3', 'o1', 'o2']);
+    assert.deepEqual(list.map((r) => r.teacher.uid), ['s1', 's2', 's3', 's4', 's5', 'o1', 'o2', 'o3']);
 });
