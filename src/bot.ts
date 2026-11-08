@@ -34,6 +34,7 @@ import {
     type TargetPerson,
 } from './target.js';
 import { campaignKey, campaignsInChakCheck, chakAskText, nextMonthOf } from './chakCheck.js';
+import { isTeacherRequest, parseTeacherRequest, recommendTeachers, type TeacherCandidate } from './teacherMatch.js';
 
 dayjs.extend(customParseFormat);
 dayjs.extend(utc);
@@ -1362,6 +1363,45 @@ async function getRegionChats(): Promise<RegionChat[]> {
 async function isRegionChat(chatId: number | string): Promise<boolean> {
     const res = await neonPool.query(`SELECT 1 FROM region_chats WHERE chat_id = $1 LIMIT 1`, [String(chatId)]);
     return res.rows.length > 0;
+}
+
+// 지역 담당방에 '교사 구합니다' 양식이 오면 교사 프로필로 추천 교사를 답한다 (점수 규칙은 teacherMatch.ts)
+// 대상: 탈락하지 않은 교사 중 프로필을 쓴 교사, 학생과 같은 성별
+async function replyTeacherRecommendation(ctx: any, text: string) {
+    const req = parseTeacherRequest(text);
+    const res = await neonPool.query(
+        `SELECT t.uid, m.이름 AS name, m.지역 AS region, m.구역 AS team,
+                tp.gender, tp.birth_year AS "birthYear", tp.mbti, tp.enneagram, tp.preferences,
+                tp.available_times AS "availableTimes", tp.major, tp.occupation,
+                (SELECT COUNT(*)::int FROM students s
+                  WHERE s.교사_고유번호 = t.uid AND s.단계 IN ('합', '섭', '복', '예정')) AS load
+         FROM teachers t
+         JOIN members m ON m.고유번호 = t.uid
+         JOIN teacher_profiles tp ON tp.uid = t.uid
+         WHERE NOT COALESCE(t.fail, false)`
+    );
+    const thisYear = dayjs().tz('Asia/Seoul').year();
+    const list = recommendTeachers(req, res.rows as TeacherCandidate[], thisYear);
+
+    const who = [req.age && req.gender ? `${req.age}/${req.gender}` : req.age ?? req.gender, req.mbti, req.enneaText]
+        .filter(Boolean)
+        .join(' · ');
+    const missing = [!req.mbti && 'MBTI', !req.ennea && '에니어그램', !req.age && '나이', !req.gender && '성별'].filter(Boolean);
+    let msg = `🧑‍🏫 <b>${escapeHtml(req.name ?? '섭외자')}${who ? ` (${escapeHtml(who)})` : ''} 추천 교사</b>\n`;
+    msg += `<i>교사 프로필 기준 · 선호 MBTI·에니어그램, 나이, 만남 시간, 관리건수 순 · 같은 지역 먼저${req.gender ? ` · ${req.gender} 교사만` : ''}</i>\n`;
+    if (missing.length) msg += `⚠️ 양식에서 ${missing.join('·')}을(를) 찾지 못해 빼고 계산했습니다.\n`;
+    if (!list.length) msg += '\n추천할 교사가 없습니다. (프로필을 쓴 교사가 없거나 조건이 맞지 않음)';
+    list.forEach(({ teacher: t, reasons, age, sameRegion }, i) => {
+        // 같은 지역 / 다른 지역 제목 (각 묶음의 첫 줄 앞에)
+        if (i === 0 || sameRegion !== list[i - 1].sameRegion)
+            msg += sameRegion ? `\n📍 <b>같은 지역 (${escapeHtml(req.region)})</b>\n` : `\n🌐 <b>다른 지역</b>\n`;
+        const info = [age !== null ? `${age}/${t.gender ?? '-'}` : t.gender, t.mbti, t.enneagram].filter(Boolean).join(' · ');
+        const job = [t.major && `전공 ${t.major}`, t.occupation && `직업 ${t.occupation}`].filter(Boolean).join(' · ');
+        msg += `${i + 1}. <b>${escapeHtml([t.region, t.team, t.name].filter(Boolean).join(' '))}</b> (${escapeHtml(info)}) · 관리 ${t.load}건\n`;
+        if (reasons.length) msg += `   └ ${escapeHtml(reasons.join(', '))}\n`;
+        if (job) msg += `   └ ${escapeHtml(job)}\n`;
+    });
+    await ctx.reply(msg, { parse_mode: 'HTML', reply_to_message_id: ctx.message?.message_id });
 }
 
 function regionChatIdsFor(chat: Pick<ChatRecord, 'guide_region' | 'teacher_region'>, regionChats: RegionChat[]): string[] {
@@ -6972,8 +7012,11 @@ async function handleIncomingText(ctx: any, rawText: string, source: 'text' | 'c
 
     try {
 
-    // 지역 담당방의 대화는 상담방 보고서로 처리하지 않음
-    if (await isRegionChat(chatId)) return;
+    // 지역 담당방의 대화는 상담방 보고서로 처리하지 않음 ('교사 구합니다' 양식만 추천 교사로 답한다)
+    if (await isRegionChat(chatId)) {
+        if (isTeacherRequest(text)) await replyTeacherRecommendation(ctx, text);
+        return;
+    }
 
     await ensureChatRecord(chatId, roomTitle);
 

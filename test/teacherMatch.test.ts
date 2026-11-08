@@ -1,0 +1,103 @@
+import { test } from 'node:test';
+import assert from 'node:assert/strict';
+import { isTeacherRequest, parseSlots, parseTeacherRequest, recommendTeachers, type TeacherCandidate } from '../src/teacherMatch.ts';
+
+// 지역 담당방에 실제로 올라온 양식 (연락처는 지움)
+const FORM = `#만국소성 #생명나무잎사귀 #중랑
+
+💙 교사 구합니다 💙
+
+* 지역: 중랑
+* 팀-구역(구역장이름): 2-1(이예슬)
+* 인도자 이름: 이예슬
+
+🍎섭외자 정보
+* 이름: 남예지
+* 나이/성별: 20/여
+* 인도자 오픈 여부(공개/비공개): 비공개
+
+* 영,육정보:
+✔️육
+- ISFJ, 9W1, 집순이이지만 문화생활 즐기고 싶어함
+
+* 원하는교사유형:
+- 따뜻하지만 똑부러지게 얘기해줄 수 있는 교사님
+
+* 만남가능 시간대: 주말 점심 이후 희망
+
+* 문의처:
+지역장) 엄소영`;
+
+const teacher = (over: Partial<TeacherCandidate>): TeacherCandidate => ({
+    uid: 'u',
+    name: '교사',
+    region: '중랑',
+    team: '1',
+    gender: '여',
+    birthYear: '2002',
+    mbti: 'INFJ',
+    enneagram: '2W1',
+    preferences: [],
+    availableTimes: ['주말 오후'],
+    major: null,
+    occupation: null,
+    load: 0,
+    ...over,
+});
+
+test('양식 인식과 항목 읽기', () => {
+    assert.equal(isTeacherRequest(FORM), true);
+    assert.equal(isTeacherRequest('오늘 모임 공지입니다'), false);
+    assert.deepEqual(parseTeacherRequest(FORM), {
+        region: '중랑',
+        name: '남예지',
+        age: 20,
+        gender: '여',
+        mbti: 'ISFJ',
+        ennea: 9,
+        enneaText: '9W1',
+        slots: ['주말 오후', '주말 저녁'],
+    });
+});
+
+test('만남 가능 시간', () => {
+    assert.deepEqual(parseSlots('평일 저녁'), ['평일 저녁']);
+    assert.deepEqual(parseSlots('주말'), ['주말 오전', '주말 오후', '주말 저녁']);
+    assert.deepEqual(parseSlots('아무때나'), []);
+});
+
+test('선호 유형·나이·바쁨 순으로 추천, 성별 다른 교사는 뺌', () => {
+    const req = parseTeacherRequest(FORM);
+    const list = recommendTeachers(
+        req,
+        [
+            teacher({ uid: 'pref', name: '선호일치', preferences: [{ mbti: 'ISFJ', ennea: '9' }] }),
+            teacher({ uid: 'busy', name: '바쁨', preferences: [{ mbti: 'ISFJ', ennea: '9' }], load: 3 }),
+            teacher({ uid: 'plain', name: '보통' }),
+            teacher({ uid: 'male', name: '남교사', gender: '남', preferences: [{ mbti: 'ISFJ', ennea: '9' }] }),
+        ],
+        2026,
+    );
+    assert.deepEqual(list.map((r) => r.teacher.uid), ['pref', 'busy', 'plain']);
+    assert.deepEqual(list[0].reasons, ['선호 ISFJ·9번 일치', '나이 차 4살', '시간 맞음(주말 오후)']);
+    assert.equal(list[0].score, 3 + 2 + 2 + 1);
+});
+
+test('같은 지역 먼저 3명까지, 남은 자리는 다른 지역 (점수가 더 높아도 다른 지역은 뒤)', () => {
+    const req = parseTeacherRequest(FORM);
+    const best = { preferences: [{ mbti: 'ISFJ', ennea: '9' }] };
+    const list = recommendTeachers(
+        req,
+        [
+            teacher({ uid: 'o1', name: '다른1', region: '노원', ...best }),
+            teacher({ uid: 'o2', name: '다른2', region: '강북', ...best }),
+            teacher({ uid: 'o3', name: '다른3', region: '도봉', ...best }),
+            teacher({ uid: 's1', name: '같은1' }),
+            teacher({ uid: 's2', name: '같은2' }),
+            teacher({ uid: 's3', name: '같은3' }),
+            teacher({ uid: 's4', name: '같은4' }),
+        ],
+        2026,
+    );
+    assert.deepEqual(list.map((r) => r.teacher.uid), ['s1', 's2', 's3', 'o1', 'o2']);
+});
