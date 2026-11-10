@@ -5409,7 +5409,7 @@ bot.hears(/^(?:[\/!]?관리자\s+)(미갱신\s*명단|미갱신|일정\s*미갱�
     }
 });
 
-// 발굴 이상(발·찾·합·섭)인데 봇이 초대(매칭)된 방이 없는 대상자 (관리자 미초대)
+// 발굴 이상(발·찾·합·섭, 탈락 제외)인데 봇이 초대(매칭)된 방이 없는 대상자 (관리자 미초대)
 bot.hears(/^(?:[\/!]?관리자\s+)(미초대|봇미초대|초대누락)$/i, async (ctx) => {
     try {
         const userId = String(ctx.from?.id);
@@ -5431,6 +5431,8 @@ bot.hears(/^(?:[\/!]?관리자\s+)(미초대|봇미초대|초대누락)$/i, asyn
             LEFT JOIN members m ON s."인도자_고유번호" = m."고유번호"
             LEFT JOIN members t ON s."교사_고유번호" = t."고유번호"
             WHERE LEFT(TRIM(COALESCE(s."단계"::text, '')), 1) IN ('발', '찾', '합', '섭')
+              AND s."탈락" IS NULL
+              AND COALESCE(s."단계"::text, '') NOT LIKE '%탈락%'
               AND NOT EXISTS (
                   SELECT 1 FROM counseling_chats c
                   WHERE c.matched_member_id::text = s.id::text
