@@ -6954,8 +6954,8 @@ bot.action(/^chak:(keep|drop|dropok|back):(\d{6}):(\d+)$/, async (ctx) => {
 });
 
 // ======================= 발·찾 탈락 사유 (지역 담당방 버튼) =======================
-// 행정에서 발·찾 단계(합 이전)에 탈락한 학생 중 상담방이 연결되지 않은 학생 → 인도자·교사 지역 담당방에 중단 사유 버튼
-// (상담방이 있으면 그 방의 탈락 확인 버튼으로 받는다). 고른 사유는 student_dropout_reasons에 쌓여 웹 탈락 분석에 나온다
+// 행정에서 발·찾 단계(합 이전)에 탈락했는데 사유가 없는 학생 → 인도자·교사 지역 담당방에 중단 사유 버튼
+// 사유 = 직접 넣은 사유 또는 상담방에서 만남 중단한 기록 (웹 lib/dropouts getDropouts와 같은 기준). 고른 사유는 student_dropout_reasons에 쌓여 웹 탈락 분석에 나온다
 // 타겟 점검과 같이 돈다 (업데이트마다 3분에 한 번 + 오전·밤 크론). 12월 개강 발굴(발·찾 인정 시작 2026-11-02)부터 묻는다
 async function askDropoutReasons() {
     const since = await getOrInitMeta('dropout_reason_bal_since', () => '2026-11-02');
@@ -6971,7 +6971,8 @@ async function askDropoutReasons() {
              WHERE s."탈락" IS NOT NULL AND COALESCE(s."발_완료일", s."찾_완료일")::date >= $1::date
                AND s."합_완료일" IS NULL AND s."섭_완료일" IS NULL AND s."복_완료일" IS NULL
                AND s."예정_완료일" IS NULL AND s."센확_완료일" IS NULL
-               AND NOT EXISTS (SELECT 1 FROM counseling_chats c WHERE c.matched_member_id = s.id)
+               AND NOT EXISTS (SELECT 1 FROM counseling_chats c WHERE c.matched_member_id = s.id
+                                 AND (c.meeting_date = '중단' OR COALESCE(TRIM(c.stop_reason), '') <> ''))
                AND NOT EXISTS (SELECT 1 FROM student_dropout_reasons r WHERE r.student_id = s.id AND r.dropped_on = s."탈락"::date)
                AND NOT EXISTS (SELECT 1 FROM dropout_reason_prompts p WHERE p.student_id = s.id AND p.dropped_on = s."탈락"::date)
              ORDER BY s."탈락"
