@@ -4865,8 +4865,12 @@ async function setMeetingDateFromInput(ctx: any, rawInput?: string) {
     try {
         if (rawInput.includes('미정')) {
             await upsertMeetingDate(ctx.chat.id, title, '미정');
+            // 인터뷰 전(결과 보고서 전) 방이면 인터뷰일도 미정 (/인터뷰일 미정과 같음)
+            const record = await getChatRecord(ctx.chat.id);
+            const interview = record?.meeting_type === '인터뷰' && !record.interview_report_submitted;
+            if (interview && record.interview_date !== '미정') await updateChat(ctx.chat.id, { interview_date: '미정' });
             await ctx.reply(
-                '📌 <b>만남 예정일이 [미정]으로 등록되었습니다.</b>\n\n' +
+                (interview ? '📌 <b>만남 예정일·인터뷰일이 [미정]으로 등록되었습니다.</b>\n\n' : '📌 <b>만남 예정일이 [미정]으로 등록되었습니다.</b>\n\n') +
                     '만남 일정이 다시 잡히면 <code>/만남일 MM-DD</code>로 봇에게 꼭 알려주세요!',
                 { parse_mode: 'HTML' }
             );
