@@ -159,6 +159,22 @@ async function initDb() {
                     ALTER TABLE student_targets ADD PRIMARY KEY (student_id, kind, target_month);
                 END IF;
             END $$;
+            -- 탈락 사유 (웹 lib/dropouts와 같은 표: 학생+탈락일마다 하나). 지역 담당방 버튼·웹 탈락 분석에서 넣는다
+            CREATE TABLE IF NOT EXISTS student_dropout_reasons (
+                student_id INTEGER NOT NULL REFERENCES students(id) ON DELETE CASCADE,
+                dropped_on DATE NOT NULL,
+                reason TEXT NOT NULL,
+                updated_by TEXT,
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                PRIMARY KEY (student_id, dropped_on)
+            );
+            -- 지역 담당방에 탈락 사유를 물어본 기록 (같은 탈락을 두 번 묻지 않음)
+            CREATE TABLE IF NOT EXISTS dropout_reason_prompts (
+                student_id INTEGER NOT NULL,
+                dropped_on DATE NOT NULL,
+                asked_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                PRIMARY KEY (student_id, dropped_on)
+            );
             CREATE TABLE IF NOT EXISTS meeting_events (
                 id SERIAL PRIMARY KEY,
                 chat_id TEXT NOT NULL,
@@ -6488,6 +6504,7 @@ async function runTargetChecks() {
     try {
         await checkStageTargets();
         await checkTargetMonthChanges();
+        await askDropoutReasons().catch((err) => console.error('[탈락 사유 묻기 실패]:', getErrorMessage(err)));
     } finally {
         targetChecksRunning = false;
     }
@@ -6932,6 +6949,103 @@ bot.action(/^chak:(keep|drop|dropok|back):(\d{6}):(\d+)$/, async (ctx) => {
         await ctx.reply(result, { parse_mode: 'HTML' });
     } catch (err: unknown) {
         console.error('[찾기 확인 버튼 처리 실패]:', getErrorMessage(err));
+        await ctx.answerCbQuery('저장하지 못했습니다. 잠시 뒤 다시 눌러주세요.').catch(() => {});
+    }
+});
+
+// ======================= 발·찾 탈락 사유 (지역 담당방 버튼) =======================
+// 행정에서 발·찾 단계(합 이전)에 탈락한 학생 중 상담방이 연결되지 않은 학생 → 인도자·교사 지역 담당방에 중단 사유 버튼
+// (상담방이 있으면 그 방의 탈락 확인 버튼으로 받는다). 고른 사유는 student_dropout_reasons에 쌓여 웹 탈락 분석에 나온다
+// 타겟 점검과 같이 돈다 (업데이트마다 3분에 한 번 + 오전·밤 크론). 12월 개강 발굴(발·찾 인정 시작 2026-11-02)부터 묻는다
+async function askDropoutReasons() {
+    const since = await getOrInitMeta('dropout_reason_bal_since', () => '2026-11-02');
+    const rows = (
+        await neonPool.query(
+            `SELECT s.id, s."이름" AS matched_student_name, to_char(s."탈락"::date, 'YYYY-MM-DD') AS dropped_on,
+                    CASE WHEN s."찾_완료일" IS NOT NULL THEN '찾' ELSE '발' END AS from_stage,
+                    m1."지역" AS guide_region, m1."구역" AS guide_district, m1."이름" AS guide_name,
+                    m2."지역" AS teacher_region, m2."구역" AS teacher_district, m2."이름" AS teacher_name
+             FROM students s
+             LEFT JOIN members m1 ON m1."고유번호" = s."인도자_고유번호"
+             LEFT JOIN members m2 ON m2."고유번호" = s."교사_고유번호"
+             WHERE s."탈락" IS NOT NULL AND COALESCE(s."발_완료일", s."찾_완료일")::date >= $1::date
+               AND s."합_완료일" IS NULL AND s."섭_완료일" IS NULL AND s."복_완료일" IS NULL
+               AND s."예정_완료일" IS NULL AND s."센확_완료일" IS NULL
+               AND NOT EXISTS (SELECT 1 FROM counseling_chats c WHERE c.matched_member_id = s.id)
+               AND NOT EXISTS (SELECT 1 FROM student_dropout_reasons r WHERE r.student_id = s.id AND r.dropped_on = s."탈락"::date)
+               AND NOT EXISTS (SELECT 1 FROM dropout_reason_prompts p WHERE p.student_id = s.id AND p.dropped_on = s."탈락"::date)
+             ORDER BY s."탈락"
+             LIMIT 50`,
+            [since]
+        )
+    ).rows;
+    if (!rows.length) return;
+    const regionChats = await getRegionChats();
+    for (const r of rows) {
+        // 담당방이 없는 지역은 묻지 않고 넘긴다 (웹 탈락 분석에서 직접 넣는다). 담당방이 생기면 그때 묻는다
+        const targets = regionChatIdsFor(r, regionChats);
+        let sent = 0;
+        for (const target of targets) {
+            await bot.telegram
+                .sendMessage(target, dropoutReasonText(r), { parse_mode: 'HTML', reply_markup: dropoutReasonKeyboard(r.id, r.dropped_on) })
+                .then(() => sent++)
+                .catch((err) => console.error(`[탈락 사유 묻기 발송 실패] ${target}:`, getErrorMessage(err)));
+        }
+        if (sent)
+            await neonPool.query(`INSERT INTO dropout_reason_prompts (student_id, dropped_on) VALUES ($1, $2) ON CONFLICT DO NOTHING`, [
+                r.id,
+                r.dropped_on,
+            ]);
+    }
+}
+
+function dropoutReasonText(r: PersonRow & { from_stage: string; dropped_on: string }): string {
+    return (
+        `🛑 <b>[${r.from_stage} 탈락 · 만남 중단 사유]</b>\n` +
+        `${personLine(r, '탈락')}\n` +
+        `<i>${r.from_stage} 단계에서 탈락 · 탈락일 ${r.dropped_on.slice(5).replace('-', '/')}</i>\n` +
+        `만남 중단 사유를 눌러주세요.`
+    );
+}
+
+// 버튼: dr:<사유코드>:<학생id>:<탈락일 YYYYMMDD> (탈락일이 바뀌면 = 재등록 후 다시 탈락하면 옛 버튼은 저장 안 됨)
+function dropoutReasonKeyboard(studentId: number, droppedOn: string) {
+    const day = droppedOn.replace(/-/g, '');
+    const rows = buildStopCategoryKeyboard('stop').inline_keyboard.filter((row) => row[0]?.callback_data !== 'stop:cancel');
+    return {
+        inline_keyboard: rows.map((row) => row.map((b) => ({ text: b.text, callback_data: `dr:${b.callback_data.slice(5)}:${studentId}:${day}` }))),
+    };
+}
+
+bot.action(/^dr:(\w+):(\d+):(\d{8})$/, async (ctx) => {
+    try {
+        const [, code, sid, day] = ctx.match;
+        const label = getStopCategoryLabel(code);
+        if (!label || !ctx.chat || !(await isRegionChat(ctx.chat.id))) {
+            await ctx.answerCbQuery('지역 담당방에서만 고를 수 있습니다.');
+            return;
+        }
+        const droppedOn = `${day.slice(0, 4)}-${day.slice(4, 6)}-${day.slice(6)}`;
+        const who = `봇:${displayName(ctx.from)} (${ctx.from?.id ?? ''})`;
+        const saved = await neonPool.query(
+            `INSERT INTO student_dropout_reasons (student_id, dropped_on, reason, updated_by)
+             SELECT id, "탈락"::date, $3, $4 FROM students WHERE id = $1 AND "탈락"::date = $2::date
+             ON CONFLICT (student_id, dropped_on) DO UPDATE SET reason = EXCLUDED.reason, updated_by = EXCLUDED.updated_by, updated_at = NOW()
+             RETURNING (SELECT "이름" FROM students WHERE id = $1) AS name`,
+            [Number(sid), droppedOn, label, who]
+        );
+        await ctx.editMessageReplyMarkup(undefined).catch(() => {});
+        if (!saved.rowCount) {
+            await ctx.answerCbQuery('행정의 탈락 상태가 바뀌어 저장하지 않았습니다.', { show_alert: true });
+            return;
+        }
+        await ctx.answerCbQuery(`${label}(으)로 저장했습니다.`);
+        await ctx.reply(
+            `✅ <b>${escapeHtml(saved.rows[0].name ?? '')}</b> 탈락 사유: <b>${escapeHtml(label)}</b> (${escapeHtml(displayName(ctx.from))})\n<i>바꾸려면 웹 탈락 분석에서 고쳐주세요.</i>`,
+            { parse_mode: 'HTML' }
+        );
+    } catch (err: unknown) {
+        console.error('[탈락 사유 버튼 처리 실패]:', getErrorMessage(err));
         await ctx.answerCbQuery('저장하지 못했습니다. 잠시 뒤 다시 눌러주세요.').catch(() => {});
     }
 });
