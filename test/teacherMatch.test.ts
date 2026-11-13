@@ -60,6 +60,7 @@ test('양식 인식과 항목 읽기', () => {
     assert.deepEqual(parseTeacherRequest(FORM), {
         region: '중랑',
         name: '남예지',
+        guide: '이예슬',
         age: 20,
         gender: '여',
         mbti: 'ISFJ',
@@ -79,6 +80,7 @@ test('새 양식 (/교사매칭양식): 채운 양식은 읽고, 빈 양식은 �
     assert.deepEqual(parseTeacherRequest(filled), {
         region: '중랑',
         name: '남예지',
+        guide: null,
         age: 20,
         gender: '여',
         mbti: 'ISFJ',

@@ -4,6 +4,7 @@
 export interface TeacherRequest {
     region: string | null;
     name: string | null;
+    guide: string | null; // 인도자 이름 (교사 매칭 대기 건을 학생과 연결할 때)
     age: number | null;
     gender: '남' | '여' | null;
     mbti: string | null; // 'ISFJ'
@@ -101,6 +102,7 @@ export function parseTeacherRequest(rawText: string): TeacherRequest {
     return {
         region: field(text, '지역'),
         name: field(text, '이름'),
+        guide: field(text, '인도자\\s*이름'),
         age: Number(ageGender?.match(/\d{1,2}/)?.[0]) || Number(field(text, '나이')?.match(/\d{1,2}/)?.[0]) || null,
         gender: ((ageGender ?? field(text, '성별'))?.match(/남|여/)?.[0] as '남' | '여' | undefined) ?? null,
         mbti: text.match(MBTI_RE)?.[1].toUpperCase() ?? null,
