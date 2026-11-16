@@ -191,6 +191,9 @@ async function initDb() {
                 close_note TEXT
             );
             CREATE INDEX IF NOT EXISTS teacher_requests_open ON teacher_requests (chat_id) WHERE status = '대기';
+            -- 학생과 연결한 시각과 그때 행정 교사 (연결 뒤에 새로 등록·바뀐 교사만 매칭으로 본다)
+            ALTER TABLE teacher_requests ADD COLUMN IF NOT EXISTS linked_at TIMESTAMPTZ;
+            ALTER TABLE teacher_requests ADD COLUMN IF NOT EXISTS base_teacher_uid TEXT;
             -- 지역 담당방에 탈락 사유를 물어본 기록 (같은 탈락을 두 번 묻지 않음)
             CREATE TABLE IF NOT EXISTS dropout_reason_prompts (
                 student_id INTEGER NOT NULL,
@@ -219,6 +222,17 @@ async function initDb() {
             `);
             await neonPool.query(`INSERT INTO bot_meta (key, value) VALUES ('auth_chats_migrated', NOW()::text);`);
             console.log(`✅ [DB 점검] 기존 방 ${res.rowCount}개를 인증된 방으로 이전`);
+        }
+        // 교사 매칭 자동 확인이 상담방 유형 '교사'(인터뷰 결과 보고서만 낸 상태)를 매칭으로 잘못 본 건을 다시 연다 (한 번만)
+        const reopened = await neonPool.query(`SELECT 1 FROM bot_meta WHERE key = 'teacher_requests_reopen_v1'`);
+        if (reopened.rows.length === 0) {
+            const res = await neonPool.query(`
+                UPDATE teacher_requests SET status = '대기', teacher_uid = NULL, teacher_name = NULL,
+                       closed_by = NULL, closed_at = NULL, close_note = NULL, linked_at = NULL, base_teacher_uid = NULL
+                WHERE status = '완료' AND close_note = '자동: 상담방 교사 만남'
+            `);
+            await neonPool.query(`INSERT INTO bot_meta (key, value) VALUES ('teacher_requests_reopen_v1', NOW()::text);`);
+            console.log(`✅ [DB 점검] 잘못 자동 완료된 교사 매칭 의뢰 ${res.rowCount}건을 다시 대기로`);
         }
     } catch (err: unknown) {
         console.error('⚠️ [인증 테이블 점검 경고]:', getErrorMessage(err));
@@ -1490,6 +1504,13 @@ function messageLink(chatId: string, messageId?: number | string | null): string
     return messageId && chatId.startsWith('-100') ? `https://t.me/c/${chatId.slice(4)}/${messageId}` : '';
 }
 
+// 누른 의뢰의 버튼만 지운다 (추천 답장은 전부, /교사미매칭 명단은 그 줄만)
+async function dropRequestButtons(ctx: any, reqId: number) {
+    const rows: { callback_data?: string }[][] = ctx.callbackQuery?.message?.reply_markup?.inline_keyboard ?? [];
+    const rest = rows.filter((row) => !row.some((b) => b.callback_data?.startsWith(`tq:${reqId}:`)));
+    await ctx.editMessageReplyMarkup(rest.length ? { inline_keyboard: rest } : undefined).catch(() => {});
+}
+
 // 지역 담당방 사람이면 누구나 누를 수 있다
 bot.action(/^tq:(\d+):(\d+|o|x)$/, async (ctx) => {
     try {
@@ -1504,7 +1525,7 @@ bot.action(/^tq:(\d+):(\d+|o|x)$/, async (ctx) => {
             return;
         }
         if (q.status !== '대기') {
-            await ctx.editMessageReplyMarkup(undefined).catch(() => {});
+            await dropRequestButtons(ctx, q.id);
             await ctx.answerCbQuery(`이미 ${q.status} 처리된 의뢰입니다${q.teacher_name ? ` (${q.teacher_name})` : ''}.`, { show_alert: true });
             return;
         }
@@ -1524,7 +1545,7 @@ bot.action(/^tq:(\d+):(\d+|o|x)$/, async (ctx) => {
             await ctx.answerCbQuery('이미 처리되었습니다.');
             return;
         }
-        await ctx.editMessageReplyMarkup(undefined).catch(() => {});
+        await dropRequestButtons(ctx, q.id);
         await ctx.answerCbQuery(status === '취소' ? '매칭 취소로 처리했습니다.' : '매칭 완료로 처리했습니다.');
         const name = escapeHtml(q.student_name ?? '섭외자');
         await ctx.reply(
@@ -1541,12 +1562,19 @@ bot.action(/^tq:(\d+):(\d+|o|x)$/, async (ctx) => {
 
 // 대기 중인 매칭 의뢰를 학생과 연결하고, 매칭된 흔적이 생기면 자동으로 닫는다 (버튼을 깜빡해도 닫히도록)
 // 연결: 양식의 섭외자 이름 + 인도자 이름이 같은 학생이 딱 한 명일 때 (양식 이후 등록돼도 나중에 연결)
-// 완료: 행정 교사 등록 / 합등 / 상담방이 교사 만남 유형이거나 교사 만남 기록이 있음   취소: 행정 탈락
+// 완료는 양식을 올린 뒤에 생긴 것만: 연결 뒤 행정 교사가 새로 등록·바뀜 / 양식 날 이후 합등 / 양식 날 이후 이 학생의 교사 만남 기록
+//   (상담방 유형 '교사'는 인터뷰 결과 보고서만 내도 바뀌어 교사가 없을 수 있으므로 보지 않는다)
+// 취소: 행정 탈락
 async function closeMatchedTeacherRequests() {
+    // 기능 수정 전에 연결된 건은 지금 교사를 기준으로 (한 번만)
     await neonPool.query(
-        `UPDATE teacher_requests q SET student_id = c.sid
+        `UPDATE teacher_requests q SET linked_at = NOW(), base_teacher_uid = s."교사_고유번호"
+         FROM students s WHERE s.id = q.student_id AND q.linked_at IS NULL AND q.status = '대기'`
+    );
+    await neonPool.query(
+        `UPDATE teacher_requests q SET student_id = c.sid, linked_at = NOW(), base_teacher_uid = c.teacher_uid
          FROM (
-             SELECT q2.id, MIN(s.id) AS sid
+             SELECT q2.id, MIN(s.id) AS sid, MIN(s."교사_고유번호") AS teacher_uid
              FROM teacher_requests q2
              JOIN students s ON regexp_replace(s."이름", '[[:space:]]', '', 'g') = regexp_replace(q2.student_name, '[[:space:]]', '', 'g')
              LEFT JOIN members g ON g."고유번호" = s."인도자_고유번호"
@@ -1559,14 +1587,16 @@ async function closeMatchedTeacherRequests() {
     const rows = (
         await neonPool.query(
             `SELECT q.id, q.chat_id, q.message_id, q.reply_message_id, q.student_name,
-                    s."탈락" IS NOT NULL AS dropped, s."합_완료일" IS NOT NULL AS hap, s."교사_고유번호" AS teacher_uid,
+                    s."탈락" IS NOT NULL AS dropped,
+                    s."합_완료일"::date >= (q.posted_at AT TIME ZONE 'Asia/Seoul')::date AS hap,
+                    CASE WHEN s."교사_고유번호" IS DISTINCT FROM q.base_teacher_uid THEN s."교사_고유번호" END AS teacher_uid,
                     concat_ws(' ', t."지역", t."구역", t."이름") AS teacher_name,
-                    EXISTS (SELECT 1 FROM counseling_chats c WHERE c.matched_member_id = s.id
-                              AND (c.meeting_type = '교사' OR EXISTS (SELECT 1 FROM teacher_meetings tm WHERE tm.chat_id = c.chat_id))) AS room_teacher
+                    EXISTS (SELECT 1 FROM teacher_meetings tm WHERE tm.student_id = s.id::text
+                              AND tm.meeting_date >= to_char(q.posted_at AT TIME ZONE 'Asia/Seoul', 'YYYY-MM-DD')) AS room_teacher
              FROM teacher_requests q
              JOIN students s ON s.id = q.student_id
              LEFT JOIN members t ON t."고유번호" = s."교사_고유번호"
-             WHERE q.status = '대기'`
+             WHERE q.status = '대기' AND q.linked_at IS NOT NULL`
         )
     ).rows;
     for (const r of rows) {
@@ -1595,7 +1625,9 @@ async function closeMatchedTeacherRequests() {
 
 // 매칭 대기 의뢰 줄 (오전 요약·/교사미매칭 공통). chatIds가 null이면 전체
 const TEACHER_REQUEST_LATE_DAYS = 3;
-async function teacherRequestWaitingText(chatIds: string[] | null): Promise<{ count: number; text: string }> {
+async function teacherRequestWaitingText(
+    chatIds: string[] | null
+): Promise<{ count: number; text: string; rows: { id: number; student_name: string | null }[] }> {
     const rows = (
         await neonPool.query(
             `SELECT id, chat_id, message_id, region, student_name, guide_name, age, gender,
@@ -1606,7 +1638,7 @@ async function teacherRequestWaitingText(chatIds: string[] | null): Promise<{ co
             chatIds ? [chatIds] : []
         )
     ).rows;
-    if (!rows.length) return { count: 0, text: '' };
+    if (!rows.length) return { count: 0, text: '', rows: [] };
     const late = rows.filter((r) => r.days >= TEACHER_REQUEST_LATE_DAYS).length;
     const lines = rows.map((r) => {
         const who = escapeHtml([r.region, r.student_name ?? '이름 없음'].filter(Boolean).join(' '));
@@ -1618,6 +1650,7 @@ async function teacherRequestWaitingText(chatIds: string[] | null): Promise<{ co
     const MAX = 20;
     return {
         count: rows.length,
+        rows: rows.slice(0, 20),
         text:
             `\n🧑‍🏫 <b>교사 매칭 대기: ${rows.length}건</b>${late ? ` <i>(${TEACHER_REQUEST_LATE_DAYS}일 이상 ${late}건)</i>` : ''}\n` +
             lines.slice(0, MAX).join('') +
@@ -1634,11 +1667,22 @@ bot.hears(/^[\/!](교사미매칭|매칭대기|미매칭)(?:@\w+)?$/i, async (ct
             return;
         }
         await closeMatchedTeacherRequests().catch((err) => console.error('[교사 매칭 자동 확인 실패]:', getErrorMessage(err)));
-        const { count, text } = await teacherRequestWaitingText(inRegion ? [String(ctx.chat.id)] : null);
-        await ctx.reply(count ? text.trimStart() + `\n<i>원래 양식의 추천 답장에서 교사를 누르면 완료됩니다.</i>` : '✅ 교사 매칭 대기 중인 의뢰가 없습니다.', {
-            parse_mode: 'HTML',
-            link_preview_options: { is_disabled: true },
-        });
+        const { count, text, rows } = await teacherRequestWaitingText(inRegion ? [String(ctx.chat.id)] : null);
+        // 담당방에서는 건마다 완료·취소 버튼 (추천 답장의 버튼이 지워졌거나 찾기 어려울 때)
+        const keyboard = inRegion
+            ? {
+                  inline_keyboard: rows.map((r) => [
+                      { text: `✅ ${r.student_name ?? '이름 없음'} 매칭 완료`, callback_data: `tq:${r.id}:o` },
+                      { text: '❌ 취소', callback_data: `tq:${r.id}:x` },
+                  ]),
+              }
+            : undefined;
+        await ctx.reply(
+            count
+                ? text.trimStart() + `\n<i>추천 답장에서 교사를 누르면 교사까지 기록되고, 아래 버튼은 완료·취소만 기록합니다.</i>`
+                : '✅ 교사 매칭 대기 중인 의뢰가 없습니다.',
+            { parse_mode: 'HTML', link_preview_options: { is_disabled: true }, reply_markup: count ? keyboard : undefined }
+        );
     } catch (err: unknown) {
         await replyError(ctx, '교사 매칭 대기 조회', err);
     }
@@ -2609,7 +2653,7 @@ async function sendRegionDailySummaries(mode: 'morning' | 'night') {
         let msg: string;
         if (mode === 'morning') {
             // 지역 담당방은 그 방에 올라온 매칭 의뢰, 청년회 전체 요약은 모든 의뢰
-            const matching = await teacherRequestWaitingText(regions ? [target] : null).catch(() => ({ count: 0, text: '' }));
+            const matching = await teacherRequestWaitingText(regions ? [target] : null).catch(() => ({ count: 0, text: '', rows: [] }));
             if (todayMeetings.length === 0 && overdue.length === 0 && waiting.length === 0 && needsCount === 0 && matching.count === 0) continue;
             msg = `☀️ <b>[${regionName} 오늘의 요약] ${dayLabel(today)}</b>\n━━━━━━━━━━━━━━━━━━\n\n`;
             msg += `🗓 <b>오늘 만남: ${todayMeetings.length}건</b>\n` + todayMeetings.map(meetingLine).join('');
