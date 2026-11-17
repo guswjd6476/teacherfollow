@@ -1803,6 +1803,33 @@ bot.hears(/^[\/!](교사평가|교사기준표)(?:@\w+)?$/i, async (ctx) => {
     }
 });
 
+// /교사명단: 이 담당방 지역 교사를 지역/구역/이름으로 (교사 평가 대상과 같은 교사). /정교사 /교사 /예비교사는 그 구분만
+bot.hears(/^[\/!](교사명단|정교사|교사|예비교사)(?:@\w+)?$/i, async (ctx) => {
+    try {
+        const type = ctx.match[1] === '교사명단' ? null : ctx.match[1];
+        const regions = await chatRegionsOf(ctx.chat.id);
+        if (!regions.length) {
+            await ctx.reply('지역 담당방에서 쓰는 명령어입니다.');
+            return;
+        }
+        // 구역은 '1-1', '1-10', '사랑-가족1'처럼 섞여 있어 숫자를 숫자로 비교 (1-2 다음 1-10)
+        const cmp = (x: string | null, y: string | null) => String(x ?? '').localeCompare(String(y ?? ''), 'ko', { numeric: true });
+        const list = (await evalTeachers(regions)).filter((t) => !type || t.type === type).sort(
+            (a, b) => cmp(a.region, b.region) || cmp(a.team, b.team) || cmp(a.name, b.name)
+        );
+        if (!list.length) {
+            await ctx.reply(`이 지역 ${type ?? '교사'}가 없습니다.`);
+            return;
+        }
+        const lines = list.map((t) => `${t.region?.trim() || '-'}/${t.team?.trim() || '-'}/${t.name.trim()}`);
+        // 텔레그램 한 메시지 4096자 제한이라 나눠 보낸다
+        const head = `🧑‍🏫 ${regions.join(', ')} ${type ?? '교사'} 명단 (${list.length}명)\n`;
+        for (let i = 0; i < lines.length; i += 100) await ctx.reply((i === 0 ? head : '') + lines.slice(i, i + 100).join('\n'));
+    } catch (err: unknown) {
+        await replyError(ctx, '교사 명단', err);
+    }
+});
+
 // te:o:<교사 id> 평가지 열기 · te:t:<id>:<항목> 체크 · te:d:<id> 완료
 bot.action(/^te:(o|t|d):(\d+)(?::(\w+))?$/, async (ctx) => {
     try {
@@ -3103,6 +3130,7 @@ const HELP_SECTIONS: Record<string, { label: string; text: string }> = {
         '• <b>주간 요약</b>: <code>관리자 주간요약</code> (매주 월요일 오전 관리자에게 자동 발송)\n' +
         '• <b>봇 사용 인증 현황</b>: <code>관리자 인증목록</code> (해제: <code>관리자 인증해제 ID</code>, 승인: <code>관리자 인증승인 ID</code>)\n' +
         '• <b>교사 매칭 양식</b>: 지역 담당방에서 <code>/교사매칭양식</code> (작성해서 올리면 추천 교사를 답장)\n' +
+        '• <b>교사 명단</b>: 지역 담당방에서 <code>/교사명단</code> (그 지역 교사를 지역/구역/이름으로. 구분별: <code>/정교사</code> <code>/교사</code> <code>/예비교사</code>)\n' +
         '• <b>교사 기준표 평가</b>: 지역 담당방에서 <code>/교사평가</code> (그 지역 교사 목록 → 이름을 눌러 항목 체크 → 상·중·하 자동 계산)\n' +
         '• <b>교사 매칭 대기</b>: <code>/교사미매칭</code> (양식을 올렸는데 아직 매칭 안 된 건. 추천 답장의 교사 버튼으로 완료, 행정 교사 등록·합등·상담방 교사 만남이면 자동 완료)\n' +
         '• <b>지역 담당방 등록</b>: 담당방에서 <code>/담당방등록 강북</code> (해제: <code>/담당방해제</code>, 목록: <code>관리자 담당방</code>)\n' +
@@ -7583,7 +7611,7 @@ bot.hears(/^[\/!](?:교사\s*만남\s*회차|만남\s*회차|회차)(?:@\w+)?(?:
 const KNOWN_COMMANDS = [
     '메뉴', '도움말', '최초등록', '유형변경', '교사전환', '인터뷰사전양식', '인터뷰사후양식', '만남보고서양식', '피드백양식',
     '인터뷰어', '타이퍼', '인터뷰일', '매칭해제', '행정확인', '목표월수정', '단계향상표', '상태확인', '만남중단', '만남일',
-    '구분해제', '섭등회차', '회차취소', '타겟', '타겟현황', '교사매칭양식', '교사미매칭', '교사평가', '교사만남회차', ...PROGRESS_STAGES, '담당방등록', '담당방해제', '담당방공지',
+    '구분해제', '섭등회차', '회차취소', '타겟', '타겟현황', '교사매칭양식', '교사미매칭', '교사평가', '교사명단', '정교사', '교사', '예비교사', '교사만남회차', ...PROGRESS_STAGES, '담당방등록', '담당방해제', '담당방공지',
 ];
 
 async function replyUnknownCommand(ctx: any, text: string) {
