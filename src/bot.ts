@@ -1821,7 +1821,7 @@ bot.hears(/^[\/!](교사명단|정교사|교사|예비교사)(?:@\w+)?$/i, async
             await ctx.reply(`이 지역 ${type ?? '교사'}가 없습니다.`);
             return;
         }
-        const lines = list.map((t) => `${t.region?.trim() || '-'}/${t.team?.trim() || '-'}/${t.name.trim()}`);
+        const lines = list.map((t) => `${t.region?.trim() || '-'}/${t.team?.trim() || '-'}/${t.name.trim()}/${t.type?.trim() || '-'}`);
         // 텔레그램 한 메시지 4096자 제한이라 나눠 보낸다
         const head = `🧑‍🏫 ${regions.join(', ')} ${type ?? '교사'} 명단 (${list.length}명)\n`;
         for (let i = 0; i < lines.length; i += 100) await ctx.reply((i === 0 ? head : '') + lines.slice(i, i + 100).join('\n'));
@@ -3130,7 +3130,7 @@ const HELP_SECTIONS: Record<string, { label: string; text: string }> = {
         '• <b>주간 요약</b>: <code>관리자 주간요약</code> (매주 월요일 오전 관리자에게 자동 발송)\n' +
         '• <b>봇 사용 인증 현황</b>: <code>관리자 인증목록</code> (해제: <code>관리자 인증해제 ID</code>, 승인: <code>관리자 인증승인 ID</code>)\n' +
         '• <b>교사 매칭 양식</b>: 지역 담당방에서 <code>/교사매칭양식</code> (작성해서 올리면 추천 교사를 답장)\n' +
-        '• <b>교사 명단</b>: 지역 담당방에서 <code>/교사명단</code> (그 지역 교사를 지역/구역/이름으로. 구분별: <code>/정교사</code> <code>/교사</code> <code>/예비교사</code>)\n' +
+        '• <b>교사 명단</b>: 지역 담당방에서 <code>/교사명단</code> (그 지역 교사를 지역/구역/이름/구분으로. 구분별: <code>/정교사</code> <code>/교사</code> <code>/예비교사</code>)\n' +
         '• <b>교사 기준표 평가</b>: 지역 담당방에서 <code>/교사평가</code> (그 지역 교사 목록 → 이름을 눌러 항목 체크 → 상·중·하 자동 계산)\n' +
         '• <b>교사 매칭 대기</b>: <code>/교사미매칭</code> (양식을 올렸는데 아직 매칭 안 된 건. 추천 답장의 교사 버튼으로 완료, 행정 교사 등록·합등·상담방 교사 만남이면 자동 완료)\n' +
         '• <b>지역 담당방 등록</b>: 담당방에서 <code>/담당방등록 강북</code> (해제: <code>/담당방해제</code>, 목록: <code>관리자 담당방</code>)\n' +
