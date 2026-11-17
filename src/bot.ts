@@ -34,6 +34,7 @@ import {
     type TargetPerson,
 } from './target.js';
 import { campaignKey, campaignsInChakCheck, chakAskText, nextMonthOf } from './chakCheck.js';
+import { GRADE_ITEMS, gradeOf, ITEM_CODES } from './teacherGrade.js';
 import { isBlankRequest, isTeacherRequest, parseTeacherRequest, recommendTeachers, TEACHER_REQUEST_TEMPLATE, type TeacherCandidate } from './teacherMatch.js';
 
 dayjs.extend(customParseFormat);
@@ -194,6 +195,15 @@ async function initDb() {
             -- 학생과 연결한 시각과 그때 행정 교사 (연결 뒤에 새로 등록·바뀐 교사만 매칭으로 본다)
             ALTER TABLE teacher_requests ADD COLUMN IF NOT EXISTS linked_at TIMESTAMPTZ;
             ALTER TABLE teacher_requests ADD COLUMN IF NOT EXISTS base_teacher_uid TEXT;
+            -- 교사 기준표 평가 (지역 담당방 /교사평가). 교사마다 지금 평가 하나, done_at이 있으면 완료
+            CREATE TABLE IF NOT EXISTS teacher_evaluations (
+                uid TEXT PRIMARY KEY,
+                items TEXT[] NOT NULL DEFAULT '{}',
+                grade VARCHAR(2),
+                updated_by TEXT,
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                done_at TIMESTAMPTZ
+            );
             -- 지역 담당방에 탈락 사유를 물어본 기록 (같은 탈락을 두 번 묻지 않음)
             CREATE TABLE IF NOT EXISTS dropout_reason_prompts (
                 student_id INTEGER NOT NULL,
@@ -1688,6 +1698,177 @@ bot.hears(/^[\/!](교사미매칭|매칭대기|미매칭)(?:@\w+)?$/i, async (ct
     }
 });
 
+// ---------- 교사 기준표 평가 (/교사평가) ----------
+// 지역 담당방에서 그 지역 교사(지금 회원 지역 기준)를 하나씩 눌러 항목을 체크하면 상·중·하가 자동 계산된다 (규칙은 teacherGrade.ts)
+// 기록으로 셀 수 있는 항목(센터 등록·복음방 건수)은 처음 열 때 미리 체크해 두고, 담당자가 고칠 수 있다
+// (기록에는 개인복음방·그룹복음방 구분이 없어 '그룹복으로 센터 등록'은 담당자가 체크)
+interface EvalTeacher {
+    id: number;
+    uid: string;
+    type: string | null;
+    name: string;
+    region: string | null;
+    team: string | null;
+    items: string[] | null;
+    grade: string | null;
+    done_at: Date | null;
+}
+const TEACHER_TYPE_ORDER = ['정교사', '교사', '예비교사'];
+
+async function chatRegionsOf(chatId: number | string): Promise<string[]> {
+    const res = await neonPool.query(`SELECT region FROM region_chats WHERE chat_id = $1`, [String(chatId)]);
+    return res.rows.map((r) => r.region);
+}
+
+// regions에 맞는 교사 (탈락 교사 제외). id를 주면 그 교사만
+async function evalTeachers(regions: string[], id?: number): Promise<EvalTeacher[]> {
+    const res = await neonPool.query<EvalTeacher>(
+        `SELECT t.id, t.uid, t.type, m.이름 AS name, m.지역 AS region, m.구역 AS team, e.items, e.grade, e.done_at
+         FROM teachers t
+         JOIN members m ON m.고유번호 = t.uid
+         LEFT JOIN teacher_evaluations e ON e.uid = t.uid
+         WHERE NOT COALESCE(t.fail, false) AND ($1::int IS NULL OR t.id = $1)`,
+        [id ?? null]
+    );
+    const rank = (t: string | null) => (TEACHER_TYPE_ORDER.indexOf(t ?? '') + 4) % 4;
+    return res.rows
+        .filter((t) => regions.some((r) => regionMatches(r, t.region)))
+        .sort((a, b) => rank(a.type) - rank(b.type) || a.name.localeCompare(b.name, 'ko'));
+}
+
+// 단계별 실적 기록에서 이 교사가 교사로 남은 센확·복 건수
+async function teacherEvalRecord(uid: string) {
+    const res = await neonPool.query(
+        `SELECT COUNT(*) FILTER (WHERE stage = '센확' AND done_at >= NOW() - INTERVAL '6 months')::int AS center6,
+                COUNT(*) FILTER (WHERE stage = '복' AND done_at >= NOW() - INTERVAL '3 months')::int AS bok3,
+                COUNT(*) FILTER (WHERE stage = '복' AND done_at >= NOW() - INTERVAL '6 months')::int AS bok6
+         FROM student_stage_credits WHERE teacher_code = $1`,
+        [uid]
+    );
+    return res.rows[0] as { center6: number; bok3: number; bok6: number };
+}
+
+const evalWho = (ctx: any) => `${ctx.from?.first_name ?? ''}${ctx.from?.last_name ? ` ${ctx.from.last_name}` : ''} (${ctx.from?.id})`;
+
+async function evalForm(t: EvalTeacher) {
+    const rec = await teacherEvalRecord(t.uid);
+    const items = t.items ?? [];
+    const { grade, next } = gradeOf(items);
+    let msg = `🌈 <b>${escapeHtml(t.name)}</b> <i>(${escapeHtml([t.type, t.region, t.team && `${t.team}팀`].filter(Boolean).join(' · '))})</i> 교사 평가\n`;
+    msg += `<i>기록: 6개월 센터 등록 ${rec.center6}회 · 3개월 복음방 ${rec.bok3}건 · 6개월 복음방 ${rec.bok6}건 (개인·그룹 구분 없음)</i>\n\n`;
+    for (const level of ['상', '중'] as const) {
+        msg += `<b>■ ${level}</b> ${level === '상' ? '(4개 충족, ①②③ 필수)' : '(3개 충족, ①② 필수)'}\n`;
+        for (const i of GRADE_ITEMS.filter((x) => x.level === level)) msg += `${items.includes(i.code) ? '☑️' : '⬜'} ${i.no} ${escapeHtml(i.text)}\n`;
+        msg += '\n';
+    }
+    msg += `➡️ 지금 등급: <b>${grade}</b>${next ? `\n<i>${escapeHtml(next)}</i>` : ''}`;
+    if (t.done_at) msg += `\n✅ 평가 완료 (${dayjs(t.done_at).tz('Asia/Seoul').format('M/D')})`;
+    const buttons = GRADE_ITEMS.map((i) => ({
+        text: `${items.includes(i.code) ? '☑️' : '⬜'} ${i.level}${i.no} ${i.short}`,
+        callback_data: `te:t:${t.id}:${i.code}`,
+    }));
+    const rows = [];
+    for (let k = 0; k < buttons.length; k += 2) rows.push(buttons.slice(k, k + 2));
+    rows.push([{ text: t.done_at ? '✅ 다시 저장' : '✅ 평가 완료', callback_data: `te:d:${t.id}` }]);
+    return { text: msg, reply_markup: { inline_keyboard: rows } };
+}
+
+async function evalList(regions: string[]) {
+    const list = await evalTeachers(regions);
+    const done = list.filter((t) => t.done_at);
+    const count = (g: string) => done.filter((t) => t.grade === g).length;
+    let msg = `🌈 <b>교사 기준표 평가 · ${escapeHtml(regions.join(', '))}</b>\n`;
+    msg += `교사 ${list.length}명 · 완료 ${done.length}명 (상 ${count('상')} · 중 ${count('중')} · 하 ${count('하')}) · 남은 ${list.length - done.length}명\n`;
+    msg += `<i>이름을 누르면 평가지가 열립니다. 담당방에 있는 사람은 누구나 할 수 있습니다.</i>`;
+    const buttons = list.map((t) => ({
+        text: `${t.done_at ? `✅ ${t.grade}` : '⬜'} ${t.name}${t.type === '예비교사' ? '(예비)' : ''}`,
+        callback_data: `te:o:${t.id}`,
+    }));
+    const rows = [];
+    for (let k = 0; k < buttons.length; k += 2) rows.push(buttons.slice(k, k + 2));
+    return { text: msg, reply_markup: { inline_keyboard: rows }, remaining: list.length - done.length };
+}
+
+bot.hears(/^[\/!](교사평가|교사기준표)(?:@\w+)?$/i, async (ctx) => {
+    try {
+        const regions = await chatRegionsOf(ctx.chat.id);
+        if (!regions.length) {
+            await ctx.reply('지역 담당방에서 쓰는 명령어입니다.');
+            return;
+        }
+        const { text, reply_markup } = await evalList(regions);
+        await ctx.reply(text, { parse_mode: 'HTML', reply_markup });
+    } catch (err: unknown) {
+        await replyError(ctx, '교사 평가 목록', err);
+    }
+});
+
+// te:o:<교사 id> 평가지 열기 · te:t:<id>:<항목> 체크 · te:d:<id> 완료
+bot.action(/^te:(o|t|d):(\d+)(?::(\w+))?$/, async (ctx) => {
+    try {
+        const [, act, idText, code] = ctx.match;
+        const regions = ctx.chat ? await chatRegionsOf(ctx.chat.id) : [];
+        if (!regions.length) {
+            await ctx.answerCbQuery('지역 담당방에서만 누를 수 있습니다.');
+            return;
+        }
+        let [t] = await evalTeachers(regions, Number(idText));
+        if (!t) {
+            await ctx.answerCbQuery('이 방 지역 교사가 아니거나 찾지 못했습니다.', { show_alert: true });
+            return;
+        }
+        if (act === 'o') {
+            if (!t.items) {
+                // 처음 열 때 기록으로 셀 수 있는 항목을 미리 체크
+                const rec = await teacherEvalRecord(t.uid);
+                const auto = [rec.center6 >= 2 && 'a1', rec.bok3 >= 3 && 'a7', rec.bok6 >= 1 && 'b5'].filter(Boolean) as string[];
+                await neonPool.query(
+                    `INSERT INTO teacher_evaluations (uid, items, grade, updated_by) VALUES ($1, $2, $3, $4) ON CONFLICT (uid) DO NOTHING`,
+                    [t.uid, auto, gradeOf(auto).grade, evalWho(ctx)]
+                );
+                [t] = await evalTeachers(regions, t.id);
+            }
+            await ctx.answerCbQuery();
+            const form = await evalForm(t);
+            await ctx.reply(form.text, { parse_mode: 'HTML', reply_markup: form.reply_markup });
+            return;
+        }
+        if (act === 't') {
+            if (!code || !ITEM_CODES.includes(code)) {
+                await ctx.answerCbQuery();
+                return;
+            }
+            const items = t.items ?? [];
+            const next = items.includes(code) ? items.filter((c) => c !== code) : [...items, code];
+            await neonPool.query(
+                `INSERT INTO teacher_evaluations (uid, items, grade, updated_by) VALUES ($1, $2, $3, $4)
+                 ON CONFLICT (uid) DO UPDATE SET items = EXCLUDED.items, grade = EXCLUDED.grade, updated_by = EXCLUDED.updated_by, updated_at = NOW()`,
+                [t.uid, next, gradeOf(next).grade, evalWho(ctx)]
+            );
+            t = { ...t, items: next };
+            await ctx.answerCbQuery();
+        } else {
+            const items = t.items ?? [];
+            const grade = gradeOf(items).grade;
+            const done = (
+                await neonPool.query(
+                    `INSERT INTO teacher_evaluations (uid, items, grade, updated_by, done_at) VALUES ($1, $2, $3, $4, NOW())
+                     ON CONFLICT (uid) DO UPDATE SET grade = EXCLUDED.grade, updated_by = EXCLUDED.updated_by, updated_at = NOW(), done_at = NOW()
+                     RETURNING done_at`,
+                    [t.uid, items, grade, evalWho(ctx)]
+                )
+            ).rows[0].done_at;
+            t = { ...t, grade, done_at: done };
+            await ctx.answerCbQuery(`${t.name} → ${grade} 저장했습니다.`);
+        }
+        const form = await evalForm(t);
+        await ctx.editMessageText(form.text, { parse_mode: 'HTML', reply_markup: form.reply_markup }).catch(() => {});
+    } catch (err: unknown) {
+        console.error('[교사 평가 버튼 실패]:', getErrorMessage(err));
+        await ctx.answerCbQuery('처리하지 못했습니다. 다시 눌러 주세요.').catch(() => {});
+    }
+});
+
 function regionChatIdsFor(chat: Pick<ChatRecord, 'guide_region' | 'teacher_region'>, regionChats: RegionChat[]): string[] {
     const ids = regionChats
         .filter((rc) => regionMatches(rc.region, chat.guide_region) || regionMatches(rc.region, chat.teacher_region))
@@ -2670,6 +2851,11 @@ async function sendRegionDailySummaries(mode: 'morning' | 'night') {
             msg += `\n🎯 <b>오늘 합등 예정: ${todayHap.length}건</b>\n` + todayHap.map(meetingLine).join('');
             msg += `\n⚠️ <b>보고서 미제출: ${overdue.length}건</b>\n` + overdueText;
             msg += waitingText + matching.text + needsText;
+            // 교사 기준표 평가가 남은 교사 수 (다 하면 안 나온다)
+            if (regions) {
+                const left = await evalList(regions).then((l) => l.remaining).catch(() => 0);
+                if (left > 0) msg += `\n🌈 <b>교사 평가 남은 교사: ${left}명</b> <i>(/교사평가)</i>\n`;
+            }
         } else {
             const todayUnreported = todayMeetings.filter((c) => !c.report_submitted && needsReport(c));
             const tomorrowMeetings = mine.filter((c) => c.meeting_date === tomorrowStr);
@@ -2917,6 +3103,7 @@ const HELP_SECTIONS: Record<string, { label: string; text: string }> = {
         '• <b>주간 요약</b>: <code>관리자 주간요약</code> (매주 월요일 오전 관리자에게 자동 발송)\n' +
         '• <b>봇 사용 인증 현황</b>: <code>관리자 인증목록</code> (해제: <code>관리자 인증해제 ID</code>, 승인: <code>관리자 인증승인 ID</code>)\n' +
         '• <b>교사 매칭 양식</b>: 지역 담당방에서 <code>/교사매칭양식</code> (작성해서 올리면 추천 교사를 답장)\n' +
+        '• <b>교사 기준표 평가</b>: 지역 담당방에서 <code>/교사평가</code> (그 지역 교사 목록 → 이름을 눌러 항목 체크 → 상·중·하 자동 계산)\n' +
         '• <b>교사 매칭 대기</b>: <code>/교사미매칭</code> (양식을 올렸는데 아직 매칭 안 된 건. 추천 답장의 교사 버튼으로 완료, 행정 교사 등록·합등·상담방 교사 만남이면 자동 완료)\n' +
         '• <b>지역 담당방 등록</b>: 담당방에서 <code>/담당방등록 강북</code> (해제: <code>/담당방해제</code>, 목록: <code>관리자 담당방</code>)\n' +
         '   <i>(보고서 지연·만남 중단·매일 오전 10시/밤 10시 지역 요약이 담당방으로 자동 발송)</i>\n' +
@@ -7396,7 +7583,7 @@ bot.hears(/^[\/!](?:교사\s*만남\s*회차|만남\s*회차|회차)(?:@\w+)?(?:
 const KNOWN_COMMANDS = [
     '메뉴', '도움말', '최초등록', '유형변경', '교사전환', '인터뷰사전양식', '인터뷰사후양식', '만남보고서양식', '피드백양식',
     '인터뷰어', '타이퍼', '인터뷰일', '매칭해제', '행정확인', '목표월수정', '단계향상표', '상태확인', '만남중단', '만남일',
-    '구분해제', '섭등회차', '회차취소', '타겟', '타겟현황', '교사매칭양식', '교사미매칭', '교사만남회차', ...PROGRESS_STAGES, '담당방등록', '담당방해제', '담당방공지',
+    '구분해제', '섭등회차', '회차취소', '타겟', '타겟현황', '교사매칭양식', '교사미매칭', '교사평가', '교사만남회차', ...PROGRESS_STAGES, '담당방등록', '담당방해제', '담당방공지',
 ];
 
 async function replyUnknownCommand(ctx: any, text: string) {
