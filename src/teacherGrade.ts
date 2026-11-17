@@ -53,3 +53,19 @@ function needText(grade: Grade, { missing, more }: { missing: string[]; more: nu
     const parts = [...missing.map(label), ...(more > 0 ? [`그 밖에 ${more}개 더`] : [])];
     return `${grade}까지: ${parts.join(', ')}`;
 }
+
+// 다음에 평가할 교사: 목록 순서에서 afterId 다음부터 (끝까지 가면 처음으로), 완료 안 한 교사
+// 같은 방의 다른 사람이 방금(10분 안) 연 평가지는 건너뛴다 (둘이 같은 교사를 잡지 않게)
+export interface NextCandidate {
+    id: number;
+    done_at: Date | null;
+    updated_by: string | null;
+    updated_at: Date | null;
+}
+export const EVAL_BUSY_MS = 10 * 60_000;
+export function pickNextTeacher<T extends NextCandidate>(list: T[], afterId: number, me: string, now: number): T | null {
+    const busy = (t: T) => !!t.updated_by && t.updated_by !== me && !!t.updated_at && now - new Date(t.updated_at).getTime() < EVAL_BUSY_MS;
+    const at = list.findIndex((t) => t.id === afterId);
+    const ordered = at < 0 ? list : [...list.slice(at + 1), ...list.slice(0, at)];
+    return ordered.find((t) => !t.done_at && !busy(t)) ?? null;
+}

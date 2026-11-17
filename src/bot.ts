@@ -34,7 +34,7 @@ import {
     type TargetPerson,
 } from './target.js';
 import { campaignKey, campaignsInChakCheck, chakAskText, nextMonthOf } from './chakCheck.js';
-import { GRADE_ITEMS, gradeOf, ITEM_CODES } from './teacherGrade.js';
+import { GRADE_ITEMS, gradeOf, ITEM_CODES, pickNextTeacher } from './teacherGrade.js';
 import { isBlankRequest, isTeacherRequest, parseTeacherRequest, recommendTeachers, TEACHER_REQUEST_TEMPLATE, type TeacherCandidate } from './teacherMatch.js';
 
 dayjs.extend(customParseFormat);
@@ -1712,6 +1712,8 @@ interface EvalTeacher {
     items: string[] | null;
     grade: string | null;
     done_at: Date | null;
+    updated_by: string | null;
+    updated_at: Date | null;
 }
 const TEACHER_TYPE_ORDER = ['정교사', '교사', '예비교사'];
 
@@ -1723,7 +1725,7 @@ async function chatRegionsOf(chatId: number | string): Promise<string[]> {
 // regions에 맞는 교사 (탈락 교사 제외). id를 주면 그 교사만
 async function evalTeachers(regions: string[], id?: number): Promise<EvalTeacher[]> {
     const res = await neonPool.query<EvalTeacher>(
-        `SELECT t.id, t.uid, t.type, m.이름 AS name, m.지역 AS region, m.구역 AS team, e.items, e.grade, e.done_at
+        `SELECT t.id, t.uid, t.type, m.이름 AS name, m.지역 AS region, m.구역 AS team, e.items, e.grade, e.done_at, e.updated_by, e.updated_at
          FROM teachers t
          JOIN members m ON m.고유번호 = t.uid
          LEFT JOIN teacher_evaluations e ON e.uid = t.uid
@@ -1750,11 +1752,13 @@ async function teacherEvalRecord(uid: string) {
 
 const evalWho = (ctx: any) => `${ctx.from?.first_name ?? ''}${ctx.from?.last_name ? ` ${ctx.from.last_name}` : ''} (${ctx.from?.id})`;
 
-async function evalForm(t: EvalTeacher) {
+// notice: 평가지 맨 위 한 줄 (방금 저장한 교사·남은 수)
+async function evalForm(t: EvalTeacher, notice = '') {
     const rec = await teacherEvalRecord(t.uid);
     const items = t.items ?? [];
     const { grade, next } = gradeOf(items);
-    let msg = `🌈 <b>${escapeHtml(t.name)}</b> <i>(${escapeHtml([t.type, t.region, t.team && `${t.team}팀`].filter(Boolean).join(' · '))})</i> 교사 평가\n`;
+    let msg = notice ? `${notice}\n━━━━━━━━━━━━━━\n` : '';
+    msg += `🌈 <b>${escapeHtml(t.name)}</b> <i>(${escapeHtml([t.type, t.region, t.team && `${t.team}팀`].filter(Boolean).join(' · '))})</i> 교사 평가\n`;
     msg += `<i>기록: 6개월 센터 등록 ${rec.center6}회 · 3개월 복음방 ${rec.bok3}건 · 6개월 복음방 ${rec.bok6}건 (개인·그룹 구분 없음)</i>\n\n`;
     for (const level of ['상', '중'] as const) {
         msg += `<b>■ ${level}</b> ${level === '상' ? '(4개 충족, ①②③ 필수)' : '(3개 충족, ①② 필수)'}\n`;
@@ -1769,7 +1773,11 @@ async function evalForm(t: EvalTeacher) {
     }));
     const rows = [];
     for (let k = 0; k < buttons.length; k += 2) rows.push(buttons.slice(k, k + 2));
-    rows.push([{ text: t.done_at ? '✅ 다시 저장' : '✅ 평가 완료', callback_data: `te:d:${t.id}` }]);
+    rows.push([{ text: t.done_at ? '✅ 다시 저장하고 다음' : '✅ 평가 완료하고 다음', callback_data: `te:d:${t.id}` }]);
+    rows.push([
+        { text: '⏭ 건너뛰기', callback_data: `te:n:${t.id}` },
+        { text: '📋 목록', callback_data: `te:l:0` },
+    ]);
     return { text: msg, reply_markup: { inline_keyboard: rows } };
 }
 
@@ -1779,12 +1787,14 @@ async function evalList(regions: string[]) {
     const count = (g: string) => done.filter((t) => t.grade === g).length;
     let msg = `🌈 <b>교사 기준표 평가 · ${escapeHtml(regions.join(', '))}</b>\n`;
     msg += `교사 ${list.length}명 · 완료 ${done.length}명 (상 ${count('상')} · 중 ${count('중')} · 하 ${count('하')}) · 남은 ${list.length - done.length}명\n`;
-    msg += `<i>이름을 누르면 평가지가 열립니다. 담당방에 있는 사람은 누구나 할 수 있습니다.</i>`;
+    msg += `<i>[▶ 이어서 평가]를 누르면 안 한 교사가 차례로 나옵니다. 이름을 눌러 한 명만 열 수도 있습니다. 담당방에 있는 사람은 누구나 할 수 있습니다.</i>`;
     const buttons = list.map((t) => ({
         text: `${t.done_at ? `✅ ${t.grade}` : '⬜'} ${t.name}${t.type === '예비교사' ? '(예비)' : ''}`,
         callback_data: `te:o:${t.id}`,
     }));
     const rows = [];
+    // 맨 위: 안 한 교사부터 차례로 (완료하면 같은 메시지가 다음 교사로 바뀐다)
+    if (list.length > done.length) rows.push([{ text: `▶ 이어서 평가 (남은 ${list.length - done.length}명)`, callback_data: 'te:n:0' }]);
     for (let k = 0; k < buttons.length; k += 2) rows.push(buttons.slice(k, k + 2));
     return { text: msg, reply_markup: { inline_keyboard: rows }, remaining: list.length - done.length };
 }
@@ -1830,13 +1840,55 @@ bot.hears(/^[\/!](교사명단|정교사|교사|예비교사)(?:@\w+)?$/i, async
     }
 });
 
-// te:o:<교사 id> 평가지 열기 · te:t:<id>:<항목> 체크 · te:d:<id> 완료
-bot.action(/^te:(o|t|d):(\d+)(?::(\w+))?$/, async (ctx) => {
+// 처음 여는 평가지면 기록으로 셀 수 있는 항목을 미리 체크해 둔다. 연 사람을 남겨 '다음'에서 다른 사람과 겹치지 않게
+async function openEvalDraft(ctx: any, regions: string[], t: EvalTeacher): Promise<EvalTeacher> {
+    if (t.items) {
+        if (!t.done_at) await neonPool.query(`UPDATE teacher_evaluations SET updated_by = $2, updated_at = NOW() WHERE uid = $1`, [t.uid, evalWho(ctx)]);
+        return t;
+    }
+    const rec = await teacherEvalRecord(t.uid);
+    const auto = [rec.center6 >= 2 && 'a1', rec.bok3 >= 3 && 'a7', rec.bok6 >= 1 && 'b5'].filter(Boolean) as string[];
+    await neonPool.query(
+        `INSERT INTO teacher_evaluations (uid, items, grade, updated_by) VALUES ($1, $2, $3, $4) ON CONFLICT (uid) DO NOTHING`,
+        [t.uid, auto, gradeOf(auto).grade, evalWho(ctx)]
+    );
+    return (await evalTeachers(regions, t.id))[0] ?? t;
+}
+
+// 이 메시지를 다음 교사 평가지로 바꾼다 (없으면 끝났다고 알리고 목록 버튼)
+async function showNextEval(ctx: any, regions: string[], afterId: number, notice: string) {
+    const list = await evalTeachers(regions);
+    const left = list.filter((t) => !t.done_at).length;
+    const next = pickNextTeacher(list, afterId, evalWho(ctx), Date.now());
+    if (!next) {
+        const text =
+            (notice ? `${notice}\n\n` : '') +
+            (left ? `남은 ${left}명은 다른 사람이 평가 중입니다. 잠시 뒤 [📋 목록]에서 확인해 주세요.` : `🎉 <b>${escapeHtml(regions.join(', '))} 교사 평가를 모두 마쳤습니다.</b>`);
+        await ctx.editMessageText(text, { parse_mode: 'HTML', reply_markup: { inline_keyboard: [[{ text: '📋 목록', callback_data: 'te:l:0' }]] } }).catch(() => {});
+        return;
+    }
+    const form = await evalForm(await openEvalDraft(ctx, regions, next), `${notice ? `${notice} · ` : ''}남은 ${left}명`);
+    await ctx.editMessageText(form.text, { parse_mode: 'HTML', reply_markup: form.reply_markup }).catch(() => {});
+}
+
+// te:o:<교사 id> 평가지 열기 · te:t:<id>:<항목> 체크 · te:d:<id> 완료하고 다음 · te:n:<id> 건너뛰기(0이면 처음부터) · te:l:0 목록
+bot.action(/^te:(o|t|d|n|l):(\d+)(?::(\w+))?$/, async (ctx) => {
     try {
         const [, act, idText, code] = ctx.match;
         const regions = ctx.chat ? await chatRegionsOf(ctx.chat.id) : [];
         if (!regions.length) {
             await ctx.answerCbQuery('지역 담당방에서만 누를 수 있습니다.');
+            return;
+        }
+        if (act === 'l') {
+            await ctx.answerCbQuery();
+            const { text, reply_markup } = await evalList(regions);
+            await ctx.editMessageText(text, { parse_mode: 'HTML', reply_markup }).catch(() => {});
+            return;
+        }
+        if (act === 'n' && idText === '0') {
+            await ctx.answerCbQuery();
+            await showNextEval(ctx, regions, 0, '');
             return;
         }
         let [t] = await evalTeachers(regions, Number(idText));
@@ -1845,19 +1897,14 @@ bot.action(/^te:(o|t|d):(\d+)(?::(\w+))?$/, async (ctx) => {
             return;
         }
         if (act === 'o') {
-            if (!t.items) {
-                // 처음 열 때 기록으로 셀 수 있는 항목을 미리 체크
-                const rec = await teacherEvalRecord(t.uid);
-                const auto = [rec.center6 >= 2 && 'a1', rec.bok3 >= 3 && 'a7', rec.bok6 >= 1 && 'b5'].filter(Boolean) as string[];
-                await neonPool.query(
-                    `INSERT INTO teacher_evaluations (uid, items, grade, updated_by) VALUES ($1, $2, $3, $4) ON CONFLICT (uid) DO NOTHING`,
-                    [t.uid, auto, gradeOf(auto).grade, evalWho(ctx)]
-                );
-                [t] = await evalTeachers(regions, t.id);
-            }
             await ctx.answerCbQuery();
-            const form = await evalForm(t);
+            const form = await evalForm(await openEvalDraft(ctx, regions, t));
             await ctx.reply(form.text, { parse_mode: 'HTML', reply_markup: form.reply_markup });
+            return;
+        }
+        if (act === 'n') {
+            await ctx.answerCbQuery(`${t.name} 건너뜀`);
+            await showNextEval(ctx, regions, t.id, `⏭ ${escapeHtml(t.name)} 건너뜀`);
             return;
         }
         if (act === 't') {
@@ -1874,22 +1921,20 @@ bot.action(/^te:(o|t|d):(\d+)(?::(\w+))?$/, async (ctx) => {
             );
             t = { ...t, items: next };
             await ctx.answerCbQuery();
-        } else {
-            const items = t.items ?? [];
-            const grade = gradeOf(items).grade;
-            const done = (
-                await neonPool.query(
-                    `INSERT INTO teacher_evaluations (uid, items, grade, updated_by, done_at) VALUES ($1, $2, $3, $4, NOW())
-                     ON CONFLICT (uid) DO UPDATE SET grade = EXCLUDED.grade, updated_by = EXCLUDED.updated_by, updated_at = NOW(), done_at = NOW()
-                     RETURNING done_at`,
-                    [t.uid, items, grade, evalWho(ctx)]
-                )
-            ).rows[0].done_at;
-            t = { ...t, grade, done_at: done };
-            await ctx.answerCbQuery(`${t.name} → ${grade} 저장했습니다.`);
+            const form = await evalForm(t);
+            await ctx.editMessageText(form.text, { parse_mode: 'HTML', reply_markup: form.reply_markup }).catch(() => {});
+            return;
         }
-        const form = await evalForm(t);
-        await ctx.editMessageText(form.text, { parse_mode: 'HTML', reply_markup: form.reply_markup }).catch(() => {});
+        // 완료하고 다음
+        const items = t.items ?? [];
+        const grade = gradeOf(items).grade;
+        await neonPool.query(
+            `INSERT INTO teacher_evaluations (uid, items, grade, updated_by, done_at) VALUES ($1, $2, $3, $4, NOW())
+             ON CONFLICT (uid) DO UPDATE SET grade = EXCLUDED.grade, updated_by = EXCLUDED.updated_by, updated_at = NOW(), done_at = NOW()`,
+            [t.uid, items, grade, evalWho(ctx)]
+        );
+        await ctx.answerCbQuery(`${t.name} → ${grade} 저장했습니다.`);
+        await showNextEval(ctx, regions, t.id, `✅ ${escapeHtml(t.name)} → <b>${grade}</b> 저장`);
     } catch (err: unknown) {
         console.error('[교사 평가 버튼 실패]:', getErrorMessage(err));
         await ctx.answerCbQuery('처리하지 못했습니다. 다시 눌러 주세요.').catch(() => {});
