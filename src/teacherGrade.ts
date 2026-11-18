@@ -69,3 +69,13 @@ export function pickNextTeacher<T extends NextCandidate>(list: T[], afterId: num
     const ordered = at < 0 ? list : [...list.slice(at + 1), ...list.slice(0, at)];
     return ordered.find((t) => !t.done_at && !busy(t)) ?? null;
 }
+
+// 명단용 '선택' 칸: 그 등급 항목 중 필수가 아닌 것에서 체크한 번호 (상은 ④~⑦, 중·하는 중 ③~⑤). 예: '3,4'
+export function extraItemNumbers(grade: string | null, items: readonly string[] | null): string {
+    const rule = grade === '상' ? RULES[0] : RULES[1];
+    return (items ?? [])
+        .filter((c) => c.startsWith(rule.prefix) && !rule.required.includes(c))
+        .map((c) => Number(c.slice(1)))
+        .sort((a, b) => a - b)
+        .join(',');
+}

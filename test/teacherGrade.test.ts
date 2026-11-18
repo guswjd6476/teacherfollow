@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { gradeOf, pickNextTeacher } from '../src/teacherGrade.ts';
+import { extraItemNumbers, gradeOf, pickNextTeacher } from '../src/teacherGrade.ts';
 
 test('상: 4개 이상 + ①②③ 필수', () => {
     assert.equal(gradeOf(['a1', 'a2', 'a3', 'a5']).grade, '상');
@@ -35,4 +35,11 @@ test('다음 교사: 완료·다른 사람이 방금 연 교사는 건너뛰고,
     assert.equal(pickNextTeacher(list, 5, '나 (1)', now)?.id, 1); // 끝 → 처음
     assert.equal(pickNextTeacher(list, 0, '나 (1)', now)?.id, 1); // 목록에서 이어서
     assert.equal(pickNextTeacher([t(1, { done_at: new Date(now) })], 1, '나 (1)', now), null);
+});
+
+test('명단 선택 칸: 필수 빼고 그 등급에서 체크한 번호', () => {
+    assert.equal(extraItemNumbers('상', ['a1', 'a2', 'a3', 'a5', 'a4', 'b3']), '4,5');
+    assert.equal(extraItemNumbers('중', ['b1', 'b2', 'b4', 'b3', 'a5']), '3,4');
+    assert.equal(extraItemNumbers('하', ['b1', 'b5']), '5');
+    assert.equal(extraItemNumbers('하', null), '');
 });
