@@ -102,8 +102,10 @@ export function stripDatePart(rawText: string): string {
 // 보고서 항목 내용 추출: 라벨 줄의 나머지 + 다음 항목 전까지의 줄, 라벨이 없으면 null
 // 줄 머리의 기호/번호 (예: '▶️', '▪️', '•', '2.')
 const REPORT_LINE_PREFIX = String.raw`^\s*[•\-*▪◾■□○●▶►✔✅☑️\d.)]*\s*`;
-// '• 항목: 값' 형태의 줄 (머리 기호가 있어야 항목으로 간주 — 본문의 '공과 제목 : ...' 같은 줄은 내용)
-const REPORT_FIELD_LINE = /^\s*[•▪◾■□○●▶►✔✅☑️]+\s*[가-힣A-Za-z][가-힣A-Za-z0-9 ()\/·,\-]{0,20}\s*[:：]/u;
+// '▪️ 항목: 값' 형태의 줄 (머리 기호가 있어야 항목으로 간주 — 본문의 '공과 제목 : ...' 같은 줄은 내용)
+// '•'는 뺀다: 내용을 '• 공과: 창세기'처럼 점으로 적는 경우가 많아 항목으로 보면 내용이 비었다고 나온다
+// ('• 다음만남일:'처럼 아는 항목은 REPORT_KNOWN_LABEL로 따로 끊긴다)
+const REPORT_FIELD_LINE = /^\s*[▪◾■□○●▶►✔✅☑️]+\s*[가-힣A-Za-z][가-힣A-Za-z0-9 ()\/·,\-]{0,20}\s*[:：]/u;
 const REPORT_KNOWN_LABEL = new RegExp(
     REPORT_LINE_PREFIX +
         String.raw`(?:진행\s*내용|진행\s*내역|상담\s*반응|교육\s*후\s*반응|특이\s*사항|섭외자\s*느낀\s*점|입막음|다음\s*만남)`,

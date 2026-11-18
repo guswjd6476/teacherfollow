@@ -2,6 +2,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
     extractNextMeetingRaw,
+    extractReportField,
     findMissingReportFields,
     parseFlexibleDate,
     parseFlexibleTime,
@@ -60,6 +61,19 @@ test('보고서: 필수 항목 확인', () => {
         findMissingReportFields('▶️ 진행내용: (내용 작성)\n▶️ 상담반응 및 특이사항:\n▪️ 다음만남일: 미정'),
         ['진행내용', '상담반응 및 특이사항']
     );
+});
+
+test("보고서: 내용을 '• ㅇㅇ: ㅇㅇ'처럼 점으로 적어도 작성한 것으로 인식", () => {
+    const text = `▶️ 진행내용
+• 공과: 창세기 1장
+• ㅇㅇㅇ
+▶️ 상담반응 및 특이사항
+• 질문: 많이 함
+• 다음만남일: 미정`;
+    assert.deepEqual(findMissingReportFields(text), []);
+    assert.equal(extractReportField(text, /진행\s*내용/), '• 공과: 창세기 1장\n• ㅇㅇㅇ');
+    // 아는 항목('• 다음만남일')에서는 끊긴다
+    assert.equal(extractReportField(text, /상담\s*반응(?:\s*및\s*특이\s*사항)?/), '• 질문: 많이 함');
 });
 
 test('보고서: 텔레그램이 두 조각으로 나눈 보고서를 합치면 인식', () => {
